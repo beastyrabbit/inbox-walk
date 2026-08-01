@@ -4,8 +4,6 @@ Last updated: 2026-08-01
 
 ## In progress
 
-- [ ] Publish the `v0.1.0` release after Forgejo container CI succeeds.
-- [ ] Deploy through kub-homelab and verify Flux, Pangolin SSO, and Homepage.
 - [ ] Replace the expired Fastmail token and add OpenAI API credits, then repeat live verification.
 
 ## Done
@@ -24,6 +22,8 @@ Last updated: 2026-08-01
 - [x] Dedicated Infisical project with viewer-only Kubernetes workload identity.
 - [x] Independent implementation/security review and release-blocker remediation.
 - [x] Approved live acceptance attempts (Fastmail rejected the stored token; OpenAI reported no credits).
+- [x] Public `v0.1.0` Forgejo release and immutable container image.
+- [x] Healthy kub-homelab rollout with Infisical sync, Pangolin `BeastyOnly` SSO, and Homepage.
 
 ## After first release
 
