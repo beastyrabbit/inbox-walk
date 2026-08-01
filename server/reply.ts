@@ -226,6 +226,38 @@ Constraints:
 
 Output: Follow the required structured schema. For each material supported detail, cite one or more exact source message IDs. Use empty arrays when there are no questions or warnings.`
 
+function throwOpenAiError(error: unknown): never {
+  const details =
+    typeof error === 'object' && error !== null
+      ? (error as { code?: unknown; requestID?: unknown; status?: unknown })
+      : {}
+  const status = typeof details.status === 'number' ? details.status : undefined
+  const code = typeof details.code === 'string' ? details.code : undefined
+  const safeDetails = {
+    ...(status ? { status } : {}),
+    ...(typeof details.requestID === 'string' ? { requestId: details.requestID } : {}),
+  }
+  if (status === 429 && code === 'credit_balance_exhausted') {
+    throw new ReplyError(
+      'Das OpenAI-Kontingent ist aufgebraucht. Nach dem Aufladen kann der Entwurf erneut erstellt werden.',
+      'OPENAI_QUOTA_EXHAUSTED',
+      safeDetails,
+    )
+  }
+  if (status === 401) {
+    throw new ReplyError(
+      'Der OpenAI-API-Schlüssel wurde abgelehnt.',
+      'OPENAI_AUTH_FAILED',
+      safeDetails,
+    )
+  }
+  throw new ReplyError(
+    'OpenAI konnte den Antwortentwurf nicht erstellen.',
+    'OPENAI_REQUEST_FAILED',
+    safeDetails,
+  )
+}
+
 export async function generateReply(
   context: MailAccountContext,
   token: string,
@@ -249,21 +281,25 @@ export async function generateReply(
       { characters: inputText.length, limit: 1_000_000 },
     )
   }
-  const response = await client.responses.parse({
-    model: 'gpt-5.6-sol',
-    reasoning: { effort: 'medium', context: 'current_turn' },
-    store: false,
-    safety_identifier: createHash('sha256').update(`inbox-walk:${context.accountId}`).digest('hex'),
-    max_output_tokens: 4_000,
-    input: [
-      { role: 'developer', content: [{ type: 'input_text', text: developerPrompt }] },
-      {
-        role: 'user',
-        content: [{ type: 'input_text', text: inputText }, ...attachments],
-      },
-    ],
-    text: { verbosity: 'low', format: zodTextFormat(replySchema, 'reply_proposal') },
-  })
+  const response = await client.responses
+    .parse({
+      model: 'gpt-5.6-sol',
+      reasoning: { effort: 'medium', context: 'current_turn' },
+      store: false,
+      safety_identifier: createHash('sha256')
+        .update(`inbox-walk:${context.accountId}`)
+        .digest('hex'),
+      max_output_tokens: 4_000,
+      input: [
+        { role: 'developer', content: [{ type: 'input_text', text: developerPrompt }] },
+        {
+          role: 'user',
+          content: [{ type: 'input_text', text: inputText }, ...attachments],
+        },
+      ],
+      text: { verbosity: 'low', format: zodTextFormat(replySchema, 'reply_proposal') },
+    })
+    .catch((error: unknown) => throwOpenAiError(error))
   if (response.status !== 'completed' || response.output_parsed === null) {
     throw new ReplyError(
       'OpenAI hat keinen vollständigen Antwortentwurf geliefert.',

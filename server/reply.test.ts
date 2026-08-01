@@ -1,8 +1,10 @@
+import type OpenAI from 'openai'
 import { describe, expect, it } from 'vitest'
 import type { MailIdentity, MailResource, ThreadMessage } from '../src/shared.ts'
 import {
   appendSignature,
   computeReplyRecipients,
+  generateReply,
   ReplyError,
   validateAttachmentManifest,
 } from './reply.ts'
@@ -92,5 +94,32 @@ describe('reply construction', () => {
     expect(appendSignature('Bis Donnerstag.', identity)).toBe(
       'Bis Donnerstag.\n\nViele Grüße\nAlex',
     )
+  })
+
+  it('turns exhausted OpenAI credit into an actionable app error', async () => {
+    const client = {
+      responses: {
+        parse: async () => {
+          throw { status: 429, code: 'credit_balance_exhausted', requestID: 'req-test' }
+        },
+      },
+    } as unknown as OpenAI
+    await expect(
+      generateReply(
+        {
+          accountId: 'account-1',
+          apiUrl: 'https://api.example/jmap',
+          downloadUrl: 'https://api.example/download/{blobId}',
+          maxObjectsInGet: 10,
+          maxObjectsInSet: 10,
+          username: 'alex@example.com',
+        },
+        'unused-token',
+        'unused-key',
+        [message],
+        { requestId: crypto.randomUUID(), roughNotes: 'Bestätigen.' },
+        client,
+      ),
+    ).rejects.toMatchObject({ code: 'OPENAI_QUOTA_EXHAUSTED' })
   })
 })
