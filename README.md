@@ -1,0 +1,78 @@
+# Inbox Walk
+
+Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one
+bounded snapshot of unread incoming mail, shows the original messages one at a
+time, and applies read-state changes only after a final confirmation.
+
+For messages that need an answer, Inbox Walk can use OpenAI to prepare a
+thread-aware reply and save it as a verified Fastmail draft. It has no send-mail
+endpoint or send control; sending remains in Fastmail.
+
+## What it does
+
+- Loads at most 250 unread incoming messages into a stable JMAP snapshot.
+- Resumes the exact snapshot and local decisions after a browser refresh.
+- Filters by mailbox, time range, and newsletter status.
+- Sanitizes mail HTML in a sandboxed iframe and blocks remote images by default.
+- Keeps selected messages unread and marks the rest read only after confirmation.
+- Loads the complete bounded thread before preparing a reply.
+- Automatically includes every supported thread attachment in the OpenAI request.
+- Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
+- Creates and reads back a normal Fastmail draft with reply headers and identity signature.
+- Exposes `/healthz` and `/readyz` for Kubernetes probes.
+
+## Local development
+
+Install dependencies and run the explicit sample inbox through Portless:
+
+```bash
+pnpm install
+pnpm dev:demo:portless
+```
+
+Open <https://inbox-walk.localhost:1355>.
+
+Live mode never falls back to sample data. Copy `.env.example` to `.env`, add a
+Fastmail API token with Mail access and an OpenAI API key, then run:
+
+```bash
+pnpm dev:portless
+```
+
+Secret values stay in the backend environment and are never embedded in the
+client bundle or returned by the API.
+
+## Keyboard controls
+
+- `ArrowRight`: next message
+- `ArrowLeft`: previous message
+- `ArrowUp`: toggle “keep unread”
+- `R`: open the reply-draft panel
+- `?`: keyboard help
+- `Escape`: close the active panel or dialog
+
+## Quality gates
+
+```bash
+pnpm check
+pnpm build
+pnpm test:e2e
+lefthook run pre-commit
+```
+
+Lefthook runs Biome, TypeScript, unit/API tests, and a redacted staged Gitleaks
+scan before commits. The Forgejo workflow repeats quality and browser tests,
+builds the production container through the shared BuildKit service, and
+publishes it to `git.heerlab.com/beasty/inbox-walk`.
+
+## Production
+
+The image listens on port `3000` and requires both `FASTMAIL_JMAP_TOKEN` and
+`OPENAI_API_KEY` at runtime. `MAIL_REVIEW_DEMO=1` is an explicit demo-only mode.
+
+Deployment is managed from `beasty/kub-homelab`. Runtime secrets are synced by
+the Infisical Operator; no secret values belong in this repository or in the
+container image.
+
+See [product behavior](docs/PRODUCT.md), [delivery status](docs/BOARD.md), and
+[operations](docs/OPERATIONS.md).

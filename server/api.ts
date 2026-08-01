@@ -1,0 +1,818 @@
+import { randomBytes, randomUUID } from 'node:crypto'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { z } from 'zod'
+import type {
+  ApiError,
+  DraftResult,
+  FinalizeResult,
+  MailboxOption,
+  MailIdentity,
+  MailResource,
+  ReplyProposal,
+  ReviewEmail,
+  ReviewEmailSummary,
+  ReviewFilters,
+  ReviewSnapshot,
+  ThreadMessage,
+} from '../src/shared.ts'
+import { defaultReviewFilters } from '../src/shared.ts'
+import { demoEmails } from './demo.ts'
+import {
+  createAndVerifyDraft,
+  downloadBlob,
+  fetchEmailDetail,
+  fetchIdentities,
+  fetchReviewOptions,
+  fetchThread,
+  fetchUnreadSnapshot,
+  JmapError,
+  type LiveSnapshotData,
+  type MailAccountContext,
+  markEmailsRead,
+  resumeSnapshot,
+} from './jmap.ts'
+import {
+  appendSignature,
+  computeReplyRecipients,
+  escapeDraftHtml,
+  generateReply,
+  ReplyError,
+  type ReplyRequest,
+} from './reply.ts'
+
+const MAX_JSON_BYTES = 256 * 1024
+const MAX_SNAPSHOTS = 20
+const SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000
+const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+const INLINE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp'])
+
+const filtersSchema = z.object({
+  mailboxId: z.string().min(1).nullable(),
+  newsletter: z.enum(['all', 'exclude', 'only']),
+  timeRange: z.enum(['all', '24h', '7d', '30d']),
+})
+
+const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
+
+interface StoredSnapshot {
+  blobMetadata: Map<string, MailResource>
+  context?: MailAccountContext
+  createdAt: number
+  csrfToken: string
+  detailCache: Map<string, ReviewEmail>
+  draftResults: Map<string, DraftResult>
+  emailIds: string[]
+  filters: ReviewFilters
+  finalKeepIds?: Set<string>
+  finalizationState: 'active' | 'finalized' | 'finalizing'
+  identities?: MailIdentity[]
+  lastAccessedAt: number
+  mailboxes: MailboxOption[]
+  mode: 'demo' | 'live'
+  replyCache: Map<string, Promise<ReplyProposal>>
+  replyInFlight: Set<string>
+  summaries: Map<string, ReviewEmailSummary>
+  succeededIds: Set<string>
+  threadCache: Map<string, ThreadMessage[]>
+}
+
+export interface ApiOptions {
+  fastmailToken?: string
+  forceDemo?: boolean
+  openaiApiKey?: string
+}
+
+const snapshots = new Map<string, StoredSnapshot>()
+
+function securityHeaders(res: ServerResponse) {
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Referrer-Policy', 'no-referrer')
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+}
+
+function uniqueResources(messages: ThreadMessage[]) {
+  const resources = new Map<string, MailResource>()
+  for (const message of messages) {
+    for (const resource of [...message.inlineResources, ...message.attachments]) {
+      resources.set(resource.blobId, resource)
+    }
+  }
+  return [...resources.values()]
+}
+
+function json(res: ServerResponse, status: number, value: unknown) {
+  securityHeaders(res)
+  res.statusCode = status
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Cache-Control', 'no-store')
+  res.end(JSON.stringify(value))
+}
+
+function apiError(
+  res: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+  retryable = false,
+  details?: unknown,
+) {
+  const payload: ApiError = { error: { code, message, retryable, ...(details ? { details } : {}) } }
+  return json(res, status, payload)
+}
+
+async function readJson(req: IncomingMessage) {
+  const chunks: Buffer[] = []
+  let size = 0
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+    size += buffer.length
+    if (size > MAX_JSON_BYTES)
+      throw new ApiHttpError(413, 'BODY_TOO_LARGE', 'Request body is too large')
+    chunks.push(buffer)
+  }
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}') as Record<string, unknown>
+  } catch {
+    throw new ApiHttpError(400, 'INVALID_JSON', 'Request body is not valid JSON')
+  }
+}
+
+class ApiHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: string,
+    message: string,
+    readonly retryable = false,
+    readonly details?: unknown,
+  ) {
+    super(message)
+  }
+}
+
+function validateOrigin(req: IncomingMessage) {
+  if (req.headers['sec-fetch-site'] === 'cross-site') {
+    throw new ApiHttpError(403, 'CROSS_SITE_REQUEST', 'Cross-site requests are not allowed')
+  }
+  const origin = req.headers.origin
+  if (!origin) return
+  const expectedHost = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '')
+    .split(',')[0]
+    ?.trim()
+  let originHost = ''
+  try {
+    originHost = new URL(origin).host
+  } catch {
+    throw new ApiHttpError(403, 'INVALID_ORIGIN', 'Invalid request origin')
+  }
+  if (!expectedHost || originHost !== expectedHost) {
+    throw new ApiHttpError(403, 'INVALID_ORIGIN', 'Request origin does not match this service')
+  }
+}
+
+function pruneSnapshots() {
+  const cutoff = Date.now() - SNAPSHOT_TTL_MS
+  for (const [id, snapshot] of snapshots) {
+    if (snapshot.lastAccessedAt < cutoff) snapshots.delete(id)
+  }
+  if (snapshots.size <= MAX_SNAPSHOTS) return
+  const oldest = [...snapshots.entries()].sort(
+    ([, left], [, right]) => left.lastAccessedAt - right.lastAccessedAt,
+  )
+  for (const [id] of oldest.slice(0, snapshots.size - MAX_SNAPSHOTS)) snapshots.delete(id)
+}
+
+function filterDemoEmails(filters: ReviewFilters) {
+  const hours =
+    filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
+  const cutoff = hours ? Date.now() - hours * 3_600_000 : 0
+  return demoEmails.filter((email) => {
+    if (filters.mailboxId && !email.mailboxNames.includes(filters.mailboxId)) return false
+    if (cutoff && Date.parse(email.receivedAt) < cutoff) return false
+    if (filters.newsletter === 'only' && !email.isNewsletter) return false
+    if (filters.newsletter === 'exclude' && email.isNewsletter) return false
+    return true
+  })
+}
+
+function summariesFor(emails: ReviewEmail[]) {
+  return emails.map(
+    ({
+      html: _html,
+      text: _text,
+      bodyTruncated: _truncated,
+      inlineResources: _inline,
+      attachments: _attachments,
+      cc: _cc,
+      replyTo: _replyTo,
+      messageId: _messageId,
+      inReplyTo: _inReplyTo,
+      references: _references,
+      ...summary
+    }) => summary,
+  )
+}
+
+function storeSnapshot(
+  data: Pick<LiveSnapshotData, 'emails' | 'filters' | 'mailboxes'> & {
+    context?: MailAccountContext
+    mode: 'demo' | 'live'
+    details?: ReviewEmail[]
+  },
+) {
+  pruneSnapshots()
+  const snapshotId = randomUUID()
+  const csrfToken = randomBytes(24).toString('base64url')
+  const details = new Map((data.details ?? []).map((email) => [email.id, email]))
+  const snapshot: StoredSnapshot = {
+    blobMetadata: new Map(),
+    context: data.context,
+    createdAt: Date.now(),
+    csrfToken,
+    detailCache: details,
+    draftResults: new Map(),
+    emailIds: data.emails.map((email) => email.id),
+    filters: data.filters,
+    finalizationState: 'active',
+    lastAccessedAt: Date.now(),
+    mailboxes: data.mailboxes,
+    mode: data.mode,
+    replyCache: new Map(),
+    replyInFlight: new Set(),
+    succeededIds: new Set(),
+    summaries: new Map(data.emails.map((email) => [email.id, email])),
+    threadCache: new Map(),
+  }
+  for (const email of details.values()) registerResources(snapshot, email)
+  snapshots.set(snapshotId, snapshot)
+  return { snapshotId, csrfToken, snapshot }
+}
+
+function snapshotPayload(
+  id: string,
+  snapshot: StoredSnapshot,
+  metadata: { missingIds?: string[]; totalBeforeLimit?: number; truncated?: boolean } = {},
+): ReviewSnapshot {
+  return {
+    csrfToken: snapshot.csrfToken,
+    emails: snapshot.emailIds
+      .map((emailId) => snapshot.summaries.get(emailId))
+      .filter((email): email is ReviewEmailSummary => Boolean(email)),
+    filters: snapshot.filters,
+    missingIds: metadata.missingIds ?? [],
+    mode: snapshot.mode,
+    snapshotId: id,
+    totalBeforeLimit: metadata.totalBeforeLimit ?? snapshot.emailIds.length,
+    truncated: metadata.truncated ?? false,
+  }
+}
+
+function registerResources(snapshot: StoredSnapshot, email: ReviewEmail) {
+  for (const resource of [...email.inlineResources, ...email.attachments]) {
+    snapshot.blobMetadata.set(resource.blobId, resource)
+  }
+}
+
+function getSnapshot(id: string) {
+  pruneSnapshots()
+  const snapshot = snapshots.get(id)
+  if (!snapshot) throw new ApiHttpError(410, 'REVIEW_EXPIRED', 'Diese Sitzung ist abgelaufen.')
+  snapshot.lastAccessedAt = Date.now()
+  return snapshot
+}
+
+function requireCsrf(req: IncomingMessage, snapshot: StoredSnapshot) {
+  validateOrigin(req)
+  if (req.headers['x-inbox-walk-csrf'] !== snapshot.csrfToken) {
+    throw new ApiHttpError(403, 'INVALID_CSRF', 'Ungültiger Sicherheitsschlüssel.')
+  }
+}
+
+function parseFilters(value: unknown) {
+  const parsed = filtersSchema.safeParse(value ?? defaultReviewFilters)
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_FILTERS', 'Ungültige Filter.')
+  return parsed.data
+}
+
+async function createReview(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  options: ApiOptions,
+) {
+  const filters = parseFilters(body.filters)
+  if (options.forceDemo) {
+    const details = filterDemoEmails(filters)
+    const emails = summariesFor(details)
+    const stored = storeSnapshot({
+      emails,
+      filters,
+      mailboxes: [
+        { id: 'Inbox', name: 'Inbox', role: 'inbox' },
+        { id: 'Newsletter', name: 'Newsletter' },
+        { id: 'Reisen', name: 'Reisen' },
+      ],
+      mode: 'demo',
+      details,
+    })
+    return json(res, 201, snapshotPayload(stored.snapshotId, stored.snapshot))
+  }
+  const token = options.fastmailToken?.trim()
+  if (!token)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
+  const data = await fetchUnreadSnapshot(token, filters)
+  const stored = storeSnapshot({ ...data, mode: 'live' })
+  return json(
+    res,
+    201,
+    snapshotPayload(stored.snapshotId, stored.snapshot, {
+      missingIds: data.missingIds,
+      totalBeforeLimit: data.totalBeforeLimit,
+      truncated: data.truncated,
+    }),
+  )
+}
+
+async function resumeReview(
+  res: ServerResponse,
+  body: Record<string, unknown>,
+  options: ApiOptions,
+) {
+  const emailIds = z.array(z.string().min(1)).max(250).safeParse(body.emailIds)
+  if (!emailIds.success) throw new ApiHttpError(400, 'INVALID_RESUME', 'Ungültiger Checkpoint.')
+  const filters = parseFilters(body.filters)
+  if (options.forceDemo) {
+    const wanted = new Set(emailIds.data)
+    const details = demoEmails.filter((email) => wanted.has(email.id))
+    const missingIds = emailIds.data.filter((id) => !details.some((email) => email.id === id))
+    const ordered = emailIds.data
+      .map((id) => details.find((email) => email.id === id))
+      .filter((email): email is ReviewEmail => Boolean(email))
+    const stored = storeSnapshot({
+      emails: summariesFor(ordered),
+      filters,
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'demo',
+      details: ordered,
+    })
+    return json(res, 201, snapshotPayload(stored.snapshotId, stored.snapshot, { missingIds }))
+  }
+  const token = options.fastmailToken?.trim()
+  if (!token)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
+  const data = await resumeSnapshot(token, emailIds.data, filters)
+  const stored = storeSnapshot({ ...data, mode: 'live' })
+  return json(
+    res,
+    201,
+    snapshotPayload(stored.snapshotId, stored.snapshot, {
+      missingIds: data.missingIds,
+      totalBeforeLimit: data.totalBeforeLimit,
+    }),
+  )
+}
+
+async function options(res: ServerResponse, apiOptions: ApiOptions) {
+  if (apiOptions.forceDemo) {
+    return json(res, 200, {
+      mode: 'demo',
+      mailboxes: [
+        { id: 'Inbox', name: 'Inbox', role: 'inbox' },
+        { id: 'Newsletter', name: 'Newsletter' },
+        { id: 'Reisen', name: 'Reisen' },
+      ],
+    })
+  }
+  const token = apiOptions.fastmailToken?.trim()
+  if (!token)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
+  const result = await fetchReviewOptions(token)
+  return json(res, 200, { mode: 'live', mailboxes: result.mailboxes })
+}
+
+async function emailDetail(
+  res: ServerResponse,
+  snapshotId: string,
+  emailId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  if (!snapshot.summaries.has(emailId))
+    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+  let email = snapshot.detailCache.get(emailId)
+  if (!email) {
+    const token = apiOptions.fastmailToken?.trim()
+    if (!token || !snapshot.context)
+      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+    email = await fetchEmailDetail(snapshot.context, token, emailId, snapshot.mailboxes)
+    snapshot.detailCache.set(emailId, email)
+    registerResources(snapshot, email)
+  }
+  return json(res, 200, email)
+}
+
+async function loadThread(snapshot: StoredSnapshot, threadId: string, apiOptions: ApiOptions) {
+  const cached = snapshot.threadCache.get(threadId)
+  if (cached) return cached
+  if (snapshot.mode === 'demo') {
+    const messages = demoEmails
+      .filter((email) => email.threadId === threadId)
+      .map((email) => ({ ...email, sentAt: null }))
+    snapshot.threadCache.set(threadId, messages)
+    return messages
+  }
+  const token = apiOptions.fastmailToken?.trim()
+  if (!token || !snapshot.context)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+  const messages = await fetchThread(snapshot.context, token, threadId, snapshot.mailboxes)
+  for (const email of messages) registerResources(snapshot, email)
+  snapshot.threadCache.set(threadId, messages)
+  return messages
+}
+
+async function loadIdentities(snapshot: StoredSnapshot, apiOptions: ApiOptions) {
+  if (snapshot.identities) return snapshot.identities
+  if (snapshot.mode === 'demo') {
+    snapshot.identities = [
+      {
+        id: 'demo-identity',
+        name: 'Alex',
+        email: 'alex@example.com',
+        textSignature: 'Viele Grüße\nAlex',
+        htmlSignature: '<div>Viele Grüße<br>Alex</div>',
+      },
+    ]
+    return snapshot.identities
+  }
+  const token = apiOptions.fastmailToken?.trim()
+  if (!token || !snapshot.context)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+  snapshot.identities = await fetchIdentities(snapshot.context, token)
+  return snapshot.identities
+}
+
+async function threadContext(
+  res: ServerResponse,
+  snapshotId: string,
+  threadId: string,
+  emailId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  if (!snapshot.summaries.has(emailId))
+    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+  const messages = await loadThread(snapshot, threadId, apiOptions)
+  const target = messages.find((message) => message.id === emailId)
+  if (!target)
+    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht gehört nicht zu diesem Thread.')
+  const identities = await loadIdentities(snapshot, apiOptions)
+  const replyTarget = messages.at(-1)
+  if (!replyTarget)
+    throw new ApiHttpError(409, 'THREAD_EMPTY', 'Der Thread enthält keine Nachricht.')
+  return json(res, 200, {
+    messages,
+    identities,
+    recipients: computeReplyRecipients(replyTarget, identities),
+    attachmentManifest: uniqueResources(messages),
+  })
+}
+
+async function finalize(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  const body = await readJson(req)
+  const kept = z.array(z.string().min(1)).max(250).safeParse(body.keepUnreadIds)
+  if (!kept.success) throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
+  if (snapshot.finalizationState === 'finalizing') {
+    throw new ApiHttpError(
+      409,
+      'FINALIZE_IN_PROGRESS',
+      'Der Review wird bereits abgeschlossen.',
+      true,
+    )
+  }
+  const known = new Set(snapshot.emailIds)
+  if (kept.data.some((id) => !known.has(id))) {
+    throw new ApiHttpError(400, 'UNKNOWN_EMAIL', 'Die Auswahl enthält eine unbekannte Nachricht.')
+  }
+  const requestedKeep = new Set(kept.data)
+  if (snapshot.finalKeepIds) {
+    const unchanged =
+      requestedKeep.size === snapshot.finalKeepIds.size &&
+      [...requestedKeep].every((id) => snapshot.finalKeepIds?.has(id))
+    if (!unchanged)
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_SELECTION_LOCKED',
+        'Die Auswahl ist bereits festgeschrieben.',
+      )
+  } else snapshot.finalKeepIds = requestedKeep
+
+  const toMark = snapshot.emailIds.filter(
+    (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
+  )
+  snapshot.finalizationState = 'finalizing'
+  try {
+    if (snapshot.mode === 'demo') {
+      for (const id of toMark) snapshot.succeededIds.add(id)
+      snapshot.finalizationState = 'finalized'
+      const result: FinalizeResult = {
+        failed: [],
+        finalized: true,
+        keptUnread: requestedKeep.size,
+        markedRead: snapshot.succeededIds.size,
+        mode: 'demo',
+        remaining: 0,
+      }
+      return json(res, 200, result)
+    }
+    const token = apiOptions.fastmailToken?.trim()
+    if (!token || !snapshot.context)
+      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+    const update = await markEmailsRead(snapshot.context, token, toMark)
+    for (const id of update.markedIds) snapshot.succeededIds.add(id)
+    const remaining = snapshot.emailIds.filter(
+      (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
+    ).length
+    snapshot.finalizationState = remaining === 0 ? 'finalized' : 'active'
+    const result: FinalizeResult = {
+      failed: update.failed,
+      finalized: remaining === 0,
+      keptUnread: requestedKeep.size,
+      markedRead: snapshot.succeededIds.size,
+      mode: 'live',
+      remaining,
+    }
+    return json(res, update.failed.length > 0 ? 207 : 200, result)
+  } catch (error) {
+    snapshot.finalizationState = 'active'
+    throw error
+  }
+}
+
+async function blob(
+  res: ServerResponse,
+  url: URL,
+  snapshotId: string,
+  blobId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  if (snapshot.mode !== 'live')
+    throw new ApiHttpError(404, 'BLOB_NOT_FOUND', 'Datei nicht gefunden.')
+  const resource = snapshot.blobMetadata.get(blobId)
+  if (!resource) throw new ApiHttpError(403, 'BLOB_FORBIDDEN', 'Datei ist nicht freigegeben.')
+  if (resource.size > MAX_DOWNLOAD_BYTES)
+    throw new ApiHttpError(413, 'BLOB_TOO_LARGE', 'Datei ist größer als 100 MiB.')
+  const token = apiOptions.fastmailToken?.trim()
+  if (!token || !snapshot.context)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+  const upstream = await downloadBlob(snapshot.context, token, resource)
+  if (!upstream.body)
+    throw new ApiHttpError(502, 'EMPTY_BLOB', 'Fastmail hat keine Dateidaten geliefert.', true)
+  const inline =
+    url.searchParams.get('inline') === '1' && INLINE_TYPES.has(resource.type.toLowerCase())
+  securityHeaders(res)
+  res.statusCode = 200
+  res.setHeader('Content-Type', inline ? resource.type : 'application/octet-stream')
+  res.setHeader('Cache-Control', 'private, max-age=300')
+  res.setHeader(
+    'Content-Disposition',
+    `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(resource.name.slice(0, 240))}`,
+  )
+  const contentLength = upstream.headers.get('content-length')
+  if (contentLength) res.setHeader('Content-Length', contentLength)
+  try {
+    await pipeline(Readable.fromWeb(upstream.body as never), res)
+  } catch (error) {
+    process.stderr.write(
+      `${JSON.stringify({ event: 'blob_stream_error', message: error instanceof Error ? error.message : 'unknown' })}\n`,
+    )
+    if (!res.destroyed) res.destroy()
+  }
+}
+
+async function reply(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  const body = await readJson(req)
+  const parsed = z
+    .object({
+      emailId: z.string().min(1),
+      requestId: z.string().uuid(),
+      roughNotes: z.string().max(64_000),
+      currentDraft: z.string().max(128_000).optional(),
+      revisionInstruction: z.string().max(64_000).optional(),
+    })
+    .safeParse(body)
+  if (!parsed.success)
+    throw new ApiHttpError(400, 'INVALID_REPLY_REQUEST', 'Ungültige Entwurfsanfrage.')
+  const { emailId, requestId } = parsed.data
+  const summary = snapshot.summaries.get(emailId)
+  if (!summary) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+  const existing = snapshot.replyCache.get(requestId)
+  if (existing) return json(res, 200, await existing)
+  if (snapshot.replyInFlight.has(emailId)) {
+    throw new ApiHttpError(
+      409,
+      'REPLY_IN_PROGRESS',
+      'Für diese Nachricht wird bereits ein Entwurf erstellt.',
+      true,
+    )
+  }
+  snapshot.replyInFlight.add(emailId)
+  const work = (async () => {
+    const messages = await loadThread(snapshot, summary.threadId, apiOptions)
+    if (snapshot.mode === 'demo') {
+      const result: ReplyProposal = {
+        attachmentManifest: uniqueResources(messages),
+        bodyText:
+          parsed.data.currentDraft?.trim() ||
+          parsed.data.roughNotes.trim() ||
+          'Danke für deine Nachricht. Ich melde mich dazu in Kürze noch einmal.',
+        questions: [],
+        requestId,
+        supportedDetails: [],
+        warnings: ['Demo-Modus: Es wurde keine Anfrage an OpenAI gesendet.'],
+      }
+      return result
+    }
+    const token = apiOptions.fastmailToken?.trim()
+    const apiKey = apiOptions.openaiApiKey?.trim()
+    if (!token || !snapshot.context)
+      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+    if (!apiKey)
+      throw new ApiHttpError(503, 'OPENAI_NOT_CONFIGURED', 'OpenAI ist nicht konfiguriert.')
+    const request: ReplyRequest = parsed.data
+    return await generateReply(snapshot.context, token, apiKey, messages, request)
+  })()
+  snapshot.replyCache.set(requestId, work)
+  try {
+    return json(res, 200, await work)
+  } catch (error) {
+    snapshot.replyCache.delete(requestId)
+    throw error
+  } finally {
+    snapshot.replyInFlight.delete(emailId)
+  }
+}
+
+async function draft(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  const body = await readJson(req)
+  const parsed = z
+    .object({
+      requestId: z.string().uuid(),
+      emailId: z.string().min(1),
+      identityId: z.string().min(1),
+      to: z.array(addressSchema).min(1).max(100),
+      cc: z.array(addressSchema).max(100),
+      subject: z.string().min(1).max(998),
+      bodyText: z.string().min(1).max(256_000),
+    })
+    .safeParse(body)
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_DRAFT', 'Ungültige Draft-Daten.')
+  const cached = snapshot.draftResults.get(parsed.data.requestId)
+  if (cached) return json(res, 200, cached)
+  const summary = snapshot.summaries.get(parsed.data.emailId)
+  if (!summary) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+  const messages = await loadThread(snapshot, summary.threadId, apiOptions)
+  const identities = await loadIdentities(snapshot, apiOptions)
+  const identity = identities.find((item) => item.id === parsed.data.identityId)
+  if (!identity) throw new ApiHttpError(400, 'INVALID_IDENTITY', 'Unbekannte Absenderidentität.')
+  const latest = messages.at(-1)
+  if (!latest) throw new ApiHttpError(409, 'THREAD_EMPTY', 'Der Thread enthält keine Nachricht.')
+  const bodyText = appendSignature(parsed.data.bodyText, identity)
+  const htmlSignature = identity.htmlSignature.trim()
+    ? identity.htmlSignature
+    : escapeDraftHtml(identity.textSignature.trim())
+  const bodyHtml = `${escapeDraftHtml(parsed.data.bodyText.trim())}${htmlSignature ? `<br><br>${htmlSignature}` : ''}`
+  if (snapshot.mode === 'demo') {
+    const result: DraftResult = {
+      draftId: `demo-draft-${parsed.data.requestId}`,
+      recovered: false,
+      threadId: summary.threadId,
+      verified: true,
+    }
+    snapshot.draftResults.set(parsed.data.requestId, result)
+    return json(res, 201, result)
+  }
+  const token = apiOptions.fastmailToken?.trim()
+  if (!token || !snapshot.context)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+  const references = [...new Set([...latest.references, ...latest.messageId])]
+  const result = await createAndVerifyDraft(snapshot.context, token, {
+    bodyHtml,
+    bodyText,
+    cc: parsed.data.cc,
+    from: { name: identity.name, email: identity.email },
+    inReplyTo: latest.messageId.slice(0, 1),
+    references,
+    subject: parsed.data.subject,
+    threadId: summary.threadId,
+    to: parsed.data.to,
+  })
+  snapshot.draftResults.set(parsed.data.requestId, result)
+  return json(res, 201, result)
+}
+
+function logApiError(error: unknown) {
+  if (error instanceof ApiHttpError && error.status < 500) return
+  const code =
+    error instanceof ApiHttpError || error instanceof JmapError || error instanceof ReplyError
+      ? error.code
+      : 'INTERNAL_ERROR'
+  process.stderr.write(
+    `${JSON.stringify({ event: 'api_error', code, message: error instanceof Error ? error.message : 'unknown' })}\n`,
+  )
+}
+
+function handleError(res: ServerResponse, error: unknown) {
+  logApiError(error)
+  if (res.headersSent || res.destroyed) {
+    if (!res.destroyed) res.destroy()
+    return
+  }
+  if (error instanceof ApiHttpError) {
+    return apiError(res, error.status, error.code, error.message, error.retryable, error.details)
+  }
+  if (error instanceof JmapError) {
+    const status = error.status === 401 ? 401 : error.status === 404 ? 404 : 502
+    return apiError(res, status, error.code, error.message, status >= 500)
+  }
+  if (error instanceof ReplyError) {
+    return apiError(res, 422, error.code, error.message, false, error.details)
+  }
+  return apiError(res, 500, 'INTERNAL_ERROR', 'Ein interner Fehler ist aufgetreten.', true)
+}
+
+export function createApiMiddleware(apiOptions: ApiOptions = {}) {
+  return async (req: IncomingMessage, res: ServerResponse, next: () => void) => {
+    if (!req.url?.startsWith('/api/')) return next()
+    const url = new URL(req.url, 'http://localhost')
+    const parts = url.pathname.split('/').filter(Boolean)
+    try {
+      if (req.method === 'GET' && url.pathname === '/api/review/options') {
+        return await options(res, apiOptions)
+      }
+      if (req.method === 'POST' && url.pathname === '/api/reviews') {
+        validateOrigin(req)
+        return await createReview(res, await readJson(req), apiOptions)
+      }
+      if (req.method === 'POST' && url.pathname === '/api/reviews/resume') {
+        validateOrigin(req)
+        return await resumeReview(res, await readJson(req), apiOptions)
+      }
+      if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
+        const snapshotId = parts[2]
+        if (req.method === 'GET' && parts[3] === 'emails' && parts[4]) {
+          return await emailDetail(res, snapshotId, parts[4], apiOptions)
+        }
+        if (req.method === 'GET' && parts[3] === 'threads' && parts[4]) {
+          return await threadContext(
+            res,
+            snapshotId,
+            parts[4],
+            url.searchParams.get('emailId') ?? '',
+            apiOptions,
+          )
+        }
+        if (req.method === 'GET' && parts[3] === 'blobs' && parts[4]) {
+          return await blob(res, url, snapshotId, parts[4], apiOptions)
+        }
+        if (req.method === 'POST' && parts[3] === 'finalize') {
+          return await finalize(req, res, snapshotId, apiOptions)
+        }
+        if (req.method === 'POST' && parts[3] === 'replies') {
+          return await reply(req, res, snapshotId, apiOptions)
+        }
+        if (req.method === 'POST' && parts[3] === 'drafts') {
+          return await draft(req, res, snapshotId, apiOptions)
+        }
+      }
+      return apiError(res, 404, 'NOT_FOUND', 'Not found')
+    } catch (error) {
+      return handleError(res, error)
+    }
+  }
+}
+
+export function clearApiStateForTests() {
+  snapshots.clear()
+}

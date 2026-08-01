@@ -1,0 +1,21 @@
+pre-commit:
+  parallel: true
+  commands:
+    biome:
+      glob: "*.{js,jsx,ts,tsx,json,jsonc,css}"
+      run: pnpm lint
+    typecheck:
+      glob: "*.{ts,tsx,json}"
+      run: pnpm typecheck
+    tests:
+      glob: "*.{ts,tsx}"
+      run: pnpm test
+    gitleaks:
+      run: gitleaks git --staged --no-banner --redact
+
+pre-push:
+  commands:
+    quality:
+      run: pnpm check
+    build:
+      run: pnpm build

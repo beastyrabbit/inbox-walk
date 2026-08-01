@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "packageRules": [
+    {
+      "description": "Keep the runtime and package manager aligned with the homelab runners",
+      "matchDatasources": ["docker", "node-version"],
+      "matchPackageNames": ["node"],
+      "rangeStrategy": "pin"
+    }
+  ]
+}

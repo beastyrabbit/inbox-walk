@@ -1,0 +1,30 @@
+# Delivery board
+
+Last updated: 2026-08-01
+
+## In progress
+
+- [ ] Publish the initial public Forgejo repository and `v0.1.0` release.
+- [ ] Create the Inbox Walk Infisical project and add runtime credentials.
+- [ ] Deploy through kub-homelab and verify Flux, Pangolin SSO, and Homepage.
+- [ ] Run the approved read-only Fastmail and synthetic OpenAI acceptance checks.
+- [ ] Complete the independent implementation/security review.
+
+## Done
+
+- [x] Stable bounded JMAP unread snapshot and exact checkpoint resume.
+- [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.
+- [x] Mailbox, newsletter, and time filters plus a message overview.
+- [x] Keyboard navigation, accessible announcements, and responsive layouts.
+- [x] Partial-safe finalization with exact success tracking and retries.
+- [x] Full-thread assisted replies with automatic all-attachment handling.
+- [x] Editable and revisable reply text with selectable identity and recipients.
+- [x] Verified Fastmail draft construction with no send-mail path.
+- [x] Unit, API, security-contract, desktop, and mobile browser tests.
+- [x] Production Node build and health/readiness endpoints.
+
+## After first release
+
+- [ ] Observe real-mail rendering edge cases and tune body-size bounds if needed.
+- [ ] Add operational metrics only if live troubleshooting shows a concrete need.
+- [ ] Reassess the broad personal-runner trust boundary if repository collaboration expands.
