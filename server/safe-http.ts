@@ -165,7 +165,27 @@ async function pinnedRequest(
   })
 }
 
-function detectedImageType(body: Buffer) {
+function safeSvg(body: Buffer) {
+  const source = body
+    .toString('utf8')
+    .replace(/^\uFEFF/, '')
+    .trimStart()
+  const withoutDeclaration = source.replace(/^<\?xml\s[^?]*\?>\s*/i, '')
+  if (!/^<svg(?:\s|>)/i.test(withoutDeclaration)) return false
+  return ![
+    /<!doctype/i,
+    /<!entity/i,
+    /<\?(?!xml\s)/i,
+    /<(?:script|foreignObject|iframe|object|embed|audio|video)\b/i,
+    /\son[a-z]+\s*=/i,
+    /\b(?:href|xlink:href)\s*=\s*["']\s*(?!#)[^"']+/i,
+    /\burl\s*\(/i,
+    /@import/i,
+    /data\s*:\s*text\/html/i,
+  ].some((pattern) => pattern.test(withoutDeclaration))
+}
+
+export function detectSafeImageType(body: Buffer) {
   if (body.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])))
     return 'image/png'
   if (body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff) return 'image/jpeg'
@@ -184,6 +204,16 @@ function detectedImageType(body: Buffer) {
     body.subarray(4, 12).toString('ascii').includes('ftypavis')
   )
     return 'image/avif'
+  if (
+    body.length >= 4 &&
+    body[0] === 0x00 &&
+    body[1] === 0x00 &&
+    body[2] === 0x01 &&
+    body[3] === 0x00
+  )
+    return 'image/x-icon'
+  if (body[0] === 0x42 && body[1] === 0x4d) return 'image/bmp'
+  if (safeSvg(body)) return 'image/svg+xml'
   return null
 }
 
@@ -191,7 +221,12 @@ export async function fetchRemoteImage(value: string) {
   let url = parsePublicHttpsUrl(value)
   for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
     const response = await pinnedRequest(url, {
-      headers: { Accept: 'image/avif,image/webp,image/png,image/jpeg,image/gif' },
+      headers: {
+        Accept:
+          'image/avif,image/webp,image/png,image/jpeg,image/gif,image/svg+xml,image/x-icon,image/bmp,*/*;q=0.1',
+        'User-Agent':
+          'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36',
+      },
       maxBytes: MAX_IMAGE_BYTES,
       method: 'GET',
     })
@@ -207,7 +242,7 @@ export async function fetchRemoteImage(value: string) {
         'UPSTREAM_FAILED',
       )
     }
-    const contentType = detectedImageType(response.body)
+    const contentType = detectSafeImageType(response.body)
     if (!contentType)
       throw new SafeHttpError('Die Antwort ist kein unterstütztes Bild.', 'UNSUPPORTED_IMAGE')
     return { body: response.body, contentType }

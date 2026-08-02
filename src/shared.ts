@@ -93,11 +93,12 @@ export interface ReviewSnapshot {
 }
 
 export interface ReviewCheckpoint {
-  version: 2
+  version: 3
   emailIds: string[]
   filters: ReviewFilters
   index: number
   keptUnreadIds: string[]
+  processedIds: string[]
   unsubscribeIds: string[]
   replyDrafts: Record<string, ReplyEditorState>
 }
@@ -113,7 +114,9 @@ export interface FinalizeResult {
   keptUnread: number
   markedRead: number
   mode: 'demo' | 'live'
+  processed: number
   remaining: number
+  untouched: number
   unsubscribeAttempted: number
   unsubscribeFailed: FinalizeFailure[]
   unsubscribeSucceeded: number

@@ -10,7 +10,7 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
       version?: number
     }
     if (
-      (value.version !== 1 && value.version !== 2) ||
+      (value.version !== 1 && value.version !== 2 && value.version !== 3) ||
       !Array.isArray(value.emailIds) ||
       !Array.isArray(value.keptUnreadIds) ||
       !value.filters ||
@@ -20,11 +20,14 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
       return null
     }
     return {
-      version: 2,
+      version: 3,
       emailIds: value.emailIds.filter((id): id is string => typeof id === 'string').slice(0, 250),
       filters: value.filters as ReviewFilters,
       index: Math.max(0, Math.floor(value.index)),
       keptUnreadIds: value.keptUnreadIds.filter((id): id is string => typeof id === 'string'),
+      processedIds: Array.isArray(value.processedIds)
+        ? value.processedIds.filter((id): id is string => typeof id === 'string')
+        : [],
       unsubscribeIds: Array.isArray(value.unsubscribeIds)
         ? value.unsubscribeIds.filter((id): id is string => typeof id === 'string')
         : [],

@@ -148,7 +148,7 @@ describe('demo API contract', () => {
     )
     const rejected = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
-      post({ keepUnreadIds: [] }),
+      post({ finalizeIds: [review.body.emails[0]?.id], keepUnreadIds: [] }),
     )
     expect(rejected.response.status).toBe(403)
     expect(rejected.body.error.code).toBe('INVALID_CSRF')
@@ -208,7 +208,7 @@ describe('demo API contract', () => {
     expect(send.body.error.code).toBe('NOT_FOUND')
   })
 
-  it('locks the final selection and finalizes only the snapshot IDs', async () => {
+  it('locks the final selection and leaves unprocessed snapshot messages untouched', async () => {
     const review = await json<ReviewSnapshot>(
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'only', timeRange: 'all' } }),
@@ -218,16 +218,43 @@ describe('demo API contract', () => {
     if (!keptId) return
     const finalized = await json<FinalizeResult>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
-      post({ keepUnreadIds: [keptId] }, review.body.csrfToken),
+      post({ finalizeIds: [keptId], keepUnreadIds: [keptId] }, review.body.csrfToken),
     )
     expect(finalized.response.status).toBe(200)
-    expect(finalized.body).toMatchObject({ finalized: true, keptUnread: 1, markedRead: 0 })
+    expect(finalized.body).toMatchObject({
+      finalized: true,
+      keptUnread: 1,
+      markedRead: 0,
+      processed: 1,
+      untouched: review.body.emails.length - 1,
+    })
 
     const changed = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
-      post({ keepUnreadIds: [] }, review.body.csrfToken),
+      post(
+        { finalizeIds: review.body.emails.map((email) => email.id), keepUnreadIds: [] },
+        review.body.csrfToken,
+      ),
     )
     expect(changed.response.status).toBe(409)
     expect(changed.body.error.code).toBe('FINALIZE_SELECTION_LOCKED')
+  })
+
+  it('rejects decisions for messages outside the partial completion selection', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const [processed, untouched] = review.body.emails
+    expect(processed).toBeDefined()
+    expect(untouched).toBeDefined()
+    if (!processed || !untouched) return
+
+    const rejected = await json<{ error: { code: string } }>(
+      `/api/reviews/${review.body.snapshotId}/finalize`,
+      post({ finalizeIds: [processed.id], keepUnreadIds: [untouched.id] }, review.body.csrfToken),
+    )
+    expect(rejected.response.status).toBe(400)
+    expect(rejected.body.error.code).toBe('INVALID_SELECTION')
   })
 })

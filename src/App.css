@@ -377,8 +377,17 @@
   opacity: 0.35;
   cursor: default;
 }
-.control-button.next {
+.completion-actions {
   justify-self: end;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.partial-finish {
+  color: var(--accent-dark);
+}
+.partial-finish-compact {
+  display: none;
 }
 .control-button kbd,
 .shortcut-list kbd {
@@ -790,7 +799,8 @@
   gap: 2px;
 }
 
-.unsubscribe-mark {
+.unsubscribe-mark,
+.processed-mark {
   color: var(--olive);
   font-size: 10px;
   font-weight: 650;
@@ -983,6 +993,12 @@
   .keep-button span,
   .unsubscribe-button span {
     display: none;
+  }
+  .partial-finish-wide {
+    display: none;
+  }
+  .partial-finish-compact {
+    display: inline;
   }
   .toast {
     right: 10px;

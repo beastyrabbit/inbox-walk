@@ -137,6 +137,7 @@ function App() {
   const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
   const [index, setIndex] = useState(0)
   const [keptUnread, setKeptUnread] = useState<Set<string>>(new Set())
+  const [processedIds, setProcessedIds] = useState<Set<string>>(new Set())
   const [unsubscribeIds, setUnsubscribeIds] = useState<Set<string>>(new Set())
   const [replyDrafts, setReplyDrafts] = useState<Record<string, ReplyEditorState>>({})
   const [threadContexts, setThreadContexts] = useState<Record<string, ThreadContext>>({})
@@ -170,13 +171,21 @@ function App() {
   const isUnsubscribeMarked = summary ? unsubscribeIds.has(summary.id) : false
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
+  const finalizedEmailIds = useMemo(
+    () => emails.map((item) => item.id).filter((id) => processedIds.has(id)),
+    [emails, processedIds],
+  )
+  const finalizedKeptUnreadIds = useMemo(
+    () => finalizedEmailIds.filter((id) => keptUnread.has(id)),
+    [finalizedEmailIds, keptUnread],
+  )
+  const finalizedUnsubscribeIds = useMemo(
+    () => finalizedEmailIds.filter((id) => unsubscribeIds.has(id)),
+    [finalizedEmailIds, unsubscribeIds],
+  )
   const readIds = useMemo(
-    () =>
-      idsToMarkRead(
-        emails.map((item) => item.id),
-        keptUnread,
-      ),
-    [emails, keptUnread],
+    () => idsToMarkRead(finalizedEmailIds, new Set(finalizedKeptUnreadIds)),
+    [finalizedEmailIds, finalizedKeptUnreadIds],
   )
 
   const startReview = useCallback(async (nextFilters: ReviewFilters, resume = loadCheckpoint()) => {
@@ -202,6 +211,7 @@ function App() {
         setIndex(clampIndex(resume.index, nextSnapshot.emails.length))
         const available = new Set(nextSnapshot.emails.map((item) => item.id))
         setKeptUnread(new Set(resume.keptUnreadIds.filter((id) => available.has(id))))
+        setProcessedIds(new Set(resume.processedIds.filter((id) => available.has(id))))
         setUnsubscribeIds(
           new Set(
             resume.unsubscribeIds.filter(
@@ -221,6 +231,7 @@ function App() {
       } else {
         setIndex(0)
         setKeptUnread(new Set())
+        setProcessedIds(new Set())
         setUnsubscribeIds(new Set())
         setReplyDrafts({})
         setStatus(`${nextSnapshot.emails.length} ungelesene Nachrichten geladen.`)
@@ -296,11 +307,12 @@ function App() {
   useEffect(() => {
     if (!snapshot || !restoredRef.current || emails.length === 0) return
     const saved = saveCheckpoint({
-      version: 2,
+      version: 3,
       emailIds: emails.map((item) => item.id),
       filters: snapshot.filters,
       index,
       keptUnreadIds: [...keptUnread],
+      processedIds: [...processedIds],
       unsubscribeIds: [...unsubscribeIds],
       replyDrafts,
     })
@@ -308,7 +320,7 @@ function App() {
       setError(
         'Der lokale Checkpoint konnte nicht gespeichert werden. Dieses Fenster offen lassen.',
       )
-  }, [emails, index, keptUnread, replyDrafts, snapshot, unsubscribeIds])
+  }, [emails, index, keptUnread, processedIds, replyDrafts, snapshot, unsubscribeIds])
 
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
@@ -344,11 +356,19 @@ function App() {
   }, [view])
 
   const next = useCallback(() => {
-    if (view !== 'review') return
+    if (view !== 'review' || !summary) return
     setReplyOpen(false)
+    setProcessedIds((current) => new Set(current).add(summary.id))
     if (index >= emails.length - 1) setView('confirm')
     else setIndex((current) => current + 1)
-  }, [emails.length, index, view])
+  }, [emails.length, index, summary, view])
+
+  const finishProcessed = useCallback(() => {
+    if (view !== 'review' || processedIds.size === 0) return
+    setReplyOpen(false)
+    setResult(null)
+    setView('confirm')
+  }, [processedIds.size, view])
 
   const toggleCurrent = useCallback(() => {
     if (!summary || view !== 'review') return
@@ -522,7 +542,12 @@ function App() {
     setSubmitting(true)
     setError(null)
     try {
-      const nextResult = await api.finalize(snapshot, [...keptUnread], [...unsubscribeIds])
+      const nextResult = await api.finalize(
+        snapshot,
+        finalizedEmailIds,
+        finalizedKeptUnreadIds,
+        finalizedUnsubscribeIds,
+      )
       setResult(nextResult)
       if (nextResult.finalized) {
         clearCheckpoint()
@@ -624,8 +649,9 @@ function App() {
         </span>
         <h1>Review abgeschlossen</h1>
         <p>
-          {result.markedRead} Nachrichten wurden als gelesen markiert. {result.keptUnread} bleiben
-          ungelesen.
+          {result.markedRead} Nachrichten wurden als gelesen markiert. {result.keptUnread}{' '}
+          bearbeitete bleiben ungelesen. {result.untouched} noch nicht bearbeitete Nachrichten
+          warten auf die nächste Runde.
           {result.unsubscribeAttempted > 0 &&
             ` ${result.unsubscribeSucceeded} von ${result.unsubscribeAttempted} Abmeldungen waren erfolgreich.`}
         </p>
@@ -650,23 +676,34 @@ function App() {
     return (
       <main className="state-page confirm-page">
         <h1>Review abschließen?</h1>
-        <p>Erst jetzt werden die ausgewählten Änderungen an Fastmail gesendet.</p>
+        <p>
+          Nur die bereits mit Weiter bestätigten Nachrichten werden jetzt verarbeitet. Alle anderen
+          bleiben ungelesen.
+        </p>
         <dl className="review-summary">
+          <div>
+            <dt>Bereits bearbeitet</dt>
+            <dd>{finalizedEmailIds.length}</dd>
+          </div>
           <div>
             <dt>Als gelesen markieren</dt>
             <dd>{readIds.length}</dd>
           </div>
           <div>
             <dt>Ungelesen behalten</dt>
-            <dd>{keptUnread.size}</dd>
+            <dd>{finalizedKeptUnreadIds.length}</dd>
           </div>
           <div>
             <dt>One-Click-Abmeldung versuchen</dt>
-            <dd>{unsubscribeIds.size}</dd>
+            <dd>{finalizedUnsubscribeIds.length}</dd>
+          </div>
+          <div>
+            <dt>Noch nicht bearbeitet</dt>
+            <dd>{emails.length - finalizedEmailIds.length} bleiben ungelesen</dd>
           </div>
           <div>
             <dt>Neue Nachrichten seit dem Start</dt>
-            <dd>bleiben unberührt</dd>
+            <dd>bleiben ebenfalls unberührt</dd>
           </div>
         </dl>
         {result && result.failed.length > 0 && (
@@ -889,10 +926,23 @@ function App() {
             <span>{isKept ? 'Bleibt ungelesen' : 'Ungelesen behalten'}</span>
           </button>
         </div>
-        <button type="button" className="control-button next" onClick={next}>
-          <span>{index === emails.length - 1 ? 'Abschließen' : 'Weiter'}</span>
-          <kbd>→</kbd>
-        </button>
+        <div className="completion-actions">
+          <button
+            type="button"
+            className="control-button partial-finish"
+            onClick={finishProcessed}
+            disabled={processedIds.size === 0}
+            aria-label={`${processedIds.size} bereits bearbeitete Nachrichten abschließen`}
+            title="Nur bereits mit Weiter bestätigte Nachrichten abschließen"
+          >
+            <span className="partial-finish-wide">Bisher abschließen · {processedIds.size}</span>
+            <span className="partial-finish-compact">{processedIds.size} fertig</span>
+          </button>
+          <button type="button" className="control-button next" onClick={next}>
+            <span>{index === emails.length - 1 ? 'Abschließen' : 'Weiter'}</span>
+            <kbd>→</kbd>
+          </button>
+        </div>
       </footer>
 
       <p className="sr-only" aria-live="polite">
@@ -912,6 +962,7 @@ function App() {
           emails={emails}
           currentIndex={index}
           keptUnread={keptUnread}
+          processedIds={processedIds}
           unsubscribeIds={unsubscribeIds}
           onClose={() => setOverviewOpen(false)}
           onSelect={(nextIndex) => {
@@ -1054,6 +1105,7 @@ function OverviewDrawer({
   emails,
   currentIndex,
   keptUnread,
+  processedIds,
   unsubscribeIds,
   onClose,
   onDiscard,
@@ -1062,6 +1114,7 @@ function OverviewDrawer({
   emails: ReviewSnapshot['emails']
   currentIndex: number
   keptUnread: ReadonlySet<string>
+  processedIds: ReadonlySet<string>
   unsubscribeIds: ReadonlySet<string>
   onClose: () => void
   onDiscard: () => void
@@ -1082,7 +1135,8 @@ function OverviewDrawer({
           <div>
             <h2>Nachrichten</h2>
             <p>
-              {keptUnread.size} bleiben ungelesen · {unsubscribeIds.size} Abmeldungen
+              {processedIds.size} bearbeitet · {keptUnread.size} bleiben ungelesen ·{' '}
+              {unsubscribeIds.size} Abmeldungen
             </p>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
@@ -1103,6 +1157,7 @@ function OverviewDrawer({
                   <small>{addressLine(item.from)}</small>
                 </span>
                 <span className="overview-marks">
+                  {processedIds.has(item.id) && <span className="processed-mark">bearbeitet</span>}
                   {keptUnread.has(item.id) && <span className="unread-mark">ungelesen</span>}
                   {unsubscribeIds.has(item.id) && (
                     <span className="unsubscribe-mark">abmelden</span>

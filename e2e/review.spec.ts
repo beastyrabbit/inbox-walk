@@ -36,13 +36,27 @@ test('creates and verifies a draft without exposing a send action', async ({ pag
 })
 
 test('requires confirmation before finalizing the fixed snapshot', async ({ page }) => {
-  await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
-  await page.getByRole('button', { name: /Samstagsbrief · Augustanfang/ }).click()
-  await page.getByRole('button', { name: 'Abschließen' }).click()
+  for (let index = 0; index < 4; index += 1) await page.keyboard.press('ArrowRight')
   await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+  await expect(page.getByText('Bereits bearbeitet')).toBeVisible()
   await expect(page.getByText('Neue Nachrichten seit dem Start')).toBeVisible()
   await page.getByRole('button', { name: 'Änderungen speichern' }).click()
   await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+})
+
+test('can finalize only messages already confirmed with Weiter', async ({ page }) => {
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('ArrowRight')
+  await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+  await expect(
+    page.locator('.review-summary div').filter({ hasText: 'Ungelesen behalten' }),
+  ).toContainText('1')
+  await expect(page.getByText('3 bleiben ungelesen')).toBeVisible()
+  await page.getByRole('button', { name: 'Änderungen speichern' }).click()
+  await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+  await expect(page.getByText(/3 noch nicht bearbeitete Nachrichten/)).toBeVisible()
 })
 
 test('opens keyboard help and closes it with Escape', async ({ page }) => {

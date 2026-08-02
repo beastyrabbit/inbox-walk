@@ -87,10 +87,15 @@ export const api = {
       ),
     )
   },
-  async finalize(snapshot: ReviewSnapshot, keepUnreadIds: string[], unsubscribeIds: string[]) {
+  async finalize(
+    snapshot: ReviewSnapshot,
+    finalizeIds: string[],
+    keepUnreadIds: string[],
+    unsubscribeIds: string[],
+  ) {
     return post<FinalizeResult>(
       `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/finalize`,
-      { keepUnreadIds, unsubscribeIds },
+      { finalizeIds, keepUnreadIds, unsubscribeIds },
       snapshot.csrfToken,
     )
   },

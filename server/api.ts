@@ -69,6 +69,7 @@ interface StoredSnapshot {
   draftResults: Map<string, DraftResult>
   emailIds: string[]
   filters: ReviewFilters
+  finalEmailIds?: Set<string>
   finalKeepIds?: Set<string>
   finalUnsubscribeIds?: Set<string>
   finalizationState: 'active' | 'finalized' | 'finalizing'
@@ -698,12 +699,13 @@ async function finalize(
   const snapshot = getSnapshot(snapshotId)
   requireCsrf(req, snapshot)
   const body = await readJson(req)
+  const finalized = z.array(z.string().min(1)).min(1).max(250).safeParse(body.finalizeIds)
   const kept = z.array(z.string().min(1)).max(250).safeParse(body.keepUnreadIds)
   const unsubscribe = z
     .array(z.string().min(1))
     .max(250)
     .safeParse(body.unsubscribeIds ?? [])
-  if (!kept.success || !unsubscribe.success)
+  if (!finalized.success || !kept.success || !unsubscribe.success)
     throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
   if (snapshot.finalizationState === 'finalizing') {
     throw new ApiHttpError(
@@ -714,6 +716,13 @@ async function finalize(
     )
   }
   const known = new Set(snapshot.emailIds)
+  if (finalized.data.some((id) => !known.has(id))) {
+    throw new ApiHttpError(
+      400,
+      'UNKNOWN_EMAIL',
+      'Die Abschlussauswahl enthält eine unbekannte Nachricht.',
+    )
+  }
   if (kept.data.some((id) => !known.has(id))) {
     throw new ApiHttpError(400, 'UNKNOWN_EMAIL', 'Die Auswahl enthält eine unbekannte Nachricht.')
   }
@@ -734,8 +743,34 @@ async function finalize(
       'Mindestens eine Nachricht unterstützt keine sichere One-Click-Abmeldung.',
     )
   }
+  const requestedFinalize = new Set(finalized.data)
   const requestedKeep = new Set(kept.data)
   const requestedUnsubscribe = new Set(unsubscribe.data)
+  if ([...requestedKeep].some((id) => !requestedFinalize.has(id))) {
+    throw new ApiHttpError(
+      400,
+      'INVALID_SELECTION',
+      'Ungelesen geschützte Nachrichten müssen bereits bearbeitet sein.',
+    )
+  }
+  if ([...requestedUnsubscribe].some((id) => !requestedFinalize.has(id))) {
+    throw new ApiHttpError(
+      400,
+      'INVALID_SELECTION',
+      'Abmeldungen müssen zu bereits bearbeiteten Nachrichten gehören.',
+    )
+  }
+  if (snapshot.finalEmailIds) {
+    const unchanged =
+      requestedFinalize.size === snapshot.finalEmailIds.size &&
+      [...requestedFinalize].every((id) => snapshot.finalEmailIds?.has(id))
+    if (!unchanged)
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_SELECTION_LOCKED',
+        'Die Abschlussauswahl ist bereits festgeschrieben.',
+      )
+  } else snapshot.finalEmailIds = requestedFinalize
   if (snapshot.finalKeepIds) {
     const unchanged =
       requestedKeep.size === snapshot.finalKeepIds.size &&
@@ -759,9 +794,10 @@ async function finalize(
       )
   } else snapshot.finalUnsubscribeIds = requestedUnsubscribe
 
-  const toMark = snapshot.emailIds.filter(
+  const toMark = [...requestedFinalize].filter(
     (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
   )
+  const untouched = snapshot.emailIds.length - requestedFinalize.size
   snapshot.finalizationState = 'finalizing'
   try {
     if (snapshot.mode === 'demo') {
@@ -777,7 +813,9 @@ async function finalize(
         keptUnread: requestedKeep.size,
         markedRead: snapshot.succeededIds.size,
         mode: 'demo',
+        processed: requestedFinalize.size,
         remaining: 0,
+        untouched,
         unsubscribeAttempted: snapshot.unsubscribeAttemptedIds.size,
         unsubscribeFailed: [],
         unsubscribeSucceeded: snapshot.unsubscribeSucceededIds.size,
@@ -804,7 +842,7 @@ async function finalize(
     }
     const update = await markEmailsRead(snapshot.context, token, toMark)
     for (const id of update.markedIds) snapshot.succeededIds.add(id)
-    const remaining = snapshot.emailIds.filter(
+    const remaining = [...requestedFinalize].filter(
       (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
     ).length
     snapshot.finalizationState = remaining === 0 ? 'finalized' : 'active'
@@ -814,7 +852,9 @@ async function finalize(
       keptUnread: requestedKeep.size,
       markedRead: snapshot.succeededIds.size,
       mode: 'live',
+      processed: requestedFinalize.size,
       remaining,
+      untouched,
       unsubscribeAttempted: snapshot.unsubscribeAttemptedIds.size,
       unsubscribeFailed: [...snapshot.unsubscribeFailures].map(([id, reason]) => ({ id, reason })),
       unsubscribeSucceeded: snapshot.unsubscribeSucceededIds.size,

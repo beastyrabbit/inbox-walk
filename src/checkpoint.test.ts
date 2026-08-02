@@ -38,15 +38,20 @@ beforeEach(() => storage.clear())
 describe('local review checkpoint', () => {
   it('stores IDs and decisions without message bodies', () => {
     saveCheckpoint({
-      version: 2,
+      version: 3,
       emailIds: ['mail-1'],
       filters: { mailboxId: null, newsletter: 'all', timeRange: '7d' },
       index: 0,
       keptUnreadIds: ['mail-1'],
+      processedIds: ['mail-1'],
       unsubscribeIds: [],
       replyDrafts: {},
     })
-    expect(loadCheckpoint()).toMatchObject({ emailIds: ['mail-1'], keptUnreadIds: ['mail-1'] })
+    expect(loadCheckpoint()).toMatchObject({
+      emailIds: ['mail-1'],
+      keptUnreadIds: ['mail-1'],
+      processedIds: ['mail-1'],
+    })
     expect(JSON.stringify(localStorage)).not.toContain('message body')
   })
 
@@ -54,11 +59,12 @@ describe('local review checkpoint', () => {
     localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
     expect(loadCheckpoint()).toBeNull()
     saveCheckpoint({
-      version: 2,
+      version: 3,
       emailIds: [],
       filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
       index: 0,
       keptUnreadIds: [],
+      processedIds: [],
       unsubscribeIds: [],
       replyDrafts: {},
     })
@@ -72,14 +78,31 @@ describe('local review checkpoint', () => {
     })
     expect(
       saveCheckpoint({
-        version: 2,
+        version: 3,
         emailIds: ['mail-1'],
         filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
         index: 0,
         keptUnreadIds: [],
+        processedIds: [],
         unsubscribeIds: [],
         replyDrafts: {},
       }),
     ).toBe(false)
+  })
+
+  it('migrates old checkpoints without assuming messages were processed', () => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 2,
+        emailIds: ['mail-1'],
+        filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
+        index: 1,
+        keptUnreadIds: [],
+        unsubscribeIds: [],
+        replyDrafts: {},
+      }),
+    )
+    expect(loadCheckpoint()).toMatchObject({ version: 3, processedIds: [] })
   })
 })
