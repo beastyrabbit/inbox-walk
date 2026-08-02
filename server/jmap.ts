@@ -64,7 +64,7 @@ interface JmapEmail {
   threadId: string
   to?: MailAddress[] | null
   'header:List-Id:asText'?: string | null
-  'header:List-Unsubscribe:asText'?: string | null
+  'header:List-Unsubscribe:asURLs'?: string[] | null
 }
 
 interface JmapIdentity extends MailIdentity {
@@ -252,7 +252,7 @@ function isIncoming(email: JmapEmail, mailboxes: Map<string, Mailbox>) {
 
 function isNewsletter(email: JmapEmail) {
   return Boolean(
-    email['header:List-Id:asText']?.trim() || email['header:List-Unsubscribe:asText']?.trim(),
+    email['header:List-Id:asText']?.trim() || email['header:List-Unsubscribe:asURLs']?.length,
   )
 }
 
@@ -282,7 +282,7 @@ const SUMMARY_PROPERTIES = [
   'preview',
   'hasAttachment',
   'header:List-Id:asText',
-  'header:List-Unsubscribe:asText',
+  'header:List-Unsubscribe:asURLs',
 ]
 
 const DETAIL_PROPERTIES = [

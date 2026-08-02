@@ -24,22 +24,21 @@ Fastmail.
 
 ## Local development
 
-Install dependencies and run the explicit sample inbox through Portless:
+Install dependencies, start Apache Tika, and run the live app through Portless:
 
 ```bash
 pnpm install
-pnpm dev:demo:portless
+docker run --rm -p 9998:9998 apache/tika:3.3.1.0-full
+pnpm dev:portless
 ```
 
 Open <https://inbox-walk.localhost:1355>.
 
-Live mode never falls back to sample data. Copy `.env.example` to `.env`, add a
-Fastmail API token with Mail access, start Apache Tika, and run:
-
-```bash
-docker run --rm -p 9998:9998 apache/tika:3.3.1.0-full
-pnpm dev:portless
-```
+`pnpm dev` injects `FASTMAIL_JMAP_TOKEN` from the `Kub-Homelab` Infisical
+project, environment `dev`, path `/kubernetes/tools/inbox-walk-secret`. The
+development token is read-only, so local development can review real mail but
+cannot mark messages read or create Fastmail drafts. Live mode never falls back
+to sample data.
 
 The app reuses an existing Pi `openai-codex` login from
 `~/.pi/agent/auth.json` during local development. Otherwise, choose **Codex
@@ -76,7 +75,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
 The Codex OAuth record is stored under `DATA_DIR`; `TIKA_URL` points to the
-document-extraction sidecar. `MAIL_REVIEW_DEMO=1` is an explicit demo-only mode.
+document-extraction sidecar.
 
 Deployment is managed from `beasty/kub-homelab`. Runtime secrets are synced by
 the Infisical Operator; no secret values belong in this repository or in the
