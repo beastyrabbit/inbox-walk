@@ -80,6 +80,30 @@
   gap: 14px;
 }
 
+.codex-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  border: 0;
+  color: var(--danger);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.codex-status span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.codex-status.connected {
+  color: var(--olive);
+}
+
 .text-button {
   padding: 6px 2px;
   color: var(--accent-dark);
@@ -595,6 +619,59 @@
 }
 .help-dialog {
   width: min(420px, 100%);
+}
+
+.dialog-kicker {
+  margin: 4px 0 0;
+  color: var(--ink-soft);
+  font-size: 11px;
+}
+
+.codex-login-state {
+  display: grid;
+  gap: 14px;
+  margin: 18px 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.codex-login-state code {
+  padding: 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: 7px;
+  background: #fffefa;
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-align: center;
+  user-select: all;
+}
+
+.codex-login-state .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+}
+
+.codex-login-state.failed {
+  border-color: #d3a19d;
+  color: #70241f;
+  background: #f7e4e1;
+}
+
+.codex-current {
+  margin: 18px 0;
+  color: var(--danger);
+  font-size: 13px;
+}
+
+.codex-current.connected {
+  color: var(--olive);
 }
 .shortcut-list {
   margin: 0;

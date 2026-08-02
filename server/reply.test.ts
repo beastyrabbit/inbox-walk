@@ -1,4 +1,3 @@
-import type OpenAI from 'openai'
 import { describe, expect, it } from 'vitest'
 import type { MailIdentity, MailResource, ThreadMessage } from '../src/shared.ts'
 import {
@@ -96,14 +95,7 @@ describe('reply construction', () => {
     )
   })
 
-  it('turns exhausted OpenAI credit into an actionable app error', async () => {
-    const client = {
-      responses: {
-        parse: async () => {
-          throw { status: 429, code: 'credit_balance_exhausted', requestID: 'req-test' }
-        },
-      },
-    } as unknown as OpenAI
+  it('turns an expired Codex subscription login into an actionable app error', async () => {
     await expect(
       generateReply(
         {
@@ -115,11 +107,97 @@ describe('reply construction', () => {
           username: 'alex@example.com',
         },
         'unused-token',
-        'unused-key',
         [message],
         { requestId: crypto.randomUUID(), roughNotes: 'Bestätigen.' },
-        client,
+        {
+          runCodex: async () => {
+            throw new Error('OAuth token is unauthorized')
+          },
+        },
       ),
-    ).rejects.toMatchObject({ code: 'OPENAI_QUOTA_EXHAUSTED' })
+    ).rejects.toMatchObject({ code: 'CODEX_AUTH_FAILED', status: 503 })
+  })
+
+  it.each([
+    {
+      providerMessage: 'You have 120000 weighted tokens left — usage limit reached',
+      expected: { code: 'CODEX_USAGE_LIMIT', retryable: false, status: 429 },
+    },
+    {
+      providerMessage: 'This request exceeds the maximum number of tokens allowed',
+      expected: { code: 'CODEX_CONTEXT_LIMIT', retryable: false, status: 422 },
+    },
+    {
+      providerMessage: 'Codex inference timed out after 300000 ms.',
+      expected: { code: 'CODEX_TIMEOUT', retryable: false, status: 504 },
+    },
+  ])(
+    'classifies provider limits without claiming OAuth expired',
+    async ({ providerMessage, expected }) => {
+      await expect(
+        generateReply(
+          {
+            accountId: 'account-1',
+            apiUrl: 'https://api.example/jmap',
+            downloadUrl: 'https://api.example/download/{blobId}',
+            maxObjectsInGet: 10,
+            maxObjectsInSet: 10,
+            username: 'alex@example.com',
+          },
+          'unused-token',
+          [message],
+          { requestId: crypto.randomUUID(), roughNotes: 'Bestätigen.' },
+          {
+            runCodex: async () => {
+              throw new Error(providerMessage)
+            },
+          },
+        ),
+      ).rejects.toMatchObject(expected)
+    },
+  )
+
+  it('includes every supported attachment and fails closed through injected processing', async () => {
+    const withAttachments: ThreadMessage = {
+      ...message,
+      hasAttachment: true,
+      attachments: [
+        { blobId: 'document', name: 'brief.pdf', type: 'application/pdf', size: 8 },
+        { blobId: 'image', name: 'plan.png', type: 'image/png', size: 8 },
+      ],
+    }
+    let prompt = ''
+    let imageCount = 0
+    const result = await generateReply(
+      {
+        accountId: 'account-1',
+        apiUrl: 'https://api.example/jmap',
+        downloadUrl: 'https://api.example/download/{blobId}',
+        maxObjectsInGet: 10,
+        maxObjectsInSet: 10,
+        username: 'alex@example.com',
+      },
+      'unused-token',
+      [withAttachments],
+      { requestId: crypto.randomUUID(), roughNotes: 'Bestätigen.' },
+      {
+        download: async (_context, _token, resource) =>
+          new Response(resource.blobId === 'image' ? 'png-data' : 'pdf-data'),
+        extractDocument: async (resource) => `Vollständiger Inhalt von ${resource.name}`,
+        runCodex: async (input) => {
+          prompt = input.prompt
+          imageCount = input.images.length
+          return {
+            bodyText: 'Bestätigt.',
+            supportedDetails: [{ detail: 'Bestätigung', sourceMessageIds: ['mail-1'] }],
+            questions: [],
+            warnings: [],
+          }
+        },
+      },
+    )
+    expect(prompt).toContain('Vollständiger Inhalt von brief.pdf')
+    expect(imageCount).toBe(1)
+    expect(result.attachmentManifest).toHaveLength(2)
   })
 })

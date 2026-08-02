@@ -5,6 +5,7 @@ import { clearCheckpoint, loadCheckpoint, saveCheckpoint } from './checkpoint.ts
 import { emailDocument } from './email-document.ts'
 import { clampIndex, idsToMarkRead, toggleKeptUnread } from './review-state.ts'
 import {
+  type CodexLoginState,
   type DraftResult,
   defaultReviewFilters,
   type FinalizeResult,
@@ -146,6 +147,9 @@ function App() {
   const [filtersOpen, setFiltersOpen] = useState(false)
   const [replyOpen, setReplyOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const [codexLoginOpen, setCodexLoginOpen] = useState(false)
+  const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
+  const [codexLoginBusy, setCodexLoginBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [replyLoading, setReplyLoading] = useState(false)
@@ -163,6 +167,8 @@ function App() {
   const proposal = summary ? replyProposals[summary.id] : undefined
   const draftResult = summary ? draftResults[summary.id] : undefined
   const isKept = summary ? keptUnread.has(summary.id) : false
+  const codexLoginId = codexLogin?.id
+  const codexLoginStatus = codexLogin?.status
   const readIds = useMemo(
     () =>
       idsToMarkRead(
@@ -237,6 +243,45 @@ function App() {
       active = false
     }
   }, [startReview])
+
+  useEffect(() => {
+    if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
+      return
+    let active = true
+    let polling = false
+    const poll = async () => {
+      if (polling) return
+      polling = true
+      try {
+        const next = await api.codexLoginState(codexLoginId)
+        if (!active) return
+        if (next.status === 'completed') {
+          const auth = await api.codexStatus()
+          if (active) setOptions((current) => (current ? { ...current, codex: auth } : current))
+        }
+        if (active) setCodexLogin(next)
+      } catch (cause) {
+        if (active) {
+          setCodexLogin({
+            id: codexLoginId,
+            status: 'failed',
+            message:
+              cause instanceof ClientApiError && cause.status === 404
+                ? 'Die Anmeldung ist nach einem App-Neustart abgelaufen. Bitte starte sie erneut.'
+                : 'Der Anmeldestatus konnte nicht geladen werden. Bitte starte die Anmeldung erneut.',
+          })
+        }
+      } finally {
+        polling = false
+      }
+    }
+    void poll()
+    const timer = window.setInterval(() => void poll(), 1_500)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [codexLoginId, codexLoginStatus])
 
   useEffect(() => {
     if (!snapshot || !restoredRef.current || emails.length === 0) return
@@ -484,6 +529,19 @@ function App() {
     await startReview(filters, null)
   }
 
+  async function startCodexLogin() {
+    setCodexLoginBusy(true)
+    setError(null)
+    try {
+      const { id } = await api.startCodexLogin()
+      setCodexLogin({ id, status: 'starting', message: 'Anmeldung wird vorbereitet …' })
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setCodexLoginBusy(false)
+    }
+  }
+
   if (loading) {
     return (
       <main className="state-page" aria-busy="true">
@@ -638,6 +696,16 @@ function App() {
         </button>
         <div className="top-actions">
           {snapshot.mode === 'demo' && <span className="mode-label">Demo</span>}
+          {snapshot.mode === 'live' && (
+            <button
+              type="button"
+              className={`codex-status ${options?.codex.configured ? 'connected' : ''}`}
+              onClick={() => setCodexLoginOpen(true)}
+            >
+              <span aria-hidden="true" />
+              {options?.codex.configured ? 'Codex verbunden' : 'Codex anmelden'}
+            </button>
+          )}
           <button type="button" className="text-button" onClick={() => setFiltersOpen(true)}>
             Filter
           </button>
@@ -813,6 +881,16 @@ function App() {
         />
       )}
       {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+      {codexLoginOpen && options && (
+        <CodexLoginDialog
+          authConfigured={options.codex.configured}
+          busy={codexLoginBusy}
+          login={codexLogin}
+          model={options.codex.model}
+          onClose={() => setCodexLoginOpen(false)}
+          onStart={() => void startCodexLogin()}
+        />
+      )}
       {replyOpen && (
         <ReplyPanel
           context={thread}
@@ -1039,6 +1117,76 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
   )
 }
 
+function CodexLoginDialog({
+  authConfigured,
+  busy,
+  login,
+  model,
+  onClose,
+  onStart,
+}: {
+  authConfigured: boolean
+  busy: boolean
+  login: CodexLoginState | null
+  model: string
+  onClose: () => void
+  onStart: () => void
+}) {
+  const dialogRef = useFocusRegion<HTMLElement>(true)
+  const waiting = login?.status === 'starting' || login?.status === 'waiting'
+  return (
+    <div className="dialog-backdrop">
+      <section
+        ref={dialogRef}
+        className="dialog codex-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="codex-title"
+        tabIndex={-1}
+      >
+        <div className="dialog-header">
+          <div>
+            <h2 id="codex-title">Codex verbinden</h2>
+            <p className="dialog-kicker">ChatGPT-Abo · {model}</p>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
+            ×
+          </button>
+        </div>
+        <p className="dialog-note">
+          OpenAI erneuert diese OAuth-Anmeldung automatisch. Sie bleibt auf dem privaten
+          App-Speicher; ein OpenAI-API-Schlüssel ist nicht nötig.
+        </p>
+        {login ? (
+          <div className={`codex-login-state ${login.status}`} aria-live="polite">
+            <strong>{login.message}</strong>
+            {login.userCode && <code>{login.userCode}</code>}
+            {login.url && (
+              <a className="button primary" href={login.url} target="_blank" rel="noreferrer">
+                OpenAI-Anmeldung öffnen
+              </a>
+            )}
+          </div>
+        ) : (
+          <p className={`codex-current ${authConfigured ? 'connected' : ''}`}>
+            {authConfigured ? 'Codex ist verbunden.' : 'Codex ist noch nicht verbunden.'}
+          </p>
+        )}
+        <div className="button-row">
+          <button type="button" className="button secondary" onClick={onClose}>
+            Schließen
+          </button>
+          {!waiting && login?.status !== 'completed' && (
+            <button type="button" className="button primary" disabled={busy} onClick={onStart}>
+              {authConfigured ? 'Neu anmelden' : 'Mit ChatGPT anmelden'}
+            </button>
+          )}
+        </div>
+      </section>
+    </div>
+  )
+}
+
 function ReplyPanel({
   context,
   draftResult,
@@ -1088,7 +1236,7 @@ function ReplyPanel({
       ) : editor && context ? (
         <div className="reply-form">
           <section className="context-note">
-            <strong>Kontext für OpenAI</strong>
+            <strong>Kontext für Codex</strong>
             <p>
               Alle {context.messages.length} Thread-Nachrichten und alle{' '}
               {context.attachmentManifest.length} Anhänge werden automatisch berücksichtigt. Wenn

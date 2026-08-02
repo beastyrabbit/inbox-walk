@@ -9,7 +9,7 @@ import type {
   ReviewSnapshot,
   ThreadContext,
 } from '../src/shared.ts'
-import { clearApiStateForTests, createApiMiddleware } from './api.ts'
+import { clearApiStateForTests, createApiMiddleware, safeCodexLoginUrl } from './api.ts'
 
 let server: Server
 let baseUrl = ''
@@ -31,7 +31,32 @@ function post(body: unknown, csrfToken?: string): RequestInit {
 }
 
 beforeAll(async () => {
-  const middleware = createApiMiddleware({ forceDemo: true })
+  const middleware = createApiMiddleware({
+    forceDemo: true,
+    codexAuthStorage: () => ({
+      login: async (_provider, callbacks) => {
+        const selected = await callbacks.onSelect({
+          message: 'Methode',
+          options: [
+            { id: 'browser', label: 'Browser' },
+            { id: 'device_code', label: 'Gerätecode' },
+          ],
+        })
+        if (selected !== 'device_code') throw new Error('Expected device-code login')
+        callbacks.onDeviceCode({
+          userCode: 'TEST-CODE',
+          verificationUri: 'https://auth.openai.com/codex/device',
+        })
+        await new Promise<void>((_resolve, reject) => {
+          callbacks.signal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('Cancelled', 'AbortError')),
+            { once: true },
+          )
+        })
+      },
+    }),
+  })
   server = createServer((request, response) => {
     void middleware(request, response, () => {
       response.statusCode = 404
@@ -53,6 +78,36 @@ afterAll(async () => {
 beforeEach(() => clearApiStateForTests())
 
 describe('demo API contract', () => {
+  it('allows only the official OpenAI host for login links', () => {
+    expect(safeCodexLoginUrl('https://auth.openai.com/codex/device')).toBe(
+      'https://auth.openai.com/codex/device',
+    )
+    expect(() => safeCodexLoginUrl('https://auth.openai.com.example.test/codex/device')).toThrow(
+      'unerwartete Zieladresse',
+    )
+    expect(() => safeCodexLoginUrl('http://auth.openai.com/codex/device')).toThrow(
+      'unerwartete Zieladresse',
+    )
+  })
+
+  it('starts a headless Codex subscription login without exposing credentials', async () => {
+    const started = await json<{ id: string }>('/api/auth/codex/start', post({}))
+    expect(started.response.status).toBe(202)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    const state = await json<{
+      status: string
+      url: string
+      userCode: string
+    }>(`/api/auth/codex/${started.body.id}`)
+    expect(state.body).toMatchObject({
+      status: 'waiting',
+      url: 'https://auth.openai.com/codex/device',
+      userCode: 'TEST-CODE',
+    })
+    expect(state.body).not.toHaveProperty('access')
+    expect(state.body).not.toHaveProperty('refresh')
+  })
+
   it('creates a fixed review and lazily loads a detail', async () => {
     const options = await json<ReviewOptions>('/api/review/options')
     expect(options.response.status).toBe(200)

@@ -4,10 +4,12 @@ import { createApiMiddleware } from './server/api.ts'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
+  for (const key of ['CODEX_INFERENCE_TIMEOUT_MS', 'CODEX_MODEL', 'DATA_DIR', 'TIKA_URL']) {
+    if (!process.env[key] && env[key]) process.env[key] = env[key]
+  }
   const apiOptions = {
     fastmailToken: process.env.FASTMAIL_JMAP_TOKEN || env.FASTMAIL_JMAP_TOKEN,
     forceDemo: (process.env.MAIL_REVIEW_DEMO || env.MAIL_REVIEW_DEMO) === '1',
-    openaiApiKey: process.env.OPENAI_API_KEY || env.OPENAI_API_KEY,
   }
   return {
     server: {

@@ -1,7 +1,7 @@
 {
   "name": "inbox-walk",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -21,10 +21,12 @@
     "hooks:install": "lefthook install"
   },
   "dependencies": {
+    "@earendil-works/pi-ai": "0.80.7",
+    "@earendil-works/pi-coding-agent": "0.80.7",
     "dompurify": "^3.4.12",
-    "openai": "^7.2.0",
     "react": "^19.2.8",
     "react-dom": "^19.2.8",
+    "typebox": "1.1.38",
     "zod": "^4.4.3"
   },
   "devDependencies": {

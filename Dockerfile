@@ -20,7 +20,11 @@ FROM node:24-bookworm-slim AS runtime
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
 ENV PORT=3000
+ENV DATA_DIR=/data
+ENV CODEX_MODEL=gpt-5.6-sol
 WORKDIR /app
+
+RUN mkdir -p /data && chown node:node /data
 
 COPY --from=build --chown=node:node /app/package.json ./package.json
 COPY --from=build --chown=node:node /app/node_modules ./node_modules

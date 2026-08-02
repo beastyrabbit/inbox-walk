@@ -5,6 +5,8 @@ import { pipeline } from 'node:stream/promises'
 import { z } from 'zod'
 import type {
   ApiError,
+  CodexAuthStatus,
+  CodexLoginState,
   DraftResult,
   FinalizeResult,
   MailboxOption,
@@ -18,6 +20,7 @@ import type {
   ThreadMessage,
 } from '../src/shared.ts'
 import { defaultReviewFilters } from '../src/shared.ts'
+import { codexAuthStatus, getCodexAuthStorage } from './codex.ts'
 import { demoEmails } from './demo.ts'
 import {
   createAndVerifyDraft,
@@ -79,12 +82,18 @@ interface StoredSnapshot {
 }
 
 export interface ApiOptions {
+  codexAuthStatus?: () => CodexAuthStatus
+  codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
   fastmailToken?: string
   forceDemo?: boolean
-  openaiApiKey?: string
 }
 
 const snapshots = new Map<string, StoredSnapshot>()
+interface CodexLoginRecord extends CodexLoginState {
+  controller: AbortController
+  createdAt: number
+}
+const codexLogins = new Map<string, CodexLoginRecord>()
 
 function securityHeaders(res: ServerResponse) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -373,8 +382,12 @@ async function resumeReview(
 }
 
 async function options(res: ServerResponse, apiOptions: ApiOptions) {
+  const codex = apiOptions.forceDemo
+    ? { configured: false, model: 'gpt-5.6-sol' }
+    : (apiOptions.codexAuthStatus ?? codexAuthStatus)()
   if (apiOptions.forceDemo) {
     return json(res, 200, {
+      codex,
       mode: 'demo',
       mailboxes: [
         { id: 'Inbox', name: 'Inbox', role: 'inbox' },
@@ -387,7 +400,126 @@ async function options(res: ServerResponse, apiOptions: ApiOptions) {
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
   const result = await fetchReviewOptions(token)
-  return json(res, 200, { mode: 'live', mailboxes: result.mailboxes })
+  return json(res, 200, { codex, mode: 'live', mailboxes: result.mailboxes })
+}
+
+export function safeCodexLoginUrl(value: string) {
+  const url = new URL(value)
+  if (url.protocol !== 'https:' || url.hostname !== 'auth.openai.com') {
+    throw new Error('Die Codex-Anmeldung hat eine unerwartete Zieladresse geliefert.')
+  }
+  return url.toString()
+}
+
+function pruneCodexLogins() {
+  const cutoff = Date.now() - 20 * 60 * 1000
+  for (const [id, state] of codexLogins) {
+    if (state.createdAt < cutoff) {
+      state.controller.abort()
+      codexLogins.delete(id)
+    }
+  }
+}
+
+function codexLoginFailureReason(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  if (error instanceof DOMException && error.name === 'AbortError') return 'cancelled'
+  if (/network|fetch|connect|econn|dns/i.test(message)) return 'network'
+  if (/cancel/i.test(message)) return 'cancelled'
+  return 'unexpected'
+}
+
+async function startCodexLogin(res: ServerResponse, apiOptions: ApiOptions) {
+  pruneCodexLogins()
+  for (const state of codexLogins.values()) {
+    if (state.status === 'starting' || state.status === 'waiting') state.controller.abort()
+  }
+  const id = randomUUID()
+  const createdAt = Date.now()
+  const controller = new AbortController()
+  codexLogins.set(id, {
+    id,
+    controller,
+    createdAt,
+    status: 'starting',
+    message: 'Anmeldung wird vorbereitet …',
+  })
+  const authStorage = (apiOptions.codexAuthStorage ?? getCodexAuthStorage)()
+  void authStorage
+    .login('openai-codex', {
+      onAuth: ({ url }) => {
+        codexLogins.set(id, {
+          id,
+          controller,
+          createdAt,
+          status: 'waiting',
+          message: 'Öffne die OpenAI-Anmeldeseite.',
+          url: safeCodexLoginUrl(url),
+        })
+      },
+      onDeviceCode: ({ userCode, verificationUri }) => {
+        codexLogins.set(id, {
+          id,
+          controller,
+          createdAt,
+          status: 'waiting',
+          message: 'Melde dich mit ChatGPT an und bestätige diesen Gerätecode.',
+          url: safeCodexLoginUrl(verificationUri),
+          userCode,
+        })
+      },
+      onPrompt: async () => {
+        throw new Error('Die Codex-Anmeldung benötigt unerwartet eine interaktive Eingabe.')
+      },
+      onManualCodeInput: async () => {
+        throw new Error('Die Codex-Anmeldung benötigt unerwartet einen manuellen Rückgabecode.')
+      },
+      onSelect: async ({ options: loginOptions }) =>
+        loginOptions.find((option) => option.id === 'device_code')?.id,
+      onProgress: (message) => {
+        const current = codexLogins.get(id)
+        if (current)
+          codexLogins.set(id, {
+            ...current,
+            message: message ? 'Anmeldung wird verarbeitet …' : current.message,
+          })
+      },
+      signal: controller.signal,
+    })
+    .then(() => {
+      if (!codexLogins.has(id)) return
+      codexLogins.set(id, {
+        id,
+        controller,
+        createdAt,
+        status: 'completed',
+        message: 'Codex ist mit dem ChatGPT-Abo angemeldet.',
+      })
+    })
+    .catch((error) => {
+      if (!codexLogins.has(id)) return
+      const reason = codexLoginFailureReason(error)
+      process.stderr.write(`${JSON.stringify({ event: 'codex_login_failed', reason })}\n`)
+      codexLogins.set(id, {
+        id,
+        controller,
+        createdAt,
+        status: 'failed',
+        message:
+          reason === 'cancelled'
+            ? 'Die Anmeldung wurde durch einen neuen Versuch ersetzt.'
+            : 'Die Codex-Anmeldung ist fehlgeschlagen. Bitte versuche es erneut.',
+      })
+    })
+  return json(res, 202, { id })
+}
+
+function codexLoginState(res: ServerResponse, id: string) {
+  pruneCodexLogins()
+  const state = codexLogins.get(id)
+  if (!state) throw new ApiHttpError(404, 'CODEX_LOGIN_NOT_FOUND', 'Anmeldung nicht gefunden.')
+  const { controller: _controller, createdAt: _createdAt, ...payload } = state
+  return json(res, 200, payload)
 }
 
 async function emailDetail(
@@ -643,18 +775,22 @@ async function reply(
         questions: [],
         requestId,
         supportedDetails: [],
-        warnings: ['Demo-Modus: Es wurde keine Anfrage an OpenAI gesendet.'],
+        warnings: ['Demo-Modus: Es wurde keine Anfrage an Codex gesendet.'],
       }
       return result
     }
     const token = apiOptions.fastmailToken?.trim()
-    const apiKey = apiOptions.openaiApiKey?.trim()
     if (!token || !snapshot.context)
       throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-    if (!apiKey)
-      throw new ApiHttpError(503, 'OPENAI_NOT_CONFIGURED', 'OpenAI ist nicht konfiguriert.')
+    const auth = (apiOptions.codexAuthStatus ?? codexAuthStatus)()
+    if (!auth.configured)
+      throw new ApiHttpError(
+        503,
+        'CODEX_NOT_CONFIGURED',
+        'Codex ist noch nicht mit dem ChatGPT-Abo angemeldet.',
+      )
     const request: ReplyRequest = parsed.data
-    return await generateReply(snapshot.context, token, apiKey, messages, request)
+    return await generateReply(snapshot.context, token, messages, request)
   })()
   snapshot.replyCache.set(requestId, work)
   try {
@@ -757,7 +893,7 @@ function handleError(res: ServerResponse, error: unknown) {
     return apiError(res, status, error.code, error.message, status >= 500)
   }
   if (error instanceof ReplyError) {
-    return apiError(res, 422, error.code, error.message, false, error.details)
+    return apiError(res, error.status, error.code, error.message, error.retryable, error.details)
   }
   return apiError(res, 500, 'INTERNAL_ERROR', 'Ein interner Fehler ist aufgetreten.', true)
 }
@@ -768,6 +904,28 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
     const url = new URL(req.url, 'http://localhost')
     const parts = url.pathname.split('/').filter(Boolean)
     try {
+      if (req.method === 'GET' && url.pathname === '/api/auth/codex/status') {
+        return json(
+          res,
+          200,
+          apiOptions.forceDemo
+            ? { configured: false, model: 'gpt-5.6-sol' }
+            : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
+        )
+      }
+      if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
+        validateOrigin(req)
+        return await startCodexLogin(res, apiOptions)
+      }
+      if (
+        req.method === 'GET' &&
+        parts[0] === 'api' &&
+        parts[1] === 'auth' &&
+        parts[2] === 'codex' &&
+        parts[3]
+      ) {
+        return codexLoginState(res, parts[3])
+      }
       if (req.method === 'GET' && url.pathname === '/api/review/options') {
         return await options(res, apiOptions)
       }
@@ -815,4 +973,6 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
 
 export function clearApiStateForTests() {
   snapshots.clear()
+  for (const state of codexLogins.values()) state.controller.abort()
+  codexLogins.clear()
 }

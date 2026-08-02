@@ -1,10 +1,10 @@
 # Delivery board
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 ## In progress
 
-- [ ] Replace the expired Fastmail token and add OpenAI API credits, then repeat live verification.
+- [ ] Replace the expired Fastmail token, deploy the ChatGPT-subscription provider, and repeat live verification.
 
 ## Done
 

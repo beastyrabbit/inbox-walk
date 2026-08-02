@@ -1,5 +1,7 @@
 import type {
   ApiError,
+  CodexAuthStatus,
+  CodexLoginState,
   DraftResult,
   FinalizeResult,
   MailAddress,
@@ -52,6 +54,15 @@ async function post<T>(url: string, body: unknown, csrfToken?: string) {
 }
 
 export const api = {
+  async codexStatus() {
+    return payload<CodexAuthStatus>(await fetch('/api/auth/codex/status'))
+  },
+  async startCodexLogin() {
+    return post<{ id: string }>('/api/auth/codex/start', {})
+  },
+  async codexLoginState(id: string) {
+    return payload<CodexLoginState>(await fetch(`/api/auth/codex/${encodeURIComponent(id)}`))
+  },
   async options() {
     return payload<ReviewOptions>(await fetch('/api/review/options'))
   },

@@ -54,8 +54,29 @@ export interface ReviewEmail extends ReviewEmailSummary {
 }
 
 export interface ReviewOptions {
+  codex: CodexAuthStatus
   mailboxes: MailboxOption[]
   mode: 'demo' | 'live'
+}
+
+export interface CodexAuthStatus {
+  configured: boolean
+  model: string
+  source?:
+    | 'stored'
+    | 'runtime'
+    | 'environment'
+    | 'fallback'
+    | 'models_json_key'
+    | 'models_json_command'
+}
+
+export interface CodexLoginState {
+  id: string
+  message: string
+  status: 'starting' | 'waiting' | 'completed' | 'failed'
+  url?: string
+  userCode?: string
 }
 
 export interface ReviewSnapshot {

@@ -20,7 +20,7 @@ If a body cannot be loaded, that message is protected as unread automatically.
 
 1. Load every message in the selected Fastmail thread, up to the safety bound.
 2. Compute reply-all recipients and the matching Fastmail sender identity.
-3. Automatically send every supported inline and regular attachment to OpenAI.
+3. Send every supported image to Codex and every supported document to Apache Tika for complete text extraction.
 4. Fail closed if any attachment cannot be processed or the combined budget is too large.
 5. Generate editable plain text from rough notes using only thread-supported facts.
 6. Allow direct edits and repeated correction instructions.
@@ -32,12 +32,13 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 
 ## Privacy and safety
 
-- Credentials are backend-only runtime environment variables.
+- The Fastmail credential is a backend-only runtime secret; rotating Codex OAuth data stays on the private app volume.
 - Mail HTML is sanitized and isolated in a sandboxed iframe.
 - External images remain blocked until enabled for that message.
 - Blob downloads are allowlisted from server-owned snapshot metadata.
 - POST mutations require same-origin checks and a snapshot CSRF token.
-- OpenAI requests use `store: false`, a privacy-preserving safety identifier, and structured output.
+- Codex uses the ChatGPT subscription OAuth provider in a fresh in-memory session per request.
+- Built-in tools, skills, extensions, prompts, themes, and project context are disabled; the model receives only one schema-constrained reply-submit tool.
 - Message content and attachments are treated as untrusted data, never as instructions.
 
 The app is intended for a single user behind Pangolin SSO in the Heerlab

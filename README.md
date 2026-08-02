@@ -4,9 +4,10 @@ Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one
 bounded snapshot of unread incoming mail, shows the original messages one at a
 time, and applies read-state changes only after a final confirmation.
 
-For messages that need an answer, Inbox Walk can use OpenAI to prepare a
-thread-aware reply and save it as a verified Fastmail draft. It has no send-mail
-endpoint or send control; sending remains in Fastmail.
+For messages that need an answer, Inbox Walk can use Codex through a ChatGPT
+Plus/Pro subscription to prepare a thread-aware reply and save it as a verified
+Fastmail draft. It has no send-mail endpoint or send control; sending remains in
+Fastmail.
 
 ## What it does
 
@@ -16,7 +17,7 @@ endpoint or send control; sending remains in Fastmail.
 - Sanitizes mail HTML in a sandboxed iframe and blocks remote images by default.
 - Keeps selected messages unread and marks the rest read only after confirmation.
 - Loads the complete bounded thread before preparing a reply.
-- Automatically includes every supported thread attachment in the OpenAI request.
+- Sends every supported image to Codex and extracts every supported document through Apache Tika.
 - Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
 - Creates and reads back a normal Fastmail draft with reply headers and identity signature.
 - Exposes `/healthz` and `/readyz` for Kubernetes probes.
@@ -33,14 +34,20 @@ pnpm dev:demo:portless
 Open <https://inbox-walk.localhost:1355>.
 
 Live mode never falls back to sample data. Copy `.env.example` to `.env`, add a
-Fastmail API token with Mail access and an OpenAI API key, then run:
+Fastmail API token with Mail access, start Apache Tika, and run:
 
 ```bash
+docker run --rm -p 9998:9998 apache/tika:3.3.1.0-full
 pnpm dev:portless
 ```
 
-Secret values stay in the backend environment and are never embedded in the
-client bundle or returned by the API.
+The app reuses an existing Pi `openai-codex` login from
+`~/.pi/agent/auth.json` during local development. Otherwise, choose **Codex
+anmelden** in the app and complete the OpenAI device-code flow. The rotating
+OAuth record stays server-side and is never returned by the API.
+Choosing **Neu anmelden** while using that local fallback also refreshes the
+workstation's shared Pi login; set `DATA_DIR` to an app-specific directory if
+you want isolated local credentials.
 
 ## Keyboard controls
 
@@ -67,8 +74,9 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-The image listens on port `3000` and requires both `FASTMAIL_JMAP_TOKEN` and
-`OPENAI_API_KEY` at runtime. `MAIL_REVIEW_DEMO=1` is an explicit demo-only mode.
+The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
+The Codex OAuth record is stored under `DATA_DIR`; `TIKA_URL` points to the
+document-extraction sidecar. `MAIL_REVIEW_DEMO=1` is an explicit demo-only mode.
 
 Deployment is managed from `beasty/kub-homelab`. Runtime secrets are synced by
 the Infisical Operator; no secret values belong in this repository or in the

@@ -4,19 +4,27 @@ import { extname, join, normalize, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import { createApiMiddleware } from './api.ts'
+import { ensureCodexStorageReady } from './codex.ts'
 
 const port = Number.parseInt(process.env.PORT || '3000', 10)
 const host = process.env.HOST || '0.0.0.0'
 const forceDemo = process.env.MAIL_REVIEW_DEMO === '1'
 const fastmailToken = process.env.FASTMAIL_JMAP_TOKEN?.trim()
-const openaiApiKey = process.env.OPENAI_API_KEY?.trim()
+const tikaUrl = process.env.TIKA_URL?.trim()
 
 if (!forceDemo && !fastmailToken) {
   throw new Error('FASTMAIL_JMAP_TOKEN is required unless MAIL_REVIEW_DEMO=1 is explicit')
 }
-if (!forceDemo && !openaiApiKey) {
-  throw new Error('OPENAI_API_KEY is required unless MAIL_REVIEW_DEMO=1 is explicit')
+if (!forceDemo && !tikaUrl) {
+  throw new Error('TIKA_URL is required unless MAIL_REVIEW_DEMO=1 is explicit')
 }
+if (tikaUrl) {
+  const parsedTikaUrl = new URL(tikaUrl)
+  if (!['http:', 'https:'].includes(parsedTikaUrl.protocol)) {
+    throw new Error('TIKA_URL must use http or https')
+  }
+}
+if (!forceDemo) ensureCodexStorageReady()
 
 const moduleDirectory = fileURLToPath(new URL('.', import.meta.url))
 const staticDirectory = resolve(moduleDirectory, '../dist')
@@ -24,7 +32,7 @@ if (!existsSync(join(staticDirectory, 'index.html'))) {
   throw new Error(`Production frontend was not found at ${staticDirectory}`)
 }
 
-const api = createApiMiddleware({ fastmailToken, forceDemo, openaiApiKey })
+const api = createApiMiddleware({ fastmailToken, forceDemo })
 const mimeTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
