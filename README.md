@@ -34,11 +34,11 @@ pnpm dev:portless
 
 Open <https://inbox-walk.localhost:1355>.
 
-`pnpm dev` injects `FASTMAIL_JMAP_TOKEN` from the `Kub-Homelab` Infisical
-project, environment `dev`, path `/kubernetes/tools/inbox-walk-secret`. The
-development token is read-only, so local development can review real mail but
-cannot mark messages read or create Fastmail drafts. Live mode never falls back
-to sample data.
+`pnpm dev` injects the read-only `FASTMAIL_MCP_TOKEN` from the `API Tokens`
+Infisical project, environment `dev`, path `/tools/fastmail`, and maps it to the
+application's Fastmail credential variable for that process only. Local
+development can review real mail but cannot mark messages read or create
+Fastmail drafts. Live mode never falls back to sample data.
 
 The app reuses an existing Pi `openai-codex` login from
 `~/.pi/agent/auth.json` during local development. Otherwise, choose **Codex
