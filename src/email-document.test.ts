@@ -45,4 +45,26 @@ describe('email document isolation', () => {
     )
     expect(document).not.toContain('src="https://tracker.example/pixel"')
   })
+
+  it('prevents mail color overrides from defeating the dark reader palette', () => {
+    const document = emailDocument(
+      {
+        ...email,
+        html: '<div style="background-color:#fff !important;color:#111!important">Text</div>',
+      },
+      'snap-1',
+      true,
+    )
+    expect(document).not.toMatch(/(?:#fff|#111)\s*!\s*important/i)
+    expect(document).toContain('background-color:#fff')
+  })
+
+  it('removes empty placeholder images instead of showing broken icons', () => {
+    const document = emailDocument(
+      { ...email, html: '<p>Text</p><img src="#"><img>' },
+      'snap-1',
+      true,
+    )
+    expect(document).not.toContain('<img')
+  })
 })
