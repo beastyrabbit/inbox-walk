@@ -4,7 +4,7 @@
   "version": "0.2.1",
   "type": "module",
   "scripts": {
-    "dev": "infisical run --silent --domain=http://192.168.60.11:8080 --projectId=63e82e5b-8d34-4658-a4d3-2320521588d1 --env=dev --path=/tools/fastmail -- sh -c 'exec env FASTMAIL_JMAP_TOKEN=\"$FASTMAIL_MCP_TOKEN\" CODEX_MODEL=gpt-5.6-sol TIKA_URL=http://127.0.0.1:9998 vite'",
+    "dev": "infisical run --silent --domain=http://192.168.60.11:8080 --projectId=63e82e5b-8d34-4658-a4d3-2320521588d1 --env=dev --path=/tools/fastmail -- env CODEX_MODEL=gpt-5.6-sol TIKA_URL=http://127.0.0.1:9998 vite",
     "dev:portless": "portless inbox-walk pnpm dev",
     "build": "pnpm build:client && pnpm build:server",
     "build:client": "tsc -b && vite build",
