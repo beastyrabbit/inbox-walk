@@ -65,6 +65,7 @@ interface JmapEmail {
   to?: MailAddress[] | null
   'header:List-Id:asText'?: string | null
   'header:List-Unsubscribe:asURLs'?: string[] | null
+  'header:List-Unsubscribe-Post:asText'?: string | null
 }
 
 interface JmapIdentity extends MailIdentity {
@@ -104,6 +105,7 @@ export interface LiveSnapshotData {
   missingIds: string[]
   totalBeforeLimit: number
   truncated: boolean
+  unsubscribeUrls: Record<string, string>
 }
 
 export interface MarkReadResult {
@@ -256,6 +258,27 @@ function isNewsletter(email: JmapEmail) {
   )
 }
 
+function oneClickUnsubscribeUrl(email: JmapEmail) {
+  const post = email['header:List-Unsubscribe-Post:asText'] ?? ''
+  if (!/(?:^|\s|;)List-Unsubscribe\s*=\s*One-Click(?:\s|;|$)/i.test(post)) return null
+  for (const value of email['header:List-Unsubscribe:asURLs'] ?? []) {
+    try {
+      const url = new URL(value)
+      if (
+        url.protocol === 'https:' &&
+        !url.username &&
+        !url.password &&
+        (!url.port || url.port === '443')
+      ) {
+        return url.toString()
+      }
+    } catch {
+      // Ignore malformed or non-URL list entries.
+    }
+  }
+  return null
+}
+
 function summary(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmailSummary {
   return {
     id: email.id,
@@ -268,6 +291,7 @@ function summary(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmail
     mailboxNames: assignedMailboxes(email, mailboxes).map((mailbox) => mailbox.name),
     hasAttachment: Boolean(email.hasAttachment),
     isNewsletter: isNewsletter(email),
+    canOneClickUnsubscribe: Boolean(oneClickUnsubscribeUrl(email)),
   }
 }
 
@@ -283,6 +307,7 @@ const SUMMARY_PROPERTIES = [
   'hasAttachment',
   'header:List-Id:asText',
   'header:List-Unsubscribe:asURLs',
+  'header:List-Unsubscribe-Post:asText',
 ]
 
 const DETAIL_PROPERTIES = [
@@ -381,7 +406,7 @@ export async function fetchUnreadSnapshot(
     let candidateTotal = 0
     let exhausted = false
     let changed = false
-    const selected: ReviewEmailSummary[] = []
+    const selected: Array<{ email: ReviewEmailSummary; unsubscribeUrl: string | null }> = []
     const missingIds: string[] = []
 
     while (selected.length <= SNAPSHOT_LIMIT && position < MAX_QUERY_CANDIDATES) {
@@ -408,8 +433,11 @@ export async function fetchUnreadSnapshot(
           .map((id) => byId.get(id))
           .filter((email): email is JmapEmail => Boolean(email))
           .filter((email) => isIncoming(email, mailboxes))
-          .map((email) => summary(email, mailboxes))
-          .filter((email) => newsletterMatches(email, filters.newsletter)),
+          .map((email) => ({
+            email: summary(email, mailboxes),
+            unsubscribeUrl: oneClickUnsubscribeUrl(email),
+          }))
+          .filter(({ email }) => newsletterMatches(email, filters.newsletter)),
       )
       position += ids.length
       if (position >= candidateTotal || ids.length < QUERY_PAGE_SIZE) {
@@ -423,7 +451,8 @@ export async function fetchUnreadSnapshot(
     ])
     const second = responseFor(secondResponses, 'query-check')
     if (queryState !== second.queryState) continue
-    const emails = selected.slice(0, SNAPSHOT_LIMIT)
+    const selectedEmails = selected.slice(0, SNAPSHOT_LIMIT)
+    const emails = selectedEmails.map(({ email }) => email)
     return {
       context,
       emails,
@@ -432,6 +461,11 @@ export async function fetchUnreadSnapshot(
       missingIds,
       totalBeforeLimit: exhausted ? selected.length : Math.max(selected.length, SNAPSHOT_LIMIT + 1),
       truncated: selected.length > SNAPSHOT_LIMIT || !exhausted,
+      unsubscribeUrls: Object.fromEntries(
+        selectedEmails.flatMap(({ email, unsubscribeUrl }) =>
+          unsubscribeUrl ? [[email.id, unsubscribeUrl]] : [],
+        ),
+      ),
     }
   }
   throw new JmapError(
@@ -453,6 +487,7 @@ export async function resumeSnapshot(
   const byId = new Map(fetched.list.map((email) => [email.id, email]))
   const missingIds = [...fetched.missing]
   const emails: ReviewEmailSummary[] = []
+  const unsubscribeUrls: Record<string, string> = {}
   for (const id of ids) {
     const email = byId.get(id)
     if (!email || !isIncoming(email, mailboxes)) {
@@ -460,6 +495,8 @@ export async function resumeSnapshot(
       continue
     }
     emails.push(summary(email, mailboxes))
+    const unsubscribeUrl = oneClickUnsubscribeUrl(email)
+    if (unsubscribeUrl) unsubscribeUrls[id] = unsubscribeUrl
   }
   return {
     context,
@@ -469,6 +506,7 @@ export async function resumeSnapshot(
     missingIds,
     totalBeforeLimit: ids.length,
     truncated: false,
+    unsubscribeUrls,
   } satisfies LiveSnapshotData
 }
 

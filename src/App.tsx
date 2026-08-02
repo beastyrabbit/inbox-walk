@@ -137,11 +137,11 @@ function App() {
   const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
   const [index, setIndex] = useState(0)
   const [keptUnread, setKeptUnread] = useState<Set<string>>(new Set())
+  const [unsubscribeIds, setUnsubscribeIds] = useState<Set<string>>(new Set())
   const [replyDrafts, setReplyDrafts] = useState<Record<string, ReplyEditorState>>({})
   const [threadContexts, setThreadContexts] = useState<Record<string, ThreadContext>>({})
   const [replyProposals, setReplyProposals] = useState<Record<string, ReplyProposal>>({})
   const [draftResults, setDraftResults] = useState<Record<string, DraftResult>>({})
-  const [remoteImages, setRemoteImages] = useState<Set<string>>(new Set())
   const [view, setView] = useState<View>('review')
   const [overviewOpen, setOverviewOpen] = useState(false)
   const [filtersOpen, setFiltersOpen] = useState(false)
@@ -167,6 +167,7 @@ function App() {
   const proposal = summary ? replyProposals[summary.id] : undefined
   const draftResult = summary ? draftResults[summary.id] : undefined
   const isKept = summary ? keptUnread.has(summary.id) : false
+  const isUnsubscribeMarked = summary ? unsubscribeIds.has(summary.id) : false
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
   const readIds = useMemo(
@@ -193,7 +194,6 @@ function App() {
       setThreadContexts({})
       setReplyProposals({})
       setDraftResults({})
-      setRemoteImages(new Set())
       setView('review')
       setOverviewOpen(false)
       setFiltersOpen(false)
@@ -202,6 +202,15 @@ function App() {
         setIndex(clampIndex(resume.index, nextSnapshot.emails.length))
         const available = new Set(nextSnapshot.emails.map((item) => item.id))
         setKeptUnread(new Set(resume.keptUnreadIds.filter((id) => available.has(id))))
+        setUnsubscribeIds(
+          new Set(
+            resume.unsubscribeIds.filter(
+              (id) =>
+                available.has(id) &&
+                nextSnapshot.emails.some((item) => item.id === id && item.canOneClickUnsubscribe),
+            ),
+          ),
+        )
         setReplyDrafts(resume.replyDrafts)
         const missing = nextSnapshot.missingIds.length
         setStatus(
@@ -212,6 +221,7 @@ function App() {
       } else {
         setIndex(0)
         setKeptUnread(new Set())
+        setUnsubscribeIds(new Set())
         setReplyDrafts({})
         setStatus(`${nextSnapshot.emails.length} ungelesene Nachrichten geladen.`)
       }
@@ -286,18 +296,19 @@ function App() {
   useEffect(() => {
     if (!snapshot || !restoredRef.current || emails.length === 0) return
     const saved = saveCheckpoint({
-      version: 1,
+      version: 2,
       emailIds: emails.map((item) => item.id),
       filters: snapshot.filters,
       index,
       keptUnreadIds: [...keptUnread],
+      unsubscribeIds: [...unsubscribeIds],
       replyDrafts,
     })
     if (!saved)
       setError(
         'Der lokale Checkpoint konnte nicht gespeichert werden. Dieses Fenster offen lassen.',
       )
-  }, [emails, index, keptUnread, replyDrafts, snapshot])
+  }, [emails, index, keptUnread, replyDrafts, snapshot, unsubscribeIds])
 
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
@@ -344,6 +355,16 @@ function App() {
     setKeptUnread((current) => toggleKeptUnread(current, summary.id))
     setStatus(isKept ? 'Wird beim Abschluss als gelesen markiert.' : 'Bleibt ungelesen.')
   }, [isKept, summary, view])
+
+  const toggleUnsubscribe = useCallback(() => {
+    if (!summary || view !== 'review' || !summary.canOneClickUnsubscribe) return
+    setUnsubscribeIds((current) => toggleKeptUnread(current, summary.id))
+    setStatus(
+      isUnsubscribeMarked
+        ? 'One-Click-Abmeldung nicht mehr vorgemerkt.'
+        : 'Sichere One-Click-Abmeldung vorgemerkt.',
+    )
+  }, [isUnsubscribeMarked, summary, view])
 
   const openReply = useCallback(async () => {
     if (!snapshot || !summary) return
@@ -396,6 +417,9 @@ function App() {
       } else if (event.key === 'ArrowUp') {
         event.preventDefault()
         toggleCurrent()
+      } else if (event.key === 'ArrowDown') {
+        event.preventDefault()
+        toggleUnsubscribe()
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -411,6 +435,7 @@ function App() {
     replyOpen,
     submitting,
     toggleCurrent,
+    toggleUnsubscribe,
     view,
   ])
 
@@ -497,7 +522,7 @@ function App() {
     setSubmitting(true)
     setError(null)
     try {
-      const nextResult = await api.finalize(snapshot, [...keptUnread])
+      const nextResult = await api.finalize(snapshot, [...keptUnread], [...unsubscribeIds])
       setResult(nextResult)
       if (nextResult.finalized) {
         clearCheckpoint()
@@ -601,7 +626,19 @@ function App() {
         <p>
           {result.markedRead} Nachrichten wurden als gelesen markiert. {result.keptUnread} bleiben
           ungelesen.
+          {result.unsubscribeAttempted > 0 &&
+            ` ${result.unsubscribeSucceeded} von ${result.unsubscribeAttempted} Abmeldungen waren erfolgreich.`}
         </p>
+        {result.unsubscribeFailed.length > 0 && (
+          <div className="inline-error" role="alert">
+            <strong>{result.unsubscribeFailed.length} Abmeldungen sind fehlgeschlagen.</strong>
+            <ul>
+              {result.unsubscribeFailed.map((failure) => (
+                <li key={failure.id}>{failure.reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
         <button type="button" className="button primary" onClick={() => void discardAndRestart()}>
           Neuen Review starten
         </button>
@@ -622,6 +659,10 @@ function App() {
           <div>
             <dt>Ungelesen behalten</dt>
             <dd>{keptUnread.size}</dd>
+          </div>
+          <div>
+            <dt>One-Click-Abmeldung versuchen</dt>
+            <dd>{unsubscribeIds.size}</dd>
           </div>
           <div>
             <dt>Neue Nachrichten seit dem Start</dt>
@@ -674,10 +715,6 @@ function App() {
 
   if (!summary) return null
 
-  const hasRemoteImages = Boolean(
-    email?.html && /(?:src|url\()\s*=?:?\s*["']?(?:https?:)?\/\//i.test(email.html),
-  )
-  const showRemoteImages = remoteImages.has(summary.id)
   const progress = ((index + 1) / emails.length) * 100
 
   return (
@@ -751,15 +788,6 @@ function App() {
               ))}
               {summary.isNewsletter && <span className="mailbox">Newsletter</span>}
             </div>
-            {hasRemoteImages && !showRemoteImages && (
-              <button
-                type="button"
-                className="notice-button"
-                onClick={() => setRemoteImages((current) => new Set(current).add(summary.id))}
-              >
-                Externe Bilder sind blockiert · jetzt laden
-              </button>
-            )}
             {email?.bodyTruncated && (
               <p className="warning-note">
                 Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
@@ -778,7 +806,7 @@ function App() {
                 className="message-body"
                 title={`Inhalt von ${summary.subject}`}
                 sandbox="allow-popups allow-popups-to-escape-sandbox"
-                srcDoc={emailDocument(email, snapshot.snapshotId, showRemoteImages)}
+                srcDoc={emailDocument(email, snapshot.snapshotId, true, snapshot.imageToken)}
               />
             ) : (
               <div className="body-loading error-copy">
@@ -830,6 +858,28 @@ function App() {
           </button>
           <button
             type="button"
+            className={`control-button unsubscribe-button ${isUnsubscribeMarked ? 'active' : ''}`}
+            aria-label={
+              summary.canOneClickUnsubscribe
+                ? isUnsubscribeMarked
+                  ? 'One-Click-Abmeldung vorgemerkt'
+                  : 'One-Click-Abmeldung vormerken'
+                : 'Keine sichere One-Click-Abmeldung verfügbar'
+            }
+            aria-pressed={isUnsubscribeMarked}
+            disabled={!summary.canOneClickUnsubscribe}
+            onClick={toggleUnsubscribe}
+            title={
+              summary.canOneClickUnsubscribe
+                ? 'Beim Abschluss eine standardisierte HTTPS-One-Click-Abmeldung versuchen'
+                : 'Dieser Newsletter bietet keine sichere One-Click-Abmeldung an'
+            }
+          >
+            <kbd>↓</kbd>
+            <span>{isUnsubscribeMarked ? 'Abmeldung vorgemerkt' : 'Newsletter abmelden'}</span>
+          </button>
+          <button
+            type="button"
             className={`control-button keep-button ${isKept ? 'active' : ''}`}
             aria-label={isKept ? 'Bleibt ungelesen' : 'Ungelesen behalten'}
             aria-pressed={isKept}
@@ -862,6 +912,7 @@ function App() {
           emails={emails}
           currentIndex={index}
           keptUnread={keptUnread}
+          unsubscribeIds={unsubscribeIds}
           onClose={() => setOverviewOpen(false)}
           onSelect={(nextIndex) => {
             setIndex(nextIndex)
@@ -1003,6 +1054,7 @@ function OverviewDrawer({
   emails,
   currentIndex,
   keptUnread,
+  unsubscribeIds,
   onClose,
   onDiscard,
   onSelect,
@@ -1010,6 +1062,7 @@ function OverviewDrawer({
   emails: ReviewSnapshot['emails']
   currentIndex: number
   keptUnread: ReadonlySet<string>
+  unsubscribeIds: ReadonlySet<string>
   onClose: () => void
   onDiscard: () => void
   onSelect: (index: number) => void
@@ -1028,7 +1081,9 @@ function OverviewDrawer({
         <div className="drawer-header">
           <div>
             <h2>Nachrichten</h2>
-            <p>{keptUnread.size} bleiben ungelesen</p>
+            <p>
+              {keptUnread.size} bleiben ungelesen · {unsubscribeIds.size} Abmeldungen
+            </p>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
             ×
@@ -1047,7 +1102,12 @@ function OverviewDrawer({
                   <strong>{item.subject || '(Kein Betreff)'}</strong>
                   <small>{addressLine(item.from)}</small>
                 </span>
-                {keptUnread.has(item.id) && <span className="unread-mark">ungelesen</span>}
+                <span className="overview-marks">
+                  {keptUnread.has(item.id) && <span className="unread-mark">ungelesen</span>}
+                  {unsubscribeIds.has(item.id) && (
+                    <span className="unsubscribe-mark">abmelden</span>
+                  )}
+                </span>
               </button>
             </li>
           ))}
@@ -1092,6 +1152,12 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
               <kbd>↑</kbd>
             </dt>
             <dd>Ungelesen schützen</dd>
+          </div>
+          <div>
+            <dt>
+              <kbd>↓</kbd>
+            </dt>
+            <dd>Sichere Newsletter-Abmeldung vormerken</dd>
           </div>
           <div>
             <dt>

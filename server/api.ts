@@ -44,6 +44,7 @@ import {
   ReplyError,
   type ReplyRequest,
 } from './reply.ts'
+import { fetchRemoteImage, postOneClickUnsubscribe, SafeHttpError } from './safe-http.ts'
 
 const MAX_JSON_BYTES = 256 * 1024
 const MAX_SNAPSHOTS = 20
@@ -69,8 +70,10 @@ interface StoredSnapshot {
   emailIds: string[]
   filters: ReviewFilters
   finalKeepIds?: Set<string>
+  finalUnsubscribeIds?: Set<string>
   finalizationState: 'active' | 'finalized' | 'finalizing'
   identities?: MailIdentity[]
+  imageToken: string
   lastAccessedAt: number
   mailboxes: MailboxOption[]
   mode: 'demo' | 'live'
@@ -79,6 +82,10 @@ interface StoredSnapshot {
   summaries: Map<string, ReviewEmailSummary>
   succeededIds: Set<string>
   threadCache: Map<string, ThreadMessage[]>
+  unsubscribeAttemptedIds: Set<string>
+  unsubscribeFailures: Map<string, string>
+  unsubscribeSucceededIds: Set<string>
+  unsubscribeUrls: Map<string, string>
 }
 
 export interface ApiOptions {
@@ -228,11 +235,13 @@ function storeSnapshot(
     context?: MailAccountContext
     mode: 'demo' | 'live'
     details?: ReviewEmail[]
+    unsubscribeUrls?: Record<string, string>
   },
 ) {
   pruneSnapshots()
   const snapshotId = randomUUID()
   const csrfToken = randomBytes(24).toString('base64url')
+  const imageToken = randomBytes(24).toString('base64url')
   const details = new Map((data.details ?? []).map((email) => [email.id, email]))
   const snapshot: StoredSnapshot = {
     blobMetadata: new Map(),
@@ -244,6 +253,7 @@ function storeSnapshot(
     emailIds: data.emails.map((email) => email.id),
     filters: data.filters,
     finalizationState: 'active',
+    imageToken,
     lastAccessedAt: Date.now(),
     mailboxes: data.mailboxes,
     mode: data.mode,
@@ -252,6 +262,10 @@ function storeSnapshot(
     succeededIds: new Set(),
     summaries: new Map(data.emails.map((email) => [email.id, email])),
     threadCache: new Map(),
+    unsubscribeAttemptedIds: new Set(),
+    unsubscribeFailures: new Map(),
+    unsubscribeSucceededIds: new Set(),
+    unsubscribeUrls: new Map(Object.entries(data.unsubscribeUrls ?? {})),
   }
   for (const email of details.values()) registerResources(snapshot, email)
   snapshots.set(snapshotId, snapshot)
@@ -265,6 +279,7 @@ function snapshotPayload(
 ): ReviewSnapshot {
   return {
     csrfToken: snapshot.csrfToken,
+    imageToken: snapshot.imageToken,
     emails: snapshot.emailIds
       .map((emailId) => snapshot.summaries.get(emailId))
       .filter((email): email is ReviewEmailSummary => Boolean(email)),
@@ -543,6 +558,71 @@ async function emailDetail(
   return json(res, 200, email)
 }
 
+function decodeHtmlAttribute(value: string) {
+  return value
+    .replace(/&amp;/gi, '&')
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) =>
+      String.fromCodePoint(Number.parseInt(code, 16)),
+    )
+    .replace(/&#([0-9]+);/g, (_match, code: string) =>
+      String.fromCodePoint(Number.parseInt(code, 10)),
+    )
+}
+
+function normalizedRemoteImageSource(value: string) {
+  const decoded = decodeHtmlAttribute(value.trim())
+  if (!/^https?:\/\//i.test(decoded) && !decoded.startsWith('//')) return null
+  try {
+    const url = new URL(decoded.startsWith('//') ? `https:${decoded}` : decoded)
+    return url.toString()
+  } catch {
+    return null
+  }
+}
+
+function allowedRemoteImages(email: ReviewEmail) {
+  const sources = new Set<string>()
+  const html = email.html ?? ''
+  const pattern = /<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi
+  for (const match of html.matchAll(pattern)) {
+    const source = normalizedRemoteImageSource(match[1] ?? match[2] ?? match[3] ?? '')
+    if (source) sources.add(source)
+  }
+  return sources
+}
+
+async function remoteImage(res: ServerResponse, url: URL, snapshotId: string, emailId: string) {
+  const snapshot = getSnapshot(snapshotId)
+  if (url.searchParams.get('token') !== snapshot.imageToken) {
+    throw new ApiHttpError(403, 'INVALID_IMAGE_TOKEN', 'Ungültiger Bildzugriff.')
+  }
+  if (!snapshot.summaries.has(emailId))
+    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+  const email = snapshot.detailCache.get(emailId)
+  if (!email) throw new ApiHttpError(409, 'EMAIL_NOT_LOADED', 'Nachricht wurde noch nicht geladen.')
+  const source = normalizedRemoteImageSource(url.searchParams.get('url') ?? '')
+  if (!source || !allowedRemoteImages(email).has(source)) {
+    throw new ApiHttpError(403, 'IMAGE_FORBIDDEN', 'Dieses Bild gehört nicht zur Nachricht.')
+  }
+  try {
+    const image = await fetchRemoteImage(source)
+    securityHeaders(res)
+    res.statusCode = 200
+    res.setHeader('Content-Type', image.contentType)
+    res.setHeader('Content-Length', image.body.length)
+    res.setHeader('Cache-Control', 'private, max-age=3600')
+    res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
+    res.end(image.body)
+  } catch (error) {
+    if (error instanceof SafeHttpError) {
+      throw new ApiHttpError(502, error.code, error.message, true)
+    }
+    throw error
+  }
+}
+
 async function loadThread(snapshot: StoredSnapshot, threadId: string, apiOptions: ApiOptions) {
   const cached = snapshot.threadCache.get(threadId)
   if (cached) return cached
@@ -619,7 +699,12 @@ async function finalize(
   requireCsrf(req, snapshot)
   const body = await readJson(req)
   const kept = z.array(z.string().min(1)).max(250).safeParse(body.keepUnreadIds)
-  if (!kept.success) throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
+  const unsubscribe = z
+    .array(z.string().min(1))
+    .max(250)
+    .safeParse(body.unsubscribeIds ?? [])
+  if (!kept.success || !unsubscribe.success)
+    throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
   if (snapshot.finalizationState === 'finalizing') {
     throw new ApiHttpError(
       409,
@@ -632,7 +717,25 @@ async function finalize(
   if (kept.data.some((id) => !known.has(id))) {
     throw new ApiHttpError(400, 'UNKNOWN_EMAIL', 'Die Auswahl enthält eine unbekannte Nachricht.')
   }
+  if (unsubscribe.data.some((id) => !known.has(id))) {
+    throw new ApiHttpError(
+      400,
+      'UNKNOWN_EMAIL',
+      'Die Abmeldeauswahl enthält eine unbekannte Nachricht.',
+    )
+  }
+  if (
+    snapshot.mode === 'live' &&
+    unsubscribe.data.some((id) => !snapshot.unsubscribeUrls.has(id))
+  ) {
+    throw new ApiHttpError(
+      400,
+      'UNSUBSCRIBE_UNAVAILABLE',
+      'Mindestens eine Nachricht unterstützt keine sichere One-Click-Abmeldung.',
+    )
+  }
   const requestedKeep = new Set(kept.data)
+  const requestedUnsubscribe = new Set(unsubscribe.data)
   if (snapshot.finalKeepIds) {
     const unchanged =
       requestedKeep.size === snapshot.finalKeepIds.size &&
@@ -644,6 +747,17 @@ async function finalize(
         'Die Auswahl ist bereits festgeschrieben.',
       )
   } else snapshot.finalKeepIds = requestedKeep
+  if (snapshot.finalUnsubscribeIds) {
+    const unchanged =
+      requestedUnsubscribe.size === snapshot.finalUnsubscribeIds.size &&
+      [...requestedUnsubscribe].every((id) => snapshot.finalUnsubscribeIds?.has(id))
+    if (!unchanged)
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_SELECTION_LOCKED',
+        'Die Abmeldeauswahl ist bereits festgeschrieben.',
+      )
+  } else snapshot.finalUnsubscribeIds = requestedUnsubscribe
 
   const toMark = snapshot.emailIds.filter(
     (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
@@ -652,6 +766,10 @@ async function finalize(
   try {
     if (snapshot.mode === 'demo') {
       for (const id of toMark) snapshot.succeededIds.add(id)
+      for (const id of requestedUnsubscribe) {
+        snapshot.unsubscribeAttemptedIds.add(id)
+        snapshot.unsubscribeSucceededIds.add(id)
+      }
       snapshot.finalizationState = 'finalized'
       const result: FinalizeResult = {
         failed: [],
@@ -660,12 +778,30 @@ async function finalize(
         markedRead: snapshot.succeededIds.size,
         mode: 'demo',
         remaining: 0,
+        unsubscribeAttempted: snapshot.unsubscribeAttemptedIds.size,
+        unsubscribeFailed: [],
+        unsubscribeSucceeded: snapshot.unsubscribeSucceededIds.size,
       }
       return json(res, 200, result)
     }
     const token = apiOptions.fastmailToken?.trim()
     if (!token || !snapshot.context)
       throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+    for (const id of requestedUnsubscribe) {
+      if (snapshot.unsubscribeAttemptedIds.has(id)) continue
+      snapshot.unsubscribeAttemptedIds.add(id)
+      try {
+        const target = snapshot.unsubscribeUrls.get(id)
+        if (!target) throw new Error('Keine sichere One-Click-Adresse verfügbar.')
+        await postOneClickUnsubscribe(target)
+        snapshot.unsubscribeSucceededIds.add(id)
+      } catch (error) {
+        snapshot.unsubscribeFailures.set(
+          id,
+          error instanceof Error ? error.message : 'Die Abmeldung ist fehlgeschlagen.',
+        )
+      }
+    }
     const update = await markEmailsRead(snapshot.context, token, toMark)
     for (const id of update.markedIds) snapshot.succeededIds.add(id)
     const remaining = snapshot.emailIds.filter(
@@ -679,6 +815,9 @@ async function finalize(
       markedRead: snapshot.succeededIds.size,
       mode: 'live',
       remaining,
+      unsubscribeAttempted: snapshot.unsubscribeAttemptedIds.size,
+      unsubscribeFailed: [...snapshot.unsubscribeFailures].map(([id, reason]) => ({ id, reason })),
+      unsubscribeSucceeded: snapshot.unsubscribeSucceededIds.size,
     }
     return json(res, update.failed.length > 0 ? 207 : 200, result)
   } catch (error) {
@@ -939,6 +1078,9 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
       }
       if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
         const snapshotId = parts[2]
+        if (req.method === 'GET' && parts[3] === 'emails' && parts[4] && parts[5] === 'images') {
+          return await remoteImage(res, url, snapshotId, parts[4])
+        }
         if (req.method === 'GET' && parts[3] === 'emails' && parts[4]) {
           return await emailDetail(res, snapshotId, parts[4], apiOptions)
         }

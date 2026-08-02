@@ -38,6 +38,7 @@ export interface ReviewEmailSummary {
   mailboxNames: string[]
   hasAttachment: boolean
   isNewsletter: boolean
+  canOneClickUnsubscribe: boolean
 }
 
 export interface ReviewEmail extends ReviewEmailSummary {
@@ -81,6 +82,7 @@ export interface CodexLoginState {
 
 export interface ReviewSnapshot {
   csrfToken: string
+  imageToken: string
   emails: ReviewEmailSummary[]
   filters: ReviewFilters
   missingIds: string[]
@@ -91,11 +93,12 @@ export interface ReviewSnapshot {
 }
 
 export interface ReviewCheckpoint {
-  version: 1
+  version: 2
   emailIds: string[]
   filters: ReviewFilters
   index: number
   keptUnreadIds: string[]
+  unsubscribeIds: string[]
   replyDrafts: Record<string, ReplyEditorState>
 }
 
@@ -111,6 +114,9 @@ export interface FinalizeResult {
   markedRead: number
   mode: 'demo' | 'live'
   remaining: number
+  unsubscribeAttempted: number
+  unsubscribeFailed: FinalizeFailure[]
+  unsubscribeSucceeded: number
 }
 
 export interface MailIdentity {

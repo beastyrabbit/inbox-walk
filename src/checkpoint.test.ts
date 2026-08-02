@@ -38,11 +38,12 @@ beforeEach(() => storage.clear())
 describe('local review checkpoint', () => {
   it('stores IDs and decisions without message bodies', () => {
     saveCheckpoint({
-      version: 1,
+      version: 2,
       emailIds: ['mail-1'],
       filters: { mailboxId: null, newsletter: 'all', timeRange: '7d' },
       index: 0,
       keptUnreadIds: ['mail-1'],
+      unsubscribeIds: [],
       replyDrafts: {},
     })
     expect(loadCheckpoint()).toMatchObject({ emailIds: ['mail-1'], keptUnreadIds: ['mail-1'] })
@@ -53,11 +54,12 @@ describe('local review checkpoint', () => {
     localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
     expect(loadCheckpoint()).toBeNull()
     saveCheckpoint({
-      version: 1,
+      version: 2,
       emailIds: [],
       filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
       index: 0,
       keptUnreadIds: [],
+      unsubscribeIds: [],
       replyDrafts: {},
     })
     clearCheckpoint()
@@ -70,11 +72,12 @@ describe('local review checkpoint', () => {
     })
     expect(
       saveCheckpoint({
-        version: 1,
+        version: 2,
         emailIds: ['mail-1'],
         filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
         index: 0,
         keptUnreadIds: [],
+        unsubscribeIds: [],
         replyDrafts: {},
       }),
     ).toBe(false)

@@ -1,18 +1,19 @@
 :root {
-  --canvas: #e9e4da;
-  --surface: #f7f3ea;
-  --surface-strong: #fffdf7;
-  --surface-muted: #eee8dc;
-  --ink: #27241f;
-  --ink-soft: #686158;
-  --line: #d2cabd;
-  --line-strong: #aaa093;
-  --accent: #9b4025;
-  --accent-dark: #752d1a;
-  --accent-soft: #f1d7cc;
-  --olive: #576044;
-  --danger: #9a2f27;
-  --focus: #bd5a35;
+  --canvas: #141310;
+  --surface: #1b1916;
+  --surface-strong: #211f1b;
+  --surface-muted: #2a2722;
+  --ink: #eee9df;
+  --ink-soft: #aaa297;
+  --line: #38342e;
+  --line-strong: #575047;
+  --accent: #b95d3f;
+  --accent-dark: #e28a67;
+  --accent-soft: #41291f;
+  --olive: #a5b080;
+  --danger: #e08478;
+  --focus: #db7654;
+  color-scheme: dark;
   color: var(--ink);
   background: var(--canvas);
   font-family:
@@ -56,7 +57,7 @@ textarea:focus-visible {
 }
 ::selection {
   color: var(--ink);
-  background: #e9bca8;
+  background: #694132;
 }
 
 .sr-only {

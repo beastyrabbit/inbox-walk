@@ -87,10 +87,10 @@ export const api = {
       ),
     )
   },
-  async finalize(snapshot: ReviewSnapshot, keepUnreadIds: string[]) {
+  async finalize(snapshot: ReviewSnapshot, keepUnreadIds: string[], unsubscribeIds: string[]) {
     return post<FinalizeResult>(
       `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/finalize`,
-      { keepUnreadIds },
+      { keepUnreadIds, unsubscribeIds },
       snapshot.csrfToken,
     )
   },
@@ -133,4 +133,14 @@ export const api = {
 export function blobUrl(snapshotId: string, blobId: string, inline = false) {
   const suffix = inline ? '?inline=1' : ''
   return `/api/reviews/${encodeURIComponent(snapshotId)}/blobs/${encodeURIComponent(blobId)}${suffix}`
+}
+
+export function remoteImageUrl(
+  snapshotId: string,
+  emailId: string,
+  source: string,
+  imageToken: string,
+) {
+  const params = new URLSearchParams({ token: imageToken, url: source })
+  return `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}/images?${params}`
 }

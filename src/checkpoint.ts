@@ -6,9 +6,11 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
   try {
     const raw = localStorage.getItem(KEY)
     if (!raw) return null
-    const value = JSON.parse(raw) as Partial<ReviewCheckpoint>
+    const value = JSON.parse(raw) as Omit<Partial<ReviewCheckpoint>, 'version'> & {
+      version?: number
+    }
     if (
-      value.version !== 1 ||
+      (value.version !== 1 && value.version !== 2) ||
       !Array.isArray(value.emailIds) ||
       !Array.isArray(value.keptUnreadIds) ||
       !value.filters ||
@@ -18,11 +20,14 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
       return null
     }
     return {
-      version: 1,
+      version: 2,
       emailIds: value.emailIds.filter((id): id is string => typeof id === 'string').slice(0, 250),
       filters: value.filters as ReviewFilters,
       index: Math.max(0, Math.floor(value.index)),
       keptUnreadIds: value.keptUnreadIds.filter((id): id is string => typeof id === 'string'),
+      unsubscribeIds: Array.isArray(value.unsubscribeIds)
+        ? value.unsubscribeIds.filter((id): id is string => typeof id === 'string')
+        : [],
       replyDrafts: (value.replyDrafts ?? {}) as Record<string, ReplyEditorState>,
     }
   } catch {

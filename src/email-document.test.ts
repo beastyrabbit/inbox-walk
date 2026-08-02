@@ -20,6 +20,7 @@ const email: ReviewEmail = {
   mailboxNames: [],
   hasAttachment: false,
   isNewsletter: false,
+  canOneClickUnsubscribe: false,
   bodyTruncated: false,
   attachments: [],
   inlineResources: [
@@ -37,7 +38,11 @@ describe('email document isolation', () => {
     expect(document).toContain('target="_blank"')
   })
 
-  it('allows explicitly requested remote images', () => {
-    expect(emailDocument(email, 'snap-1', true)).toContain('https://tracker.example/pixel')
+  it('routes explicitly requested remote images through the backend proxy', () => {
+    const document = emailDocument(email, 'snap-1', true)
+    expect(document).toContain(
+      '/api/reviews/snap-1/emails/mail-1/images?token=&amp;url=https%3A%2F%2Ftracker.example%2Fpixel',
+    )
+    expect(document).not.toContain('src="https://tracker.example/pixel"')
   })
 })
