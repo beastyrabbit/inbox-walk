@@ -1,7 +1,7 @@
 {
   "name": "inbox-walk",
   "private": true,
-  "version": "0.5.0",
+  "version": "0.5.1",
   "type": "module",
   "scripts": {
     "dev": "infisical run --silent --domain=http://192.168.60.11:8080 --projectId=71562e7f-98e6-45f1-a031-ca8713b3f0dd --env=dev --path=/kubernetes/tools/inbox-walk-secret -- env CODEX_MODEL=gpt-5.6-sol TIKA_URL=http://127.0.0.1:9998 vite",

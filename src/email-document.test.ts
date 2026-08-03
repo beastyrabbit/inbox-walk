@@ -72,6 +72,9 @@ describe('email document isolation', () => {
     )
     expect(document).not.toMatch(/(?:#fff|#111)\s*!\s*important/i)
     expect(document).toContain('background-color:#fff')
+    expect(document).toContain(
+      'body *:not(img):not(picture):not(svg):not(svg *) { background-color: transparent !important; }',
+    )
   })
 
   it('removes empty placeholder images instead of showing broken icons', () => {

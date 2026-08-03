@@ -121,7 +121,7 @@ export function emailDocument(
     html, body { background: #211f1b !important; color: #eee9df !important; }
     body { margin: 0; padding: 28px 36px 52px; font: 16px/1.62 Arial, sans-serif; overflow-wrap: break-word; }
     body *:not(img):not(picture) { border-color: #4b463e !important; color: inherit !important; }
-    body table, body thead, body tbody, body tfoot, body tr, body td, body th, body div, body section, body article, body header, body footer, body main { background-color: transparent !important; }
+    body *:not(img):not(picture):not(svg):not(svg *) { background-color: transparent !important; }
     body .email-bg > table.email-body { width: min(720px, 100%) !important; max-width: min(720px, 100%) !important; }
     img { max-width: 100% !important; height: auto !important; } img[data-remote-image] { display: none !important; }
     table { max-width: 100% !important; } th, td { overflow-wrap: normal !important; word-break: normal !important; } th { white-space: nowrap !important; } a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
