@@ -1,5 +1,13 @@
 # Operations
 
+## Current deployment
+
+- Release: `v0.5.2`
+- URL: <https://inbox-walk.heerlab.com>
+- Access: Pangolin `BeastyOnly`
+- Namespace: `tools`
+- GitOps source: `beasty/kub-homelab`
+
 ## Runtime contract
 
 - Port: `3000`
@@ -40,13 +48,16 @@ Fastmail.
 ## Verification
 
 ```bash
-kubectl -n tools get deploy,pod,svc inbox-walk
+kubectl -n tools get deploy/inbox-walk svc/inbox-walk
+kubectl -n tools get pods -l app.kubernetes.io/name=inbox-walk
 kubectl -n tools get pvc
 kubectl -n tools get infisicalstaticsecret inbox-walk-secret
 kubectl -n tools rollout status deploy/inbox-walk
 kubectl -n tools port-forward svc/inbox-walk 3000:3000
 curl -fsS http://127.0.0.1:3000/healthz
 curl -fsS http://127.0.0.1:3000/readyz
+curl -fsS http://127.0.0.1:3000/api/review/options \
+  | jq '{mode, reviewedCount, mailboxCount: (.mailboxes | length)}'
 ```
 
 Check `/api/auth/codex/status` for the non-secret configured flag and model. Do

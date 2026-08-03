@@ -28,15 +28,20 @@ Fastmail.
 
 ## Local development
 
-Install dependencies, start Apache Tika, and run the live app through Portless:
+Install dependencies, then start Apache Tika in a separate terminal:
 
 ```bash
 pnpm install
-docker run --rm -p 9998:9998 apache/tika:3.3.1.0-full
+docker run --rm --name inbox-walk-tika -p 9998:9998 apache/tika:3.3.1.0-full
+```
+
+Run the live app through Portless:
+
+```bash
 pnpm dev:portless
 ```
 
-Open <https://inbox-walk.localhost:1355>.
+Open <http://inbox-walk.localhost:1355>.
 
 `pnpm dev` injects the read-only `FASTMAIL_JMAP_TOKEN` from the `Kub-Homelab`
 Infisical project, environment `dev`, path
@@ -84,6 +89,9 @@ builds the production container through the shared BuildKit service, and
 publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
+
+The current usable release is `v0.5.2`, deployed at
+<https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
 The Codex OAuth record and retained-unread SQLite history are stored under

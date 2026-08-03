@@ -1,7 +1,7 @@
 # Inbox Walk documentation
 
-- [PRODUCT.md](PRODUCT.md) defines the review, reply, privacy, and mutation contracts.
-- [BOARD.md](BOARD.md) tracks release and deployment status.
-- [OPERATIONS.md](OPERATIONS.md) documents the runtime and verification contract.
+- [Product behavior](PRODUCT.md) defines review, reply, privacy, and mutation contracts.
+- [Release status](BOARD.md) records the current usable release and deferred work.
+- [Operations](OPERATIONS.md) documents runtime, deployment, and verification.
 
 The repository README remains the source for setup and development commands.
