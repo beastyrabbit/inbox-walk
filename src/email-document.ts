@@ -47,11 +47,17 @@ export function emailDocument(
     FORBID_ATTR: ['srcset', 'onerror', 'onload', 'background'],
   })
   const parsed = new DOMParser().parseFromString(clean, 'text/html')
+  const remoteImageIds = email.remoteImageIds ?? {}
   const cids = new Map(
     email.inlineResources
       .filter((resource) => resource.cid)
       .map((resource) => [resource.cid?.toLowerCase(), blobUrl(snapshotId, resource.blobId, true)]),
   )
+  const blockImage = (image: HTMLImageElement) => {
+    image.removeAttribute('src')
+    image.setAttribute('data-remote-image', 'blocked')
+    image.setAttribute('alt', image.getAttribute('alt') || 'Bild nicht verfügbar')
+  }
   for (const image of parsed.querySelectorAll('img')) {
     const src = image.getAttribute('src') || ''
     if (!src.trim() || src.trim() === '#') {
@@ -59,16 +65,37 @@ export function emailDocument(
     } else if (src.toLowerCase().startsWith('cid:')) {
       const replacement = cids.get(src.slice(4).replace(/^<|>$/g, '').toLowerCase())
       if (replacement) image.setAttribute('src', replacement)
-      else image.removeAttribute('src')
+      else blockImage(image)
     } else if (/^(https?:)?\/\//i.test(src)) {
-      const normalized = src.startsWith('//') ? `https:${src}` : src
-      if (loadRemoteImages && normalized.toLowerCase().startsWith('https://')) {
-        image.setAttribute('src', remoteImageUrl(snapshotId, email.id, normalized, imageToken))
-      } else {
-        image.removeAttribute('src')
-        image.setAttribute('data-remote-image', 'blocked')
-        image.setAttribute('alt', image.getAttribute('alt') || 'Externes Bild blockiert')
+      let imageId: string | undefined
+      try {
+        const normalized = new URL(src.startsWith('//') ? `https:${src}` : src).toString()
+        imageId = remoteImageIds[normalized]
+      } catch {
+        // Malformed remote URLs stay blocked.
       }
+      if (loadRemoteImages && imageId) {
+        image.setAttribute('src', remoteImageUrl(snapshotId, email.id, imageId, imageToken))
+      } else {
+        blockImage(image)
+      }
+    } else if (!src.toLowerCase().startsWith('data:image/')) {
+      blockImage(image)
+    }
+  }
+  for (const element of parsed.querySelectorAll('[srcset], [background], [poster]')) {
+    element.removeAttribute('srcset')
+    element.removeAttribute('background')
+    element.removeAttribute('poster')
+  }
+  for (const element of parsed.querySelectorAll('[src]')) {
+    if (element.tagName.toLowerCase() !== 'img') element.removeAttribute('src')
+  }
+  for (const element of parsed.querySelectorAll('[href], [xlink\\:href]')) {
+    if (element.tagName.toLowerCase() === 'a') continue
+    for (const attribute of ['href', 'xlink:href']) {
+      const value = element.getAttribute(attribute) ?? ''
+      if (/^(?:https?:)?\/\//i.test(value)) element.removeAttribute(attribute)
     }
   }
   const stripRemoteUrls = (value: string) =>

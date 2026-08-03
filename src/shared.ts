@@ -52,6 +52,7 @@ export interface ReviewEmail extends ReviewEmailSummary {
   bodyTruncated: boolean
   inlineResources: MailResource[]
   attachments: MailResource[]
+  remoteImageIds?: Record<string, string>
 }
 
 export interface ReviewOptions {

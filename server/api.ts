@@ -80,6 +80,8 @@ interface StoredSnapshot {
   mode: 'demo' | 'live'
   replyCache: Map<string, Promise<ReplyProposal>>
   replyInFlight: Set<string>
+  remoteImageIds: Map<string, Map<string, string>>
+  remoteImageSources: Map<string, string>
   summaries: Map<string, ReviewEmailSummary>
   succeededIds: Set<string>
   threadCache: Map<string, ThreadMessage[]>
@@ -260,6 +262,8 @@ function storeSnapshot(
     mode: data.mode,
     replyCache: new Map(),
     replyInFlight: new Set(),
+    remoteImageIds: new Map(),
+    remoteImageSources: new Map(),
     succeededIds: new Set(),
     summaries: new Map(data.emails.map((email) => [email.id, email])),
     threadCache: new Map(),
@@ -296,6 +300,21 @@ function snapshotPayload(
 function registerResources(snapshot: StoredSnapshot, email: ReviewEmail) {
   for (const resource of [...email.inlineResources, ...email.attachments]) {
     snapshot.blobMetadata.set(resource.blobId, resource)
+  }
+  const registered = snapshot.remoteImageIds.get(email.id) ?? new Map<string, string>()
+  for (const source of allowedRemoteImages(email)) {
+    if (registered.has(source)) continue
+    const imageId = randomBytes(18).toString('base64url')
+    registered.set(source, imageId)
+    snapshot.remoteImageSources.set(`${email.id}/${imageId}`, source)
+  }
+  snapshot.remoteImageIds.set(email.id, registered)
+}
+
+function emailPayload(snapshot: StoredSnapshot, email: ReviewEmail): ReviewEmail {
+  return {
+    ...email,
+    remoteImageIds: Object.fromEntries(snapshot.remoteImageIds.get(email.id) ?? []),
   }
 }
 
@@ -556,7 +575,7 @@ async function emailDetail(
     snapshot.detailCache.set(emailId, email)
     registerResources(snapshot, email)
   }
-  return json(res, 200, email)
+  return json(res, 200, emailPayload(snapshot, email))
 }
 
 function decodeHtmlAttribute(value: string) {
@@ -589,22 +608,28 @@ function allowedRemoteImages(email: ReviewEmail) {
   const pattern = /<img\b[^>]*?\bsrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi
   for (const match of html.matchAll(pattern)) {
     const source = normalizedRemoteImageSource(match[1] ?? match[2] ?? match[3] ?? '')
-    if (source) sources.add(source)
+    if (source?.startsWith('https://')) sources.add(source)
   }
   return sources
 }
 
-async function remoteImage(res: ServerResponse, url: URL, snapshotId: string, emailId: string) {
+async function remoteImage(
+  res: ServerResponse,
+  url: URL,
+  snapshotId: string,
+  emailId: string,
+  imageId: string,
+) {
   const snapshot = getSnapshot(snapshotId)
   if (url.searchParams.get('token') !== snapshot.imageToken) {
     throw new ApiHttpError(403, 'INVALID_IMAGE_TOKEN', 'Ungültiger Bildzugriff.')
   }
   if (!snapshot.summaries.has(emailId))
     throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-  const email = snapshot.detailCache.get(emailId)
-  if (!email) throw new ApiHttpError(409, 'EMAIL_NOT_LOADED', 'Nachricht wurde noch nicht geladen.')
-  const source = normalizedRemoteImageSource(url.searchParams.get('url') ?? '')
-  if (!source || !allowedRemoteImages(email).has(source)) {
+  if (!snapshot.detailCache.has(emailId))
+    throw new ApiHttpError(409, 'EMAIL_NOT_LOADED', 'Nachricht wurde noch nicht geladen.')
+  const source = snapshot.remoteImageSources.get(`${emailId}/${imageId}`)
+  if (!source) {
     throw new ApiHttpError(403, 'IMAGE_FORBIDDEN', 'Dieses Bild gehört nicht zur Nachricht.')
   }
   try {
@@ -1118,10 +1143,16 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
       }
       if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
         const snapshotId = parts[2]
-        if (req.method === 'GET' && parts[3] === 'emails' && parts[4] && parts[5] === 'images') {
-          return await remoteImage(res, url, snapshotId, parts[4])
+        if (
+          req.method === 'GET' &&
+          parts[3] === 'emails' &&
+          parts[4] &&
+          parts[5] === 'images' &&
+          parts[6]
+        ) {
+          return await remoteImage(res, url, snapshotId, parts[4], parts[6])
         }
-        if (req.method === 'GET' && parts[3] === 'emails' && parts[4]) {
+        if (req.method === 'GET' && parts[3] === 'emails' && parts[4] && !parts[5]) {
           return await emailDetail(res, snapshotId, parts[4], apiOptions)
         }
         if (req.method === 'GET' && parts[3] === 'threads' && parts[4]) {

@@ -127,6 +127,22 @@ describe('demo API contract', () => {
     expect(detail.response.status).toBe(200)
     expect(detail.body).toHaveProperty('text')
     expect(detail.body.attachments).toHaveLength(1)
+
+    const remoteSummary = review.body.emails.find((email) => email.id === 'demo-shop')
+    expect(remoteSummary).toBeDefined()
+    if (!remoteSummary) return
+    const remoteDetail = await json<ReviewEmail>(
+      `/api/reviews/${review.body.snapshotId}/emails/${remoteSummary.id}`,
+    )
+    const remoteIds = Object.values(remoteDetail.body.remoteImageIds ?? {})
+    expect(remoteIds).toHaveLength(1)
+    expect(remoteIds[0]).toMatch(/^[A-Za-z0-9_-]{24}$/)
+
+    const unknownImage = await json<{ error: { code: string } }>(
+      `/api/reviews/${review.body.snapshotId}/emails/${remoteSummary.id}/images/not-registered?token=${review.body.imageToken}`,
+    )
+    expect(unknownImage.response.status).toBe(403)
+    expect(unknownImage.body.error.code).toBe('IMAGE_FORBIDDEN')
   })
 
   it('resumes only exact IDs and reports missing messages', async () => {

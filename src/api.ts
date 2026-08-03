@@ -143,9 +143,9 @@ export function blobUrl(snapshotId: string, blobId: string, inline = false) {
 export function remoteImageUrl(
   snapshotId: string,
   emailId: string,
-  source: string,
+  imageId: string,
   imageToken: string,
 ) {
-  const params = new URLSearchParams({ token: imageToken, url: source })
-  return `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}/images?${params}`
+  const params = new URLSearchParams({ token: imageToken })
+  return `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}/images/${encodeURIComponent(imageId)}?${params}`
 }
