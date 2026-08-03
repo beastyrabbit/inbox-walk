@@ -38,13 +38,13 @@ beforeEach(() => storage.clear())
 describe('local review checkpoint', () => {
   it('stores IDs and decisions without message bodies', () => {
     saveCheckpoint({
-      version: 3,
+      version: 4,
       emailIds: ['mail-1'],
-      filters: { mailboxId: null, newsletter: 'all', timeRange: '7d' },
+      filters: { mailboxId: null, newsletter: 'all', spam: 'exclude', timeRange: '7d' },
       index: 0,
       keptUnreadIds: ['mail-1'],
       processedIds: ['mail-1'],
-      unsubscribeIds: [],
+      secondaryActionIds: [],
       replyDrafts: {},
     })
     expect(loadCheckpoint()).toMatchObject({
@@ -59,13 +59,13 @@ describe('local review checkpoint', () => {
     localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
     expect(loadCheckpoint()).toBeNull()
     saveCheckpoint({
-      version: 3,
+      version: 4,
       emailIds: [],
-      filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
+      filters: { mailboxId: null, newsletter: 'all', spam: 'exclude', timeRange: 'all' },
       index: 0,
       keptUnreadIds: [],
       processedIds: [],
-      unsubscribeIds: [],
+      secondaryActionIds: [],
       replyDrafts: {},
     })
     clearCheckpoint()
@@ -78,13 +78,13 @@ describe('local review checkpoint', () => {
     })
     expect(
       saveCheckpoint({
-        version: 3,
+        version: 4,
         emailIds: ['mail-1'],
-        filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
+        filters: { mailboxId: null, newsletter: 'all', spam: 'exclude', timeRange: 'all' },
         index: 0,
         keptUnreadIds: [],
         processedIds: [],
-        unsubscribeIds: [],
+        secondaryActionIds: [],
         replyDrafts: {},
       }),
     ).toBe(false)
@@ -99,10 +99,15 @@ describe('local review checkpoint', () => {
         filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
         index: 1,
         keptUnreadIds: [],
-        unsubscribeIds: [],
+        unsubscribeIds: ['mail-1'],
         replyDrafts: {},
       }),
     )
-    expect(loadCheckpoint()).toMatchObject({ version: 3, processedIds: [] })
+    expect(loadCheckpoint()).toMatchObject({
+      version: 4,
+      filters: { spam: 'exclude' },
+      processedIds: [],
+      secondaryActionIds: ['mail-1'],
+    })
   })
 })

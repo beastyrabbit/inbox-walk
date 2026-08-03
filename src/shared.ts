@@ -19,11 +19,13 @@ export interface MailboxOption {
 }
 
 export type NewsletterFilter = 'all' | 'exclude' | 'only'
+export type SpamFilter = 'exclude' | 'only'
 export type TimeRange = 'all' | '24h' | '7d' | '30d'
 
 export interface ReviewFilters {
   mailboxId: string | null
   newsletter: NewsletterFilter
+  spam: SpamFilter
   timeRange: TimeRange
 }
 
@@ -38,7 +40,6 @@ export interface ReviewEmailSummary {
   mailboxNames: string[]
   hasAttachment: boolean
   isNewsletter: boolean
-  canOneClickUnsubscribe: boolean
 }
 
 export interface ReviewEmail extends ReviewEmailSummary {
@@ -94,13 +95,13 @@ export interface ReviewSnapshot {
 }
 
 export interface ReviewCheckpoint {
-  version: 3
+  version: 4
   emailIds: string[]
   filters: ReviewFilters
   index: number
   keptUnreadIds: string[]
   processedIds: string[]
-  unsubscribeIds: string[]
+  secondaryActionIds: string[]
   replyDrafts: Record<string, ReplyEditorState>
 }
 
@@ -110,6 +111,7 @@ export interface FinalizeFailure {
 }
 
 export interface FinalizeResult {
+  actionFailed: FinalizeFailure[]
   failed: FinalizeFailure[]
   finalized: boolean
   keptUnread: number
@@ -117,10 +119,9 @@ export interface FinalizeResult {
   mode: 'demo' | 'live'
   processed: number
   remaining: number
+  rescuedFromSpam: number
+  taggedForUnsubscribe: number
   untouched: number
-  unsubscribeAttempted: number
-  unsubscribeFailed: FinalizeFailure[]
-  unsubscribeSucceeded: number
 }
 
 export interface MailIdentity {
@@ -194,5 +195,6 @@ export interface ApiError {
 export const defaultReviewFilters: ReviewFilters = {
   mailboxId: null,
   newsletter: 'all',
+  spam: 'exclude',
   timeRange: 'all',
 }

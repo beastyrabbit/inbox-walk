@@ -273,4 +273,85 @@ describe('demo API contract', () => {
     expect(rejected.response.status).toBe(400)
     expect(rejected.body.error.code).toBe('INVALID_SELECTION')
   })
+
+  it('defers newsletter unsubscribe work as a mailbox label', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({
+        filters: { mailboxId: null, newsletter: 'only', spam: 'exclude', timeRange: 'all' },
+      }),
+    )
+    const newsletter = review.body.emails[0]
+    expect(newsletter?.isNewsletter).toBe(true)
+    if (!newsletter) return
+
+    const finalized = await json<FinalizeResult>(
+      `/api/reviews/${review.body.snapshotId}/finalize`,
+      post(
+        {
+          finalizeIds: [newsletter.id],
+          keepUnreadIds: [],
+          secondaryActionIds: [newsletter.id],
+        },
+        review.body.csrfToken,
+      ),
+    )
+    expect(finalized.body).toMatchObject({
+      rescuedFromSpam: 0,
+      taggedForUnsubscribe: 1,
+    })
+  })
+
+  it('loads only Spam and treats the secondary action as Not Spam', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({
+        filters: { mailboxId: null, newsletter: 'all', spam: 'only', timeRange: 'all' },
+      }),
+    )
+    expect(review.body.emails.map((email) => email.id)).toEqual(['demo-spam'])
+    const spam = review.body.emails[0]
+    if (!spam) return
+
+    const finalized = await json<FinalizeResult>(
+      `/api/reviews/${review.body.snapshotId}/finalize`,
+      post(
+        {
+          finalizeIds: [spam.id],
+          keepUnreadIds: [],
+          secondaryActionIds: [spam.id],
+        },
+        review.body.csrfToken,
+      ),
+    )
+    expect(finalized.body).toMatchObject({
+      rescuedFromSpam: 1,
+      taggedForUnsubscribe: 0,
+    })
+  })
+
+  it('does not allow non-newsletters to receive the deferred unsubscribe label', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({
+        filters: { mailboxId: null, newsletter: 'all', spam: 'exclude', timeRange: 'all' },
+      }),
+    )
+    const regular = review.body.emails.find((email) => !email.isNewsletter)
+    expect(regular).toBeDefined()
+    if (!regular) return
+    const rejected = await json<{ error: { code: string } }>(
+      `/api/reviews/${review.body.snapshotId}/finalize`,
+      post(
+        {
+          finalizeIds: [regular.id],
+          keepUnreadIds: [],
+          secondaryActionIds: [regular.id],
+        },
+        review.body.csrfToken,
+      ),
+    )
+    expect(rejected.response.status).toBe(400)
+    expect(rejected.body.error.code).toBe('UNSUBSCRIBE_UNAVAILABLE')
+  })
 })

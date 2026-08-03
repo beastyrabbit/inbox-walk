@@ -13,9 +13,11 @@ Fastmail.
 
 - Loads at most 250 unread incoming messages into a stable JMAP snapshot.
 - Resumes the exact snapshot and local decisions after a browser refresh.
-- Filters by mailbox, time range, and newsletter status.
-- Sanitizes mail HTML in a sandboxed iframe and blocks remote images by default.
+- Reviews either Spam only or all incoming mail except Spam, with additional mailbox, time, and newsletter filters.
+- Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
 - Keeps selected messages unread and marks the rest read only after confirmation.
+- Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.
+- Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
 - Loads the complete bounded thread before preparing a reply.
 - Sends every supported image to Codex and extracts every supported document through Apache Tika.
 - Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
@@ -53,6 +55,7 @@ you want isolated local credentials.
 - `ArrowRight`: next message
 - `ArrowLeft`: previous message
 - `ArrowUp`: toggle “keep unread”
+- `ArrowDown`: mark “Not Spam” in Spam reviews, otherwise tag a newsletter for later unsubscribe work
 - `R`: open the reply-draft panel
 - `?`: keyboard help
 - `Escape`: close the active panel or dialog

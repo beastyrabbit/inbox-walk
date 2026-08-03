@@ -138,7 +138,7 @@ function App() {
   const [index, setIndex] = useState(0)
   const [keptUnread, setKeptUnread] = useState<Set<string>>(new Set())
   const [processedIds, setProcessedIds] = useState<Set<string>>(new Set())
-  const [unsubscribeIds, setUnsubscribeIds] = useState<Set<string>>(new Set())
+  const [secondaryActionIds, setSecondaryActionIds] = useState<Set<string>>(new Set())
   const [replyDrafts, setReplyDrafts] = useState<Record<string, ReplyEditorState>>({})
   const [threadContexts, setThreadContexts] = useState<Record<string, ThreadContext>>({})
   const [replyProposals, setReplyProposals] = useState<Record<string, ReplyProposal>>({})
@@ -168,7 +168,8 @@ function App() {
   const proposal = summary ? replyProposals[summary.id] : undefined
   const draftResult = summary ? draftResults[summary.id] : undefined
   const isKept = summary ? keptUnread.has(summary.id) : false
-  const isUnsubscribeMarked = summary ? unsubscribeIds.has(summary.id) : false
+  const isSpamReview = snapshot?.filters.spam === 'only'
+  const isSecondaryActionMarked = summary ? secondaryActionIds.has(summary.id) : false
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
   const finalizedEmailIds = useMemo(
@@ -179,9 +180,9 @@ function App() {
     () => finalizedEmailIds.filter((id) => keptUnread.has(id)),
     [finalizedEmailIds, keptUnread],
   )
-  const finalizedUnsubscribeIds = useMemo(
-    () => finalizedEmailIds.filter((id) => unsubscribeIds.has(id)),
-    [finalizedEmailIds, unsubscribeIds],
+  const finalizedSecondaryActionIds = useMemo(
+    () => finalizedEmailIds.filter((id) => secondaryActionIds.has(id)),
+    [finalizedEmailIds, secondaryActionIds],
   )
   const readIds = useMemo(
     () => idsToMarkRead(finalizedEmailIds, new Set(finalizedKeptUnreadIds)),
@@ -212,12 +213,13 @@ function App() {
         const available = new Set(nextSnapshot.emails.map((item) => item.id))
         setKeptUnread(new Set(resume.keptUnreadIds.filter((id) => available.has(id))))
         setProcessedIds(new Set(resume.processedIds.filter((id) => available.has(id))))
-        setUnsubscribeIds(
+        setSecondaryActionIds(
           new Set(
-            resume.unsubscribeIds.filter(
+            resume.secondaryActionIds.filter(
               (id) =>
                 available.has(id) &&
-                nextSnapshot.emails.some((item) => item.id === id && item.canOneClickUnsubscribe),
+                (nextSnapshot.filters.spam === 'only' ||
+                  nextSnapshot.emails.some((item) => item.id === id && item.isNewsletter)),
             ),
           ),
         )
@@ -232,7 +234,7 @@ function App() {
         setIndex(0)
         setKeptUnread(new Set())
         setProcessedIds(new Set())
-        setUnsubscribeIds(new Set())
+        setSecondaryActionIds(new Set())
         setReplyDrafts({})
         setStatus(`${nextSnapshot.emails.length} ungelesene Nachrichten geladen.`)
       }
@@ -307,20 +309,20 @@ function App() {
   useEffect(() => {
     if (!snapshot || !restoredRef.current || emails.length === 0) return
     const saved = saveCheckpoint({
-      version: 3,
+      version: 4,
       emailIds: emails.map((item) => item.id),
       filters: snapshot.filters,
       index,
       keptUnreadIds: [...keptUnread],
       processedIds: [...processedIds],
-      unsubscribeIds: [...unsubscribeIds],
+      secondaryActionIds: [...secondaryActionIds],
       replyDrafts,
     })
     if (!saved)
       setError(
         'Der lokale Checkpoint konnte nicht gespeichert werden. Dieses Fenster offen lassen.',
       )
-  }, [emails, index, keptUnread, processedIds, replyDrafts, snapshot, unsubscribeIds])
+  }, [emails, index, keptUnread, processedIds, replyDrafts, secondaryActionIds, snapshot])
 
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
@@ -376,15 +378,19 @@ function App() {
     setStatus(isKept ? 'Wird beim Abschluss als gelesen markiert.' : 'Bleibt ungelesen.')
   }, [isKept, summary, view])
 
-  const toggleUnsubscribe = useCallback(() => {
-    if (!summary || view !== 'review' || !summary.canOneClickUnsubscribe) return
-    setUnsubscribeIds((current) => toggleKeptUnread(current, summary.id))
+  const toggleSecondaryAction = useCallback(() => {
+    if (!summary || view !== 'review' || (!isSpamReview && !summary.isNewsletter)) return
+    setSecondaryActionIds((current) => toggleKeptUnread(current, summary.id))
     setStatus(
-      isUnsubscribeMarked
-        ? 'One-Click-Abmeldung nicht mehr vorgemerkt.'
-        : 'Sichere One-Click-Abmeldung vorgemerkt.',
+      isSecondaryActionMarked
+        ? isSpamReview
+          ? 'Nachricht bleibt im Spam-Ordner.'
+          : 'Abmelde-Label nicht mehr vorgemerkt.'
+        : isSpamReview
+          ? 'Wird beim Abschluss aus Spam in die Inbox verschoben.'
+          : 'Wird beim Abschluss mit „Newsletter abmelden“ markiert.',
     )
-  }, [isUnsubscribeMarked, summary, view])
+  }, [isSecondaryActionMarked, isSpamReview, summary, view])
 
   const openReply = useCallback(async () => {
     if (!snapshot || !summary) return
@@ -439,7 +445,7 @@ function App() {
         toggleCurrent()
       } else if (event.key === 'ArrowDown') {
         event.preventDefault()
-        toggleUnsubscribe()
+        toggleSecondaryAction()
       }
     }
     window.addEventListener('keydown', onKeyDown)
@@ -455,7 +461,7 @@ function App() {
     replyOpen,
     submitting,
     toggleCurrent,
-    toggleUnsubscribe,
+    toggleSecondaryAction,
     view,
   ])
 
@@ -546,7 +552,7 @@ function App() {
         snapshot,
         finalizedEmailIds,
         finalizedKeptUnreadIds,
-        finalizedUnsubscribeIds,
+        finalizedSecondaryActionIds,
       )
       setResult(nextResult)
       if (nextResult.finalized) {
@@ -652,14 +658,16 @@ function App() {
           {result.markedRead} Nachrichten wurden als gelesen markiert. {result.keptUnread}{' '}
           bearbeitete bleiben ungelesen. {result.untouched} noch nicht bearbeitete Nachrichten
           warten auf die nächste Runde.
-          {result.unsubscribeAttempted > 0 &&
-            ` ${result.unsubscribeSucceeded} von ${result.unsubscribeAttempted} Abmeldungen waren erfolgreich.`}
+          {result.taggedForUnsubscribe > 0 &&
+            ` ${result.taggedForUnsubscribe} Newsletter wurden mit „Newsletter abmelden“ markiert.`}
+          {result.rescuedFromSpam > 0 &&
+            ` ${result.rescuedFromSpam} Nachrichten wurden aus Spam in die Inbox verschoben.`}
         </p>
-        {result.unsubscribeFailed.length > 0 && (
+        {result.actionFailed.length > 0 && (
           <div className="inline-error" role="alert">
-            <strong>{result.unsubscribeFailed.length} Abmeldungen sind fehlgeschlagen.</strong>
+            <strong>{result.actionFailed.length} Zusatzaktionen sind fehlgeschlagen.</strong>
             <ul>
-              {result.unsubscribeFailed.map((failure) => (
+              {result.actionFailed.map((failure) => (
                 <li key={failure.id}>{failure.reason}</li>
               ))}
             </ul>
@@ -694,8 +702,8 @@ function App() {
             <dd>{finalizedKeptUnreadIds.length}</dd>
           </div>
           <div>
-            <dt>One-Click-Abmeldung versuchen</dt>
-            <dd>{finalizedUnsubscribeIds.length}</dd>
+            <dt>{isSpamReview ? 'Aus Spam in die Inbox' : 'Für spätere Abmeldung markieren'}</dt>
+            <dd>{finalizedSecondaryActionIds.length}</dd>
           </div>
           <div>
             <dt>Noch nicht bearbeitet</dt>
@@ -711,6 +719,16 @@ function App() {
             <strong>{result.failed.length} Änderungen fehlgeschlagen.</strong>
             <ul>
               {result.failed.map((failure) => (
+                <li key={failure.id}>{failure.reason}</li>
+              ))}
+            </ul>
+          </div>
+        )}
+        {result && result.actionFailed.length > 0 && (
+          <div className="inline-error" role="alert">
+            <strong>{result.actionFailed.length} Zusatzaktionen fehlgeschlagen.</strong>
+            <ul>
+              {result.actionFailed.map((failure) => (
                 <li key={failure.id}>{failure.reason}</li>
               ))}
             </ul>
@@ -895,25 +913,39 @@ function App() {
           </button>
           <button
             type="button"
-            className={`control-button unsubscribe-button ${isUnsubscribeMarked ? 'active' : ''}`}
+            className={`control-button unsubscribe-button ${isSecondaryActionMarked ? 'active' : ''}`}
             aria-label={
-              summary.canOneClickUnsubscribe
-                ? isUnsubscribeMarked
-                  ? 'One-Click-Abmeldung vorgemerkt'
-                  : 'One-Click-Abmeldung vormerken'
-                : 'Keine sichere One-Click-Abmeldung verfügbar'
+              isSpamReview
+                ? isSecondaryActionMarked
+                  ? 'Als kein Spam vorgemerkt'
+                  : 'Kein Spam'
+                : summary.isNewsletter
+                  ? isSecondaryActionMarked
+                    ? 'Abmelde-Label vorgemerkt'
+                    : 'Für spätere Abmeldung markieren'
+                  : 'Kein Newsletter erkannt'
             }
-            aria-pressed={isUnsubscribeMarked}
-            disabled={!summary.canOneClickUnsubscribe}
-            onClick={toggleUnsubscribe}
+            aria-pressed={isSecondaryActionMarked}
+            disabled={!isSpamReview && !summary.isNewsletter}
+            onClick={toggleSecondaryAction}
             title={
-              summary.canOneClickUnsubscribe
-                ? 'Beim Abschluss eine standardisierte HTTPS-One-Click-Abmeldung versuchen'
-                : 'Dieser Newsletter bietet keine sichere One-Click-Abmeldung an'
+              isSpamReview
+                ? 'Beim Abschluss aus Spam entfernen und in die Inbox verschieben'
+                : summary.isNewsletter
+                  ? 'Beim Abschluss mit dem Fastmail-Label „Newsletter abmelden“ kennzeichnen'
+                  : 'Diese Nachricht wurde nicht als Newsletter erkannt'
             }
           >
             <kbd>↓</kbd>
-            <span>{isUnsubscribeMarked ? 'Abmeldung vorgemerkt' : 'Newsletter abmelden'}</span>
+            <span>
+              {isSpamReview
+                ? isSecondaryActionMarked
+                  ? 'Kein Spam vorgemerkt'
+                  : 'Kein Spam'
+                : isSecondaryActionMarked
+                  ? 'Abmeldung markiert'
+                  : 'Später abmelden'}
+            </span>
           </button>
           <button
             type="button"
@@ -963,7 +995,8 @@ function App() {
           currentIndex={index}
           keptUnread={keptUnread}
           processedIds={processedIds}
-          unsubscribeIds={unsubscribeIds}
+          secondaryActionIds={secondaryActionIds}
+          isSpamReview={isSpamReview}
           onClose={() => setOverviewOpen(false)}
           onSelect={(nextIndex) => {
             setIndex(nextIndex)
@@ -982,7 +1015,7 @@ function App() {
           onApply={() => void applyFilters()}
         />
       )}
-      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+      {helpOpen && <HelpDialog isSpamReview={isSpamReview} onClose={() => setHelpOpen(false)} />}
       {codexLoginOpen && options && (
         <CodexLoginDialog
           authConfigured={options.codex.configured}
@@ -1042,17 +1075,36 @@ function FilterDialog({
           </button>
         </div>
         <label>
+          Bereich
+          <select
+            value={filters.spam}
+            onChange={(event) =>
+              onChange({
+                ...filters,
+                mailboxId: null,
+                spam: event.target.value as ReviewFilters['spam'],
+              })
+            }
+          >
+            <option value="exclude">Alles außer Spam</option>
+            <option value="only">Nur Spam</option>
+          </select>
+        </label>
+        <label>
           Postfach
           <select
+            disabled={filters.spam === 'only'}
             value={filters.mailboxId ?? ''}
             onChange={(event) => onChange({ ...filters, mailboxId: event.target.value || null })}
           >
             <option value="">Alle Postfächer</option>
-            {options?.mailboxes.map((mailbox) => (
-              <option value={mailbox.id} key={mailbox.id}>
-                {mailbox.name}
-              </option>
-            ))}
+            {options?.mailboxes
+              .filter((mailbox) => mailbox.role !== 'junk')
+              .map((mailbox) => (
+                <option value={mailbox.id} key={mailbox.id}>
+                  {mailbox.name}
+                </option>
+              ))}
           </select>
         </label>
         <label>
@@ -1106,7 +1158,8 @@ function OverviewDrawer({
   currentIndex,
   keptUnread,
   processedIds,
-  unsubscribeIds,
+  secondaryActionIds,
+  isSpamReview,
   onClose,
   onDiscard,
   onSelect,
@@ -1115,7 +1168,8 @@ function OverviewDrawer({
   currentIndex: number
   keptUnread: ReadonlySet<string>
   processedIds: ReadonlySet<string>
-  unsubscribeIds: ReadonlySet<string>
+  secondaryActionIds: ReadonlySet<string>
+  isSpamReview: boolean | undefined
   onClose: () => void
   onDiscard: () => void
   onSelect: (index: number) => void
@@ -1136,7 +1190,7 @@ function OverviewDrawer({
             <h2>Nachrichten</h2>
             <p>
               {processedIds.size} bearbeitet · {keptUnread.size} bleiben ungelesen ·{' '}
-              {unsubscribeIds.size} Abmeldungen
+              {secondaryActionIds.size} {isSpamReview ? 'kein Spam' : 'für Abmeldung markiert'}
             </p>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
@@ -1159,8 +1213,10 @@ function OverviewDrawer({
                 <span className="overview-marks">
                   {processedIds.has(item.id) && <span className="processed-mark">bearbeitet</span>}
                   {keptUnread.has(item.id) && <span className="unread-mark">ungelesen</span>}
-                  {unsubscribeIds.has(item.id) && (
-                    <span className="unsubscribe-mark">abmelden</span>
+                  {secondaryActionIds.has(item.id) && (
+                    <span className="unsubscribe-mark">
+                      {isSpamReview ? 'kein Spam' : 'abmelden'}
+                    </span>
                   )}
                 </span>
               </button>
@@ -1177,7 +1233,13 @@ function OverviewDrawer({
   )
 }
 
-function HelpDialog({ onClose }: { onClose: () => void }) {
+function HelpDialog({
+  isSpamReview,
+  onClose,
+}: {
+  isSpamReview: boolean | undefined
+  onClose: () => void
+}) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
   return (
     <div className="dialog-backdrop">
@@ -1212,7 +1274,11 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
             <dt>
               <kbd>↓</kbd>
             </dt>
-            <dd>Sichere Newsletter-Abmeldung vormerken</dd>
+            <dd>
+              {isSpamReview
+                ? 'Als kein Spam markieren und in die Inbox verschieben'
+                : 'Newsletter für spätere Abmeldung markieren'}
+            </dd>
           </div>
           <div>
             <dt>

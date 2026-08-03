@@ -1,5 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fetchEmailDetail, fetchUnreadSnapshot, markEmailsRead, unreadFilter } from './jmap.ts'
+import {
+  fetchEmailDetail,
+  fetchUnreadSnapshot,
+  markEmailsRead,
+  moveEmailsOutOfSpam,
+  tagEmailsForLaterUnsubscribe,
+  unreadFilter,
+} from './jmap.ts'
 
 function jmapResponse(methodResponses: unknown[]) {
   return new Response(JSON.stringify({ methodResponses }), {
@@ -15,6 +22,28 @@ describe('Fastmail JMAP adapter', () => {
     expect(unreadFilter()).toEqual({
       operator: 'AND',
       conditions: [{ notKeyword: '$seen' }, { notKeyword: '$draft' }],
+    })
+  })
+
+  it('switches explicitly between non-spam and spam queries', () => {
+    expect(
+      unreadFilter(
+        { mailboxId: null, newsletter: 'all', spam: 'exclude', timeRange: 'all' },
+        'junk',
+      ),
+    ).toEqual({
+      operator: 'AND',
+      conditions: [
+        { notKeyword: '$seen' },
+        { notKeyword: '$draft' },
+        { operator: 'NOT', conditions: [{ inMailbox: 'junk' }] },
+      ],
+    })
+    expect(
+      unreadFilter({ mailboxId: null, newsletter: 'all', spam: 'only', timeRange: 'all' }, 'junk'),
+    ).toEqual({
+      operator: 'AND',
+      conditions: [{ notKeyword: '$seen' }, { notKeyword: '$draft' }, { inMailbox: 'junk' }],
     })
   })
 
@@ -208,5 +237,95 @@ describe('Fastmail JMAP adapter', () => {
       },
       'mark-read',
     ])
+  })
+
+  it('moves messages out of Spam and into Inbox', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Mailbox/get',
+            {
+              list: [
+                { id: 'inbox', name: 'Inbox', role: 'inbox' },
+                { id: 'junk', name: 'Spam', role: 'junk' },
+              ],
+            },
+            'mailboxes',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(jmapResponse([['Email/set', { updated: { a: null } }, 'not-spam']]))
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await moveEmailsOutOfSpam(
+      {
+        accountId: 'acc-1',
+        apiUrl: 'https://api.example/jmap',
+        downloadUrl: 'https://api.example/download/{accountId}/{blobId}/{name}',
+        maxObjectsInGet: 10,
+        maxObjectsInSet: 10,
+        username: 'alex@example.com',
+      },
+      'token',
+      ['a'],
+    )
+
+    expect(result).toEqual({ failed: [], succeededIds: ['a'] })
+    const request = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))
+    expect(request.methodCalls[0]).toEqual([
+      'Email/set',
+      {
+        accountId: 'acc-1',
+        update: {
+          a: { 'mailboxIds/inbox': true, 'mailboxIds/junk': null },
+        },
+      },
+      'not-spam',
+    ])
+  })
+
+  it('creates and applies a deferred newsletter-unsubscribe label', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jmapResponse([['Mailbox/get', { list: [] }, 'mailboxes']]))
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Mailbox/set',
+            { created: { deferredUnsubscribe: { id: 'unsubscribe-label' } } },
+            'create-unsubscribe-mailbox',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([['Email/set', { updated: { news: null } }, 'tag-unsubscribe']]),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const result = await tagEmailsForLaterUnsubscribe(
+      {
+        accountId: 'acc-1',
+        apiUrl: 'https://api.example/jmap',
+        downloadUrl: 'https://api.example/download/{accountId}/{blobId}/{name}',
+        maxObjectsInGet: 10,
+        maxObjectsInSet: 10,
+        username: 'alex@example.com',
+      },
+      'token',
+      ['news'],
+    )
+
+    expect(result).toEqual({ failed: [], succeededIds: ['news'] })
+    const createRequest = JSON.parse(String(fetchMock.mock.calls[1]?.[1]?.body))
+    expect(createRequest.methodCalls[0][1].create.deferredUnsubscribe).toMatchObject({
+      name: 'Newsletter abmelden',
+      parentId: null,
+    })
+    const tagRequest = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body))
+    expect(tagRequest.methodCalls[0][1].update).toEqual({
+      news: { 'mailboxIds/unsubscribe-label': true },
+    })
   })
 })

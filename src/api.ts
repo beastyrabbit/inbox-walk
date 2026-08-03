@@ -91,11 +91,11 @@ export const api = {
     snapshot: ReviewSnapshot,
     finalizeIds: string[],
     keepUnreadIds: string[],
-    unsubscribeIds: string[],
+    secondaryActionIds: string[],
   ) {
     return post<FinalizeResult>(
       `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/finalize`,
-      { finalizeIds, keepUnreadIds, unsubscribeIds },
+      { finalizeIds, keepUnreadIds, secondaryActionIds },
       snapshot.csrfToken,
     )
   },

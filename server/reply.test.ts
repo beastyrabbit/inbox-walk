@@ -38,7 +38,6 @@ const message: ThreadMessage = {
   mailboxNames: ['Inbox'],
   hasAttachment: false,
   isNewsletter: false,
-  canOneClickUnsubscribe: false,
   bodyTruncated: false,
   inlineResources: [],
   attachments: [],

@@ -73,3 +73,34 @@ test('keeps mail scripts blocked while allowing authenticated same-origin images
   await expect(frame).toHaveAttribute('sandbox', /allow-same-origin/)
   await expect(frame).not.toHaveAttribute('sandbox', /allow-scripts/)
 })
+
+test('marks newsletters for deferred unsubscribe work', async ({ page }) => {
+  await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
+  await page.getByRole('button', { name: /Samstagsbrief · Augustanfang/ }).click()
+  const action = page.getByRole('button', { name: 'Für spätere Abmeldung markieren' })
+  await expect(action).toBeEnabled()
+  await action.click()
+  await expect(page.getByRole('button', { name: 'Abmelde-Label vorgemerkt' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+})
+
+test('reviews Spam separately and makes Down mean Not Spam', async ({ page }) => {
+  await page.getByRole('button', { name: 'Filter', exact: true }).click()
+  await page.getByLabel('Bereich').selectOption('only')
+  await page.getByRole('button', { name: 'Auswahl laden' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Falsch einsortierte Nachricht' })).toBeVisible()
+  const action = page.getByRole('button', { name: 'Kein Spam', exact: true })
+  await action.click()
+  await expect(page.getByRole('button', { name: 'Als kein Spam vorgemerkt' })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByText('Aus Spam in die Inbox')).toBeVisible()
+  await expect(page.locator('.review-summary div').filter({ hasText: 'Aus Spam' })).toContainText(
+    '1',
+  )
+})

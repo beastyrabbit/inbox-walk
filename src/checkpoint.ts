@@ -10,7 +10,7 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
       version?: number
     }
     if (
-      (value.version !== 1 && value.version !== 2 && value.version !== 3) ||
+      (value.version !== 1 && value.version !== 2 && value.version !== 3 && value.version !== 4) ||
       !Array.isArray(value.emailIds) ||
       !Array.isArray(value.keptUnreadIds) ||
       !value.filters ||
@@ -20,17 +20,25 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
       return null
     }
     return {
-      version: 3,
+      version: 4,
       emailIds: value.emailIds.filter((id): id is string => typeof id === 'string').slice(0, 250),
-      filters: value.filters as ReviewFilters,
+      filters: {
+        ...(value.filters as Omit<ReviewFilters, 'spam'>),
+        spam:
+          (value.filters as Partial<ReviewFilters>).spam === 'only' ? 'only' : ('exclude' as const),
+      },
       index: Math.max(0, Math.floor(value.index)),
       keptUnreadIds: value.keptUnreadIds.filter((id): id is string => typeof id === 'string'),
       processedIds: Array.isArray(value.processedIds)
         ? value.processedIds.filter((id): id is string => typeof id === 'string')
         : [],
-      unsubscribeIds: Array.isArray(value.unsubscribeIds)
-        ? value.unsubscribeIds.filter((id): id is string => typeof id === 'string')
-        : [],
+      secondaryActionIds: Array.isArray(value.secondaryActionIds)
+        ? value.secondaryActionIds.filter((id): id is string => typeof id === 'string')
+        : Array.isArray((value as { unsubscribeIds?: unknown }).unsubscribeIds)
+          ? ((value as { unsubscribeIds: unknown[] }).unsubscribeIds.filter(
+              (id): id is string => typeof id === 'string',
+            ) as string[])
+          : [],
       replyDrafts: (value.replyDrafts ?? {}) as Record<string, ReplyEditorState>,
     }
   } catch {

@@ -249,24 +249,3 @@ export async function fetchRemoteImage(value: string) {
   }
   throw new SafeHttpError('Zu viele Weiterleitungen.', 'TOO_MANY_REDIRECTS')
 }
-
-export async function postOneClickUnsubscribe(value: string) {
-  const url = parsePublicHttpsUrl(value)
-  const body = Buffer.from('List-Unsubscribe=One-Click')
-  const response = await pinnedRequest(url, {
-    body,
-    headers: {
-      Accept: 'text/plain, */*;q=0.1',
-      'Content-Length': String(body.length),
-      'Content-Type': 'application/x-www-form-urlencoded',
-    },
-    maxBytes: 64 * 1024,
-    method: 'POST',
-  })
-  if (response.status < 200 || response.status >= 300) {
-    throw new SafeHttpError(
-      `Der Abmeldedienst antwortete mit ${response.status}.`,
-      'UNSUBSCRIBE_FAILED',
-    )
-  }
-}

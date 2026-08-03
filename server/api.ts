@@ -34,7 +34,9 @@ import {
   type LiveSnapshotData,
   type MailAccountContext,
   markEmailsRead,
+  moveEmailsOutOfSpam,
   resumeSnapshot,
+  tagEmailsForLaterUnsubscribe,
 } from './jmap.ts'
 import {
   appendSignature,
@@ -44,7 +46,7 @@ import {
   ReplyError,
   type ReplyRequest,
 } from './reply.ts'
-import { fetchRemoteImage, postOneClickUnsubscribe, SafeHttpError } from './safe-http.ts'
+import { fetchRemoteImage, SafeHttpError } from './safe-http.ts'
 
 const MAX_JSON_BYTES = 256 * 1024
 const MAX_SNAPSHOTS = 20
@@ -55,6 +57,7 @@ const INLINE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/web
 const filtersSchema = z.object({
   mailboxId: z.string().min(1).nullable(),
   newsletter: z.enum(['all', 'exclude', 'only']),
+  spam: z.enum(['exclude', 'only']).default('exclude'),
   timeRange: z.enum(['all', '24h', '7d', '30d']),
 })
 
@@ -71,7 +74,7 @@ interface StoredSnapshot {
   filters: ReviewFilters
   finalEmailIds?: Set<string>
   finalKeepIds?: Set<string>
-  finalUnsubscribeIds?: Set<string>
+  finalSecondaryActionIds?: Set<string>
   finalizationState: 'active' | 'finalized' | 'finalizing'
   identities?: MailIdentity[]
   imageToken: string
@@ -83,12 +86,10 @@ interface StoredSnapshot {
   remoteImageIds: Map<string, Map<string, string>>
   remoteImageSources: Map<string, string>
   summaries: Map<string, ReviewEmailSummary>
+  secondaryActionFailures: Map<string, string>
+  secondaryActionSucceededIds: Set<string>
   succeededIds: Set<string>
   threadCache: Map<string, ThreadMessage[]>
-  unsubscribeAttemptedIds: Set<string>
-  unsubscribeFailures: Map<string, string>
-  unsubscribeSucceededIds: Set<string>
-  unsubscribeUrls: Map<string, string>
 }
 
 export interface ApiOptions {
@@ -207,6 +208,8 @@ function filterDemoEmails(filters: ReviewFilters) {
     filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
   const cutoff = hours ? Date.now() - hours * 3_600_000 : 0
   return demoEmails.filter((email) => {
+    const isSpam = email.mailboxNames.includes('Spam')
+    if ((filters.spam === 'only') !== isSpam) return false
     if (filters.mailboxId && !email.mailboxNames.includes(filters.mailboxId)) return false
     if (cutoff && Date.parse(email.receivedAt) < cutoff) return false
     if (filters.newsletter === 'only' && !email.isNewsletter) return false
@@ -238,7 +241,6 @@ function storeSnapshot(
     context?: MailAccountContext
     mode: 'demo' | 'live'
     details?: ReviewEmail[]
-    unsubscribeUrls?: Record<string, string>
   },
 ) {
   pruneSnapshots()
@@ -264,13 +266,11 @@ function storeSnapshot(
     replyInFlight: new Set(),
     remoteImageIds: new Map(),
     remoteImageSources: new Map(),
+    secondaryActionFailures: new Map(),
+    secondaryActionSucceededIds: new Set(),
     succeededIds: new Set(),
     summaries: new Map(data.emails.map((email) => [email.id, email])),
     threadCache: new Map(),
-    unsubscribeAttemptedIds: new Set(),
-    unsubscribeFailures: new Map(),
-    unsubscribeSucceededIds: new Set(),
-    unsubscribeUrls: new Map(Object.entries(data.unsubscribeUrls ?? {})),
   }
   for (const email of details.values()) registerResources(snapshot, email)
   snapshots.set(snapshotId, snapshot)
@@ -355,6 +355,7 @@ async function createReview(
         { id: 'Inbox', name: 'Inbox', role: 'inbox' },
         { id: 'Newsletter', name: 'Newsletter' },
         { id: 'Reisen', name: 'Reisen' },
+        { id: 'Spam', name: 'Spam', role: 'junk' },
       ],
       mode: 'demo',
       details,
@@ -395,7 +396,10 @@ async function resumeReview(
     const stored = storeSnapshot({
       emails: summariesFor(ordered),
       filters,
-      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mailboxes: [
+        { id: 'Inbox', name: 'Inbox', role: 'inbox' },
+        { id: 'Spam', name: 'Spam', role: 'junk' },
+      ],
       mode: 'demo',
       details: ordered,
     })
@@ -428,6 +432,7 @@ async function options(res: ServerResponse, apiOptions: ApiOptions) {
         { id: 'Inbox', name: 'Inbox', role: 'inbox' },
         { id: 'Newsletter', name: 'Newsletter' },
         { id: 'Reisen', name: 'Reisen' },
+        { id: 'Spam', name: 'Spam', role: 'junk' },
       ],
     })
   }
@@ -726,11 +731,11 @@ async function finalize(
   const body = await readJson(req)
   const finalized = z.array(z.string().min(1)).min(1).max(250).safeParse(body.finalizeIds)
   const kept = z.array(z.string().min(1)).max(250).safeParse(body.keepUnreadIds)
-  const unsubscribe = z
+  const secondaryAction = z
     .array(z.string().min(1))
     .max(250)
-    .safeParse(body.unsubscribeIds ?? [])
-  if (!finalized.success || !kept.success || !unsubscribe.success)
+    .safeParse(body.secondaryActionIds ?? body.unsubscribeIds ?? [])
+  if (!finalized.success || !kept.success || !secondaryAction.success)
     throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
   if (snapshot.finalizationState === 'finalizing') {
     throw new ApiHttpError(
@@ -751,26 +756,26 @@ async function finalize(
   if (kept.data.some((id) => !known.has(id))) {
     throw new ApiHttpError(400, 'UNKNOWN_EMAIL', 'Die Auswahl enthält eine unbekannte Nachricht.')
   }
-  if (unsubscribe.data.some((id) => !known.has(id))) {
+  if (secondaryAction.data.some((id) => !known.has(id))) {
     throw new ApiHttpError(
       400,
       'UNKNOWN_EMAIL',
-      'Die Abmeldeauswahl enthält eine unbekannte Nachricht.',
+      'Die Aktionsauswahl enthält eine unbekannte Nachricht.',
     )
   }
   if (
-    snapshot.mode === 'live' &&
-    unsubscribe.data.some((id) => !snapshot.unsubscribeUrls.has(id))
+    snapshot.filters.spam === 'exclude' &&
+    secondaryAction.data.some((id) => !snapshot.summaries.get(id)?.isNewsletter)
   ) {
     throw new ApiHttpError(
       400,
       'UNSUBSCRIBE_UNAVAILABLE',
-      'Mindestens eine Nachricht unterstützt keine sichere One-Click-Abmeldung.',
+      'Nur erkannte Newsletter können für eine spätere Abmeldung markiert werden.',
     )
   }
   const requestedFinalize = new Set(finalized.data)
   const requestedKeep = new Set(kept.data)
-  const requestedUnsubscribe = new Set(unsubscribe.data)
+  const requestedSecondaryAction = new Set(secondaryAction.data)
   if ([...requestedKeep].some((id) => !requestedFinalize.has(id))) {
     throw new ApiHttpError(
       400,
@@ -778,11 +783,11 @@ async function finalize(
       'Ungelesen geschützte Nachrichten müssen bereits bearbeitet sein.',
     )
   }
-  if ([...requestedUnsubscribe].some((id) => !requestedFinalize.has(id))) {
+  if ([...requestedSecondaryAction].some((id) => !requestedFinalize.has(id))) {
     throw new ApiHttpError(
       400,
       'INVALID_SELECTION',
-      'Abmeldungen müssen zu bereits bearbeiteten Nachrichten gehören.',
+      'Zusatzaktionen müssen zu bereits bearbeiteten Nachrichten gehören.',
     )
   }
   if (snapshot.finalEmailIds) {
@@ -807,17 +812,17 @@ async function finalize(
         'Die Auswahl ist bereits festgeschrieben.',
       )
   } else snapshot.finalKeepIds = requestedKeep
-  if (snapshot.finalUnsubscribeIds) {
+  if (snapshot.finalSecondaryActionIds) {
     const unchanged =
-      requestedUnsubscribe.size === snapshot.finalUnsubscribeIds.size &&
-      [...requestedUnsubscribe].every((id) => snapshot.finalUnsubscribeIds?.has(id))
+      requestedSecondaryAction.size === snapshot.finalSecondaryActionIds.size &&
+      [...requestedSecondaryAction].every((id) => snapshot.finalSecondaryActionIds?.has(id))
     if (!unchanged)
       throw new ApiHttpError(
         409,
         'FINALIZE_SELECTION_LOCKED',
-        'Die Abmeldeauswahl ist bereits festgeschrieben.',
+        'Die Aktionsauswahl ist bereits festgeschrieben.',
       )
-  } else snapshot.finalUnsubscribeIds = requestedUnsubscribe
+  } else snapshot.finalSecondaryActionIds = requestedSecondaryAction
 
   const toMark = [...requestedFinalize].filter(
     (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
@@ -827,12 +832,10 @@ async function finalize(
   try {
     if (snapshot.mode === 'demo') {
       for (const id of toMark) snapshot.succeededIds.add(id)
-      for (const id of requestedUnsubscribe) {
-        snapshot.unsubscribeAttemptedIds.add(id)
-        snapshot.unsubscribeSucceededIds.add(id)
-      }
+      for (const id of requestedSecondaryAction) snapshot.secondaryActionSucceededIds.add(id)
       snapshot.finalizationState = 'finalized'
       const result: FinalizeResult = {
+        actionFailed: [],
         failed: [],
         finalized: true,
         keptUnread: requestedKeep.size,
@@ -840,38 +843,45 @@ async function finalize(
         mode: 'demo',
         processed: requestedFinalize.size,
         remaining: 0,
+        rescuedFromSpam:
+          snapshot.filters.spam === 'only' ? snapshot.secondaryActionSucceededIds.size : 0,
+        taggedForUnsubscribe:
+          snapshot.filters.spam === 'exclude' ? snapshot.secondaryActionSucceededIds.size : 0,
         untouched,
-        unsubscribeAttempted: snapshot.unsubscribeAttemptedIds.size,
-        unsubscribeFailed: [],
-        unsubscribeSucceeded: snapshot.unsubscribeSucceededIds.size,
       }
       return json(res, 200, result)
     }
     const token = apiOptions.fastmailToken?.trim()
     if (!token || !snapshot.context)
       throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-    for (const id of requestedUnsubscribe) {
-      if (snapshot.unsubscribeAttemptedIds.has(id)) continue
-      snapshot.unsubscribeAttemptedIds.add(id)
-      try {
-        const target = snapshot.unsubscribeUrls.get(id)
-        if (!target) throw new Error('Keine sichere One-Click-Adresse verfügbar.')
-        await postOneClickUnsubscribe(target)
-        snapshot.unsubscribeSucceededIds.add(id)
-      } catch (error) {
-        snapshot.unsubscribeFailures.set(
-          id,
-          error instanceof Error ? error.message : 'Die Abmeldung ist fehlgeschlagen.',
-        )
+    const pendingSecondaryActions = [...requestedSecondaryAction].filter(
+      (id) => !snapshot.secondaryActionSucceededIds.has(id),
+    )
+    if (pendingSecondaryActions.length > 0) {
+      const action =
+        snapshot.filters.spam === 'only'
+          ? await moveEmailsOutOfSpam(snapshot.context, token, pendingSecondaryActions)
+          : await tagEmailsForLaterUnsubscribe(snapshot.context, token, pendingSecondaryActions)
+      for (const id of action.succeededIds) {
+        snapshot.secondaryActionSucceededIds.add(id)
+        snapshot.secondaryActionFailures.delete(id)
+      }
+      for (const failure of action.failed) {
+        snapshot.secondaryActionFailures.set(failure.id, failure.reason)
       }
     }
     const update = await markEmailsRead(snapshot.context, token, toMark)
     for (const id of update.markedIds) snapshot.succeededIds.add(id)
-    const remaining = [...requestedFinalize].filter(
+    const remainingRead = [...requestedFinalize].filter(
       (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
     ).length
+    const remainingActions = [...requestedSecondaryAction].filter(
+      (id) => !snapshot.secondaryActionSucceededIds.has(id),
+    ).length
+    const remaining = remainingRead + remainingActions
     snapshot.finalizationState = remaining === 0 ? 'finalized' : 'active'
     const result: FinalizeResult = {
+      actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({ id, reason })),
       failed: update.failed,
       finalized: remaining === 0,
       keptUnread: requestedKeep.size,
@@ -879,12 +889,13 @@ async function finalize(
       mode: 'live',
       processed: requestedFinalize.size,
       remaining,
+      rescuedFromSpam:
+        snapshot.filters.spam === 'only' ? snapshot.secondaryActionSucceededIds.size : 0,
+      taggedForUnsubscribe:
+        snapshot.filters.spam === 'exclude' ? snapshot.secondaryActionSucceededIds.size : 0,
       untouched,
-      unsubscribeAttempted: snapshot.unsubscribeAttemptedIds.size,
-      unsubscribeFailed: [...snapshot.unsubscribeFailures].map(([id, reason]) => ({ id, reason })),
-      unsubscribeSucceeded: snapshot.unsubscribeSucceededIds.size,
     }
-    return json(res, update.failed.length > 0 ? 207 : 200, result)
+    return json(res, remaining > 0 ? 207 : 200, result)
   } catch (error) {
     snapshot.finalizationState = 'active'
     throw error

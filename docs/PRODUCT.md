@@ -6,13 +6,15 @@ and makes every mailbox mutation explicit and recoverable.
 
 ## Review contract
 
-1. Query a stable, bounded snapshot of unread, non-draft incoming mail.
+1. Query a stable, bounded snapshot of unread, non-draft incoming mail, explicitly either Spam only or everything except Spam.
 2. Keep only summaries in the initial payload and load bodies on demand.
 3. Store only snapshot IDs, filters, decisions, and reply editor state locally.
 4. Let the user move backward or forward and protect any message as unread.
 5. Show the exact final counts before changing Fastmail.
 6. Mark only unprotected snapshot IDs as read; newer mail remains untouched.
 7. Report and retry partial failures without repeating successful changes.
+8. In a Spam review, move messages marked “Not Spam” from Spam to Inbox only after confirmation.
+9. For normal reviews, add the `Newsletter abmelden` Fastmail label after confirmation; never contact an unsubscribe endpoint automatically.
 
 If a body cannot be loaded, that message is protected as unread automatically.
 
@@ -34,7 +36,7 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 
 - The Fastmail credential is a backend-only runtime secret; rotating Codex OAuth data stays on the private app volume.
 - Mail HTML is sanitized and isolated in a sandboxed iframe.
-- External images remain blocked until enabled for that message.
+- External images are fetched through a bounded, type-checked backend proxy; the mail document never contacts remote senders directly.
 - Blob downloads are allowlisted from server-owned snapshot metadata.
 - POST mutations require same-origin checks and a snapshot CSRF token.
 - Codex uses the ChatGPT subscription OAuth provider in a fresh in-memory session per request.

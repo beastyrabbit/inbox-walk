@@ -105,12 +105,16 @@ export interface LiveSnapshotData {
   missingIds: string[]
   totalBeforeLimit: number
   truncated: boolean
-  unsubscribeUrls: Record<string, string>
 }
 
 export interface MarkReadResult {
   failed: Array<{ id: string; reason: string }>
   markedIds: string[]
+}
+
+export interface MailboxActionResult {
+  failed: Array<{ id: string; reason: string }>
+  succeededIds: string[]
 }
 
 export interface DraftInput {
@@ -211,14 +215,23 @@ export function unreadFilter(
   filters: ReviewFilters = {
     mailboxId: null,
     newsletter: 'all',
+    spam: 'exclude',
     timeRange: 'all',
   },
+  junkMailboxId?: string,
 ) {
-  const conditions: Array<Record<string, string>> = [
+  const conditions: Array<Record<string, unknown>> = [
     { notKeyword: '$seen' },
     { notKeyword: '$draft' },
   ]
   if (filters.mailboxId) conditions.push({ inMailbox: filters.mailboxId })
+  if (junkMailboxId) {
+    conditions.push(
+      filters.spam === 'only'
+        ? { inMailbox: junkMailboxId }
+        : { operator: 'NOT', conditions: [{ inMailbox: junkMailboxId }] },
+    )
+  }
   const duration =
     filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
   if (duration)
@@ -258,27 +271,6 @@ function isNewsletter(email: JmapEmail) {
   )
 }
 
-function oneClickUnsubscribeUrl(email: JmapEmail) {
-  const post = email['header:List-Unsubscribe-Post:asText'] ?? ''
-  if (!/(?:^|\s|;)List-Unsubscribe\s*=\s*One-Click(?:\s|;|$)/i.test(post)) return null
-  for (const value of email['header:List-Unsubscribe:asURLs'] ?? []) {
-    try {
-      const url = new URL(value)
-      if (
-        url.protocol === 'https:' &&
-        !url.username &&
-        !url.password &&
-        (!url.port || url.port === '443')
-      ) {
-        return url.toString()
-      }
-    } catch {
-      // Ignore malformed or non-URL list entries.
-    }
-  }
-  return null
-}
-
 function summary(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmailSummary {
   return {
     id: email.id,
@@ -291,7 +283,6 @@ function summary(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmail
     mailboxNames: assignedMailboxes(email, mailboxes).map((mailbox) => mailbox.name),
     hasAttachment: Boolean(email.hasAttachment),
     isNewsletter: isNewsletter(email),
-    canOneClickUnsubscribe: Boolean(oneClickUnsubscribeUrl(email)),
   }
 }
 
@@ -307,7 +298,6 @@ const SUMMARY_PROPERTIES = [
   'hasAttachment',
   'header:List-Id:asText',
   'header:List-Unsubscribe:asURLs',
-  'header:List-Unsubscribe-Post:asText',
 ]
 
 const DETAIL_PROPERTIES = [
@@ -374,6 +364,15 @@ function newsletterMatches(email: ReviewEmailSummary, filter: ReviewFilters['new
   return filter === 'only' ? email.isNewsletter : !email.isNewsletter
 }
 
+function spamMatches(
+  email: JmapEmail,
+  mailboxes: Map<string, Mailbox>,
+  filter: ReviewFilters['spam'],
+) {
+  const isSpam = assignedMailboxes(email, mailboxes).some((mailbox) => mailbox.role === 'junk')
+  return filter === 'only' ? isSpam : !isSpam
+}
+
 export async function fetchReviewOptions(token: string) {
   const context = await accountContext(token)
   const mailboxes = await fetchMailboxes(context, token)
@@ -388,15 +387,32 @@ export async function fetchReviewOptions(token: string) {
 
 export async function fetchUnreadSnapshot(
   token: string,
-  filters: ReviewFilters = { mailboxId: null, newsletter: 'all', timeRange: 'all' },
+  filters: ReviewFilters = {
+    mailboxId: null,
+    newsletter: 'all',
+    spam: 'exclude',
+    timeRange: 'all',
+  },
 ): Promise<LiveSnapshotData> {
   const context = await accountContext(token)
   const mailboxList = await fetchMailboxes(context, token)
   const mailboxes = new Map(mailboxList.map((mailbox) => [mailbox.id, mailbox]))
+  const junkMailboxId = mailboxList.find((mailbox) => mailbox.role === 'junk')?.id
+  if (filters.spam === 'only' && !junkMailboxId) {
+    return {
+      context,
+      emails: [],
+      filters,
+      mailboxes: mailboxList.map(({ id, name, role }) => ({ id, name, role })),
+      missingIds: [],
+      totalBeforeLimit: 0,
+      truncated: false,
+    }
+  }
   const queryArguments = {
     accountId: context.accountId,
     calculateTotal: true,
-    filter: unreadFilter(filters),
+    filter: unreadFilter(filters, junkMailboxId),
     sort: [{ property: 'receivedAt', isAscending: false }],
   }
 
@@ -406,7 +422,7 @@ export async function fetchUnreadSnapshot(
     let candidateTotal = 0
     let exhausted = false
     let changed = false
-    const selected: Array<{ email: ReviewEmailSummary; unsubscribeUrl: string | null }> = []
+    const selected: ReviewEmailSummary[] = []
     const missingIds: string[] = []
 
     while (selected.length <= SNAPSHOT_LIMIT && position < MAX_QUERY_CANDIDATES) {
@@ -433,11 +449,9 @@ export async function fetchUnreadSnapshot(
           .map((id) => byId.get(id))
           .filter((email): email is JmapEmail => Boolean(email))
           .filter((email) => isIncoming(email, mailboxes))
-          .map((email) => ({
-            email: summary(email, mailboxes),
-            unsubscribeUrl: oneClickUnsubscribeUrl(email),
-          }))
-          .filter(({ email }) => newsletterMatches(email, filters.newsletter)),
+          .filter((email) => spamMatches(email, mailboxes, filters.spam))
+          .map((email) => summary(email, mailboxes))
+          .filter((email) => newsletterMatches(email, filters.newsletter)),
       )
       position += ids.length
       if (position >= candidateTotal || ids.length < QUERY_PAGE_SIZE) {
@@ -451,8 +465,7 @@ export async function fetchUnreadSnapshot(
     ])
     const second = responseFor(secondResponses, 'query-check')
     if (queryState !== second.queryState) continue
-    const selectedEmails = selected.slice(0, SNAPSHOT_LIMIT)
-    const emails = selectedEmails.map(({ email }) => email)
+    const emails = selected.slice(0, SNAPSHOT_LIMIT)
     return {
       context,
       emails,
@@ -461,11 +474,6 @@ export async function fetchUnreadSnapshot(
       missingIds,
       totalBeforeLimit: exhausted ? selected.length : Math.max(selected.length, SNAPSHOT_LIMIT + 1),
       truncated: selected.length > SNAPSHOT_LIMIT || !exhausted,
-      unsubscribeUrls: Object.fromEntries(
-        selectedEmails.flatMap(({ email, unsubscribeUrl }) =>
-          unsubscribeUrl ? [[email.id, unsubscribeUrl]] : [],
-        ),
-      ),
     }
   }
   throw new JmapError(
@@ -487,16 +495,13 @@ export async function resumeSnapshot(
   const byId = new Map(fetched.list.map((email) => [email.id, email]))
   const missingIds = [...fetched.missing]
   const emails: ReviewEmailSummary[] = []
-  const unsubscribeUrls: Record<string, string> = {}
   for (const id of ids) {
     const email = byId.get(id)
-    if (!email || !isIncoming(email, mailboxes)) {
+    if (!email || !isIncoming(email, mailboxes) || !spamMatches(email, mailboxes, filters.spam)) {
       if (!missingIds.includes(id)) missingIds.push(id)
       continue
     }
     emails.push(summary(email, mailboxes))
-    const unsubscribeUrl = oneClickUnsubscribeUrl(email)
-    if (unsubscribeUrl) unsubscribeUrls[id] = unsubscribeUrl
   }
   return {
     context,
@@ -506,7 +511,6 @@ export async function resumeSnapshot(
     missingIds,
     totalBeforeLimit: ids.length,
     truncated: false,
-    unsubscribeUrls,
   } satisfies LiveSnapshotData
 }
 
@@ -654,6 +658,117 @@ export async function markEmailsRead(
     }
   }
   return { failed, markedIds }
+}
+
+function patchPathSegment(value: string) {
+  return value.replaceAll('~', '~0').replaceAll('/', '~1')
+}
+
+async function updateMailboxMembership(
+  context: MailAccountContext,
+  token: string,
+  ids: readonly string[],
+  patch: Record<string, boolean | null>,
+  callId: string,
+): Promise<MailboxActionResult> {
+  const failed: MailboxActionResult['failed'] = []
+  const succeededIds: string[] = []
+  for (let start = 0; start < ids.length; start += context.maxObjectsInSet) {
+    const batch = ids.slice(start, start + context.maxObjectsInSet)
+    const update = Object.fromEntries(batch.map((id) => [id, patch]))
+    const responses = await callJmap<never>(context.apiUrl, token, [
+      ['Email/set', { accountId: context.accountId, update }, callId],
+    ])
+    const result = responseFor(responses, callId)
+    const notUpdated = result.notUpdated ?? {}
+    const updated = new Set(Object.keys(result.updated ?? {}))
+    for (const id of batch) {
+      if (updated.has(id)) succeededIds.push(id)
+      else if (notUpdated[id])
+        failed.push({ id, reason: notUpdated[id].description ?? notUpdated[id].type })
+      else failed.push({ id, reason: 'Fastmail hat die Änderung nicht bestätigt.' })
+    }
+  }
+  return { failed, succeededIds }
+}
+
+export async function moveEmailsOutOfSpam(
+  context: MailAccountContext,
+  token: string,
+  ids: readonly string[],
+): Promise<MailboxActionResult> {
+  if (ids.length === 0) return { failed: [], succeededIds: [] }
+  const mailboxes = await fetchMailboxes(context, token)
+  const junk = mailboxes.find((mailbox) => mailbox.role === 'junk')
+  const inbox = mailboxes.find((mailbox) => mailbox.role === 'inbox')
+  if (!junk || !inbox) {
+    throw new JmapError(
+      'Fastmail stellt kein Spam- oder Inbox-Postfach bereit.',
+      'MAILBOX_ROLE_MISSING',
+    )
+  }
+  return updateMailboxMembership(
+    context,
+    token,
+    ids,
+    {
+      [`mailboxIds/${patchPathSegment(junk.id)}`]: null,
+      [`mailboxIds/${patchPathSegment(inbox.id)}`]: true,
+    },
+    'not-spam',
+  )
+}
+
+const DEFERRED_UNSUBSCRIBE_MAILBOX = 'Newsletter abmelden'
+
+async function deferredUnsubscribeMailboxId(context: MailAccountContext, token: string) {
+  const mailboxes = await fetchMailboxes(context, token)
+  const existing = mailboxes.find(
+    (mailbox) =>
+      mailbox.name.trim().toLocaleLowerCase('de-DE') ===
+      DEFERRED_UNSUBSCRIBE_MAILBOX.toLocaleLowerCase('de-DE'),
+  )
+  if (existing) return existing.id
+  const responses = await callJmap<Mailbox>(context.apiUrl, token, [
+    [
+      'Mailbox/set',
+      {
+        accountId: context.accountId,
+        create: {
+          deferredUnsubscribe: {
+            name: DEFERRED_UNSUBSCRIBE_MAILBOX,
+            parentId: null,
+            isSubscribed: true,
+          },
+        },
+      },
+      'create-unsubscribe-mailbox',
+    ],
+  ])
+  const result = responseFor(responses, 'create-unsubscribe-mailbox')
+  const created = result.created?.deferredUnsubscribe
+  if (created?.id) return created.id
+  const failure = result.notCreated?.deferredUnsubscribe
+  throw new JmapError(
+    failure?.description ?? failure?.type ?? 'Fastmail konnte das Abmelde-Label nicht anlegen.',
+    'UNSUBSCRIBE_MAILBOX_CREATE_FAILED',
+  )
+}
+
+export async function tagEmailsForLaterUnsubscribe(
+  context: MailAccountContext,
+  token: string,
+  ids: readonly string[],
+): Promise<MailboxActionResult> {
+  if (ids.length === 0) return { failed: [], succeededIds: [] }
+  const mailboxId = await deferredUnsubscribeMailboxId(context, token)
+  return updateMailboxMembership(
+    context,
+    token,
+    ids,
+    { [`mailboxIds/${patchPathSegment(mailboxId)}`]: true },
+    'tag-unsubscribe',
+  )
 }
 
 function downloadUrl(context: MailAccountContext, blobId: string, name: string, type: string) {

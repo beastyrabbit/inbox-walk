@@ -20,7 +20,6 @@ const email: ReviewEmail = {
   mailboxNames: [],
   hasAttachment: false,
   isNewsletter: false,
-  canOneClickUnsubscribe: false,
   bodyTruncated: false,
   attachments: [],
   remoteImageIds: { 'https://tracker.example/pixel': 'opaque-image-id' },
