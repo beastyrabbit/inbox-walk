@@ -65,3 +65,11 @@ test('opens keyboard help and closes it with Escape', async ({ page }) => {
   await page.keyboard.press('Escape')
   await expect(page.getByRole('heading', { name: 'Tastatur' })).toBeHidden()
 })
+
+test('keeps mail scripts blocked while allowing authenticated same-origin images', async ({
+  page,
+}) => {
+  const frame = page.locator('iframe.message-body')
+  await expect(frame).toHaveAttribute('sandbox', /allow-same-origin/)
+  await expect(frame).not.toHaveAttribute('sandbox', /allow-scripts/)
+})

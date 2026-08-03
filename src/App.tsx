@@ -842,7 +842,7 @@ function App() {
               <iframe
                 className="message-body"
                 title={`Inhalt von ${summary.subject}`}
-                sandbox="allow-popups allow-popups-to-escape-sandbox"
+                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
                 srcDoc={emailDocument(email, snapshot.snapshotId, true, snapshot.imageToken)}
               />
             ) : (
