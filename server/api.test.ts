@@ -13,7 +13,7 @@ import { clearApiStateForTests, createApiMiddleware, safeCodexLoginUrl } from '.
 
 let server: Server
 let baseUrl = ''
-const reviewedIds = new Set<string>()
+const retainedIds = new Set<string>()
 
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
@@ -36,9 +36,21 @@ beforeAll(async () => {
     forceDemo: true,
     reviewHistory: {
       close() {},
-      count: () => reviewedIds.size,
-      recordViewed: (emailId) => reviewedIds.add(emailId),
-      viewedIds: () => new Set(reviewedIds),
+      count: () => retainedIds.size,
+      forget: (emailIds) =>
+        emailIds.forEach((emailId) => {
+          retainedIds.delete(emailId)
+        }),
+      rememberKeptUnread: (emailIds) =>
+        emailIds.forEach((emailId) => {
+          retainedIds.add(emailId)
+        }),
+      retainedIds: () => new Set(retainedIds),
+      retainOnly: (emailIds) => {
+        for (const emailId of retainedIds) {
+          if (!emailIds.has(emailId)) retainedIds.delete(emailId)
+        }
+      },
     },
     codexAuthStorage: () => ({
       login: async (_provider, callbacks) => {
@@ -84,7 +96,7 @@ afterAll(async () => {
 
 beforeEach(() => {
   clearApiStateForTests()
-  reviewedIds.clear()
+  retainedIds.clear()
 })
 
 describe('demo API contract', () => {
@@ -155,7 +167,7 @@ describe('demo API contract', () => {
     expect(unknownImage.body.error.code).toBe('IMAGE_FORBIDDEN')
   })
 
-  it('records opened messages and optionally excludes them from a new review', async () => {
+  it('records only messages deliberately kept unread and forgets messages marked read', async () => {
     const first = await json<ReviewSnapshot>(
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
@@ -165,8 +177,15 @@ describe('demo API contract', () => {
     if (!viewed) return
     await json<ReviewEmail>(`/api/reviews/${first.body.snapshotId}/emails/${viewed.id}`)
 
-    const options = await json<ReviewOptions>('/api/review/options')
-    expect(options.body.reviewedCount).toBe(1)
+    const beforeFinalize = await json<ReviewOptions>('/api/review/options')
+    expect(beforeFinalize.body.reviewedCount).toBe(0)
+    await json<FinalizeResult>(
+      `/api/reviews/${first.body.snapshotId}/finalize`,
+      post({ finalizeIds: [viewed.id], keepUnreadIds: [viewed.id] }, first.body.csrfToken),
+    )
+
+    const afterKeep = await json<ReviewOptions>('/api/review/options')
+    expect(afterKeep.body.reviewedCount).toBe(1)
     const filtered = await json<ReviewSnapshot>(
       '/api/reviews',
       post({
@@ -181,6 +200,17 @@ describe('demo API contract', () => {
     )
     expect(filtered.body.emails.map((email) => email.id)).not.toContain(viewed.id)
     expect(filtered.body.emails).toHaveLength(3)
+
+    const unfiltered = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    await json<FinalizeResult>(
+      `/api/reviews/${unfiltered.body.snapshotId}/finalize`,
+      post({ finalizeIds: [viewed.id], keepUnreadIds: [] }, unfiltered.body.csrfToken),
+    )
+    const afterRead = await json<ReviewOptions>('/api/review/options')
+    expect(afterRead.body.reviewedCount).toBe(0)
   })
 
   it('resumes only exact IDs and reports missing messages', async () => {

@@ -8,7 +8,7 @@ Last updated: 2026-08-03
 - [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.
 - [x] Mailbox, newsletter, and time filters plus a message overview.
 - [x] Dedicated pre-review selection for normal mail or Spam with direct controls.
-- [x] Optional already-viewed exclusion backed by a minimal persistent SQLite history.
+- [x] Optional deferred-message exclusion backed by a minimal persistent SQLite history.
 - [x] Keyboard navigation, accessible announcements, and responsive layouts.
 - [x] Partial-safe finalization with exact success tracking and retries.
 - [x] Full-thread assisted replies with automatic all-attachment handling.

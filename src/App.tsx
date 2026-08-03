@@ -1184,9 +1184,11 @@ function ReviewSetup({
               {filters.hideReviewed ? '✓' : ''}
             </span>
             <span>
-              <strong>Bereits angesehene ausblenden</strong>
+              <strong>Zurückgestellte Nachrichten ausblenden</strong>
               <small>
-                {options?.reviewedCount ?? 0} Nachrichten sind bisher in der lokalen SQLite-Historie
+                {options?.reviewedCount === 1
+                  ? '1 Nachricht wurde angesehen und bewusst ungelesen behalten'
+                  : `${options?.reviewedCount ?? 0} Nachrichten wurden angesehen und bewusst ungelesen behalten`}
               </small>
             </span>
           </label>

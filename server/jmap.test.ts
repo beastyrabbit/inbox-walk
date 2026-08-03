@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   fetchEmailDetail,
+  fetchUnreadEmailIds,
   fetchUnreadSnapshot,
   markEmailsRead,
   moveEmailsOutOfSpam,
@@ -251,6 +252,50 @@ describe('Fastmail JMAP adapter', () => {
         update: { a: { 'keywords/$seen': true }, b: { 'keywords/$seen': true } },
       },
       'mark-read',
+    ])
+  })
+
+  it('reconciles retained history IDs with their current unread state', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jmapResponse([
+        [
+          'Email/get',
+          {
+            list: [
+              { id: 'still-unread', keywords: {} },
+              { id: 'now-read', keywords: { $seen: true } },
+            ],
+            notFound: ['deleted'],
+          },
+          'history-emails',
+        ],
+      ]),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const unreadIds = await fetchUnreadEmailIds(
+      {
+        accountId: 'acc-1',
+        apiUrl: 'https://api.example/jmap',
+        downloadUrl: 'https://api.example/download/{accountId}/{blobId}/{name}',
+        maxObjectsInGet: 10,
+        maxObjectsInSet: 10,
+        username: 'alex@example.com',
+      },
+      'token',
+      ['still-unread', 'now-read', 'deleted'],
+    )
+
+    expect(unreadIds).toEqual(new Set(['still-unread']))
+    const request = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body))
+    expect(request.methodCalls[0]).toEqual([
+      'Email/get',
+      {
+        accountId: 'acc-1',
+        ids: ['still-unread', 'now-read', 'deleted'],
+        properties: ['id', 'keywords'],
+      },
+      'history-emails',
     ])
   })
 

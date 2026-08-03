@@ -10,7 +10,7 @@ and makes every mailbox mutation explicit and recoverable.
 2. Query a stable, bounded snapshot of matching unread, non-draft incoming mail.
 3. Keep only summaries in the initial payload and load bodies on demand.
 4. Store snapshot IDs, filters, decisions, and reply editor state in the browser checkpoint.
-5. Record opened message IDs and timestamps in a server-side SQLite history, and exclude them only when the user chooses that option.
+5. Record only message IDs deliberately kept unread at finalization in a server-side SQLite history, and exclude them only when the user chooses that option.
 6. Let the user move backward or forward and protect any message as unread.
 7. Show the exact final counts before changing Fastmail.
 8. Mark only unprotected snapshot IDs as read; newer mail remains untouched.
@@ -37,7 +37,7 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 ## Privacy and safety
 
 - The Fastmail credential is a backend-only runtime secret; rotating Codex OAuth data stays on the private app volume.
-- The review-history database stores Fastmail IDs and viewing metadata only, never message content or address metadata.
+- The retained-unread database stores Fastmail IDs and retention metadata only, never message content or address metadata.
 - Mail HTML is sanitized and isolated in a sandboxed iframe.
 - External images are fetched through a bounded, type-checked backend proxy; the mail document never contacts remote senders directly.
 - Blob downloads are allowlisted from server-owned snapshot metadata.

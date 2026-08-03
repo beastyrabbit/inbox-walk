@@ -29,6 +29,7 @@ import {
   fetchIdentities,
   fetchReviewOptions,
   fetchThread,
+  fetchUnreadEmailIds,
   fetchUnreadSnapshot,
   JmapError,
   type LiveSnapshotData,
@@ -206,12 +207,12 @@ function pruneSnapshots() {
   for (const [id] of oldest.slice(0, snapshots.size - MAX_SNAPSHOTS)) snapshots.delete(id)
 }
 
-function filterDemoEmails(filters: ReviewFilters, viewedIds: ReadonlySet<string>) {
+function filterDemoEmails(filters: ReviewFilters, retainedIds: ReadonlySet<string>) {
   const hours =
     filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
   const cutoff = hours ? Date.now() - hours * 3_600_000 : 0
   return demoEmails.filter((email) => {
-    if (filters.hideReviewed && viewedIds.has(email.id)) return false
+    if (filters.hideReviewed && retainedIds.has(email.id)) return false
     const isSpam = email.mailboxNames.includes('Spam')
     if ((filters.spam === 'only') !== isSpam) return false
     if (filters.mailboxId && !email.mailboxNames.includes(filters.mailboxId)) return false
@@ -343,15 +344,34 @@ function parseFilters(value: unknown) {
   return parsed.data
 }
 
+function updateReviewHistory(
+  history: ReviewHistory | undefined,
+  keptUnreadIds: ReadonlySet<string>,
+  markedReadIds: readonly string[],
+) {
+  if (!history) return
+  try {
+    history.rememberKeptUnread([...keptUnreadIds])
+    history.forget(markedReadIds)
+  } catch (error) {
+    process.stderr.write(
+      `${JSON.stringify({
+        event: 'review_history_update_failed',
+        message: error instanceof Error ? error.message : 'unknown',
+      })}\n`,
+    )
+  }
+}
+
 async function createReview(
   res: ServerResponse,
   body: Record<string, unknown>,
   options: ApiOptions,
 ) {
   const filters = parseFilters(body.filters)
-  const viewedIds = options.reviewHistory?.viewedIds() ?? new Set<string>()
+  const retainedIds = options.reviewHistory?.retainedIds() ?? new Set<string>()
   if (options.forceDemo) {
-    const details = filterDemoEmails(filters, viewedIds)
+    const details = filterDemoEmails(filters, retainedIds)
     const emails = summariesFor(details)
     const stored = storeSnapshot({
       emails,
@@ -370,7 +390,7 @@ async function createReview(
   const token = options.fastmailToken?.trim()
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
-  const data = await fetchUnreadSnapshot(token, filters, viewedIds)
+  const data = await fetchUnreadSnapshot(token, filters, retainedIds)
   const stored = storeSnapshot({ ...data, mode: 'live' })
   return json(
     res,
@@ -446,6 +466,11 @@ async function options(res: ServerResponse, apiOptions: ApiOptions) {
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
   const result = await fetchReviewOptions(token)
+  const retainedIds = apiOptions.reviewHistory?.retainedIds() ?? new Set<string>()
+  if (retainedIds.size > 0 && apiOptions.reviewHistory) {
+    const unreadIds = await fetchUnreadEmailIds(result.context, token, [...retainedIds])
+    apiOptions.reviewHistory.retainOnly(unreadIds)
+  }
   return json(res, 200, {
     codex,
     mode: 'live',
@@ -591,7 +616,6 @@ async function emailDetail(
     snapshot.detailCache.set(emailId, email)
     registerResources(snapshot, email)
   }
-  apiOptions.reviewHistory?.recordViewed(emailId)
   return json(res, 200, emailPayload(snapshot, email))
 }
 
@@ -845,6 +869,7 @@ async function finalize(
     if (snapshot.mode === 'demo') {
       for (const id of toMark) snapshot.succeededIds.add(id)
       for (const id of requestedSecondaryAction) snapshot.secondaryActionSucceededIds.add(id)
+      updateReviewHistory(apiOptions.reviewHistory, requestedKeep, [...snapshot.succeededIds])
       snapshot.finalizationState = 'finalized'
       const result: FinalizeResult = {
         actionFailed: [],
@@ -884,6 +909,7 @@ async function finalize(
     }
     const update = await markEmailsRead(snapshot.context, token, toMark)
     for (const id of update.markedIds) snapshot.succeededIds.add(id)
+    updateReviewHistory(apiOptions.reviewHistory, requestedKeep, update.markedIds)
     const remainingRead = [...requestedFinalize].filter(
       (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
     ).length

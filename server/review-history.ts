@@ -9,8 +9,10 @@ const { DatabaseSync } = createRequire(import.meta.url)(
 export interface ReviewHistory {
   close(): void
   count(): number
-  recordViewed(emailId: string): void
-  viewedIds(): Set<string>
+  forget(emailIds: readonly string[]): void
+  rememberKeptUnread(emailIds: readonly string[]): void
+  retainedIds(): Set<string>
+  retainOnly(emailIds: ReadonlySet<string>): void
 }
 
 export function reviewHistoryPath() {
@@ -25,22 +27,48 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
-    CREATE TABLE IF NOT EXISTS viewed_email (
+    CREATE TABLE IF NOT EXISTS kept_unread_email (
       email_id TEXT PRIMARY KEY,
-      first_viewed_at TEXT NOT NULL,
-      last_viewed_at TEXT NOT NULL,
-      view_count INTEGER NOT NULL DEFAULT 1 CHECK (view_count > 0)
+      first_retained_at TEXT NOT NULL,
+      last_retained_at TEXT NOT NULL,
+      retain_count INTEGER NOT NULL DEFAULT 1 CHECK (retain_count > 0)
     ) STRICT;
   `)
+  const legacyTable = database
+    .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'viewed_email'")
+    .get()
+  if (legacyTable) {
+    database.exec(`
+      INSERT OR IGNORE INTO kept_unread_email (
+        email_id,
+        first_retained_at,
+        last_retained_at,
+        retain_count
+      )
+      SELECT email_id, first_viewed_at, last_viewed_at, view_count FROM viewed_email;
+      DROP TABLE viewed_email;
+    `)
+  }
   const record = database.prepare(`
-    INSERT INTO viewed_email (email_id, first_viewed_at, last_viewed_at, view_count)
+    INSERT INTO kept_unread_email (
+      email_id,
+      first_retained_at,
+      last_retained_at,
+      retain_count
+    )
     VALUES (?, ?, ?, 1)
     ON CONFLICT(email_id) DO UPDATE SET
-      last_viewed_at = excluded.last_viewed_at,
-      view_count = viewed_email.view_count + 1
+      last_retained_at = excluded.last_retained_at,
+      retain_count = kept_unread_email.retain_count + 1
   `)
-  const list = database.prepare('SELECT email_id FROM viewed_email')
-  const count = database.prepare('SELECT COUNT(*) AS count FROM viewed_email')
+  const remove = database.prepare('DELETE FROM kept_unread_email WHERE email_id = ?')
+  const list = database.prepare('SELECT email_id FROM kept_unread_email')
+  const count = database.prepare('SELECT COUNT(*) AS count FROM kept_unread_email')
+
+  const normalizedIds = (emailIds: readonly string[]) =>
+    new Set(emailIds.map((id) => id.trim()).filter((id) => id && id.length <= 512))
+  const readRetainedIds = () =>
+    new Set((list.all() as Array<{ email_id: string }>).map((row) => row.email_id))
 
   return {
     close() {
@@ -49,14 +77,21 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
     count() {
       return Number((count.get() as { count: number | bigint }).count)
     },
-    recordViewed(emailId: string) {
-      const normalized = emailId.trim()
-      if (!normalized || normalized.length > 512) return
-      const now = new Date().toISOString()
-      record.run(normalized, now, now)
+    forget(emailIds: readonly string[]) {
+      for (const emailId of normalizedIds(emailIds)) remove.run(emailId)
     },
-    viewedIds() {
-      return new Set((list.all() as Array<{ email_id: string }>).map((row) => row.email_id))
+    rememberKeptUnread(emailIds: readonly string[]) {
+      const now = new Date().toISOString()
+      for (const emailId of normalizedIds(emailIds)) record.run(emailId, now, now)
+    },
+    retainedIds() {
+      return readRetainedIds()
+    },
+    retainOnly(emailIds: ReadonlySet<string>) {
+      const retained = normalizedIds([...emailIds])
+      for (const emailId of readRetainedIds()) {
+        if (!retained.has(emailId)) remove.run(emailId)
+      }
     },
   }
 }

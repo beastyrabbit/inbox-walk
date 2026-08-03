@@ -386,6 +386,35 @@ export async function fetchReviewOptions(token: string) {
   }
 }
 
+export async function fetchUnreadEmailIds(
+  context: MailAccountContext,
+  token: string,
+  ids: readonly string[],
+) {
+  const unreadIds = new Set<string>()
+  for (let start = 0; start < ids.length; start += context.maxObjectsInGet) {
+    const responses = await callJmap<{ id: string; keywords?: Record<string, boolean> }>(
+      context.apiUrl,
+      token,
+      [
+        [
+          'Email/get',
+          {
+            accountId: context.accountId,
+            ids: ids.slice(start, start + context.maxObjectsInGet),
+            properties: ['id', 'keywords'],
+          },
+          'history-emails',
+        ],
+      ],
+    )
+    for (const email of responseFor(responses, 'history-emails').list ?? []) {
+      if (email.keywords?.$seen !== true) unreadIds.add(email.id)
+    }
+  }
+  return unreadIds
+}
+
 export async function fetchUnreadSnapshot(
   token: string,
   filters: ReviewFilters = {
@@ -395,7 +424,7 @@ export async function fetchUnreadSnapshot(
     spam: 'exclude',
     timeRange: 'all',
   },
-  viewedIds: ReadonlySet<string> = new Set(),
+  retainedIds: ReadonlySet<string> = new Set(),
 ): Promise<LiveSnapshotData> {
   const context = await accountContext(token)
   const mailboxList = await fetchMailboxes(context, token)
@@ -453,7 +482,7 @@ export async function fetchUnreadSnapshot(
           .filter((email): email is JmapEmail => Boolean(email))
           .filter((email) => isIncoming(email, mailboxes))
           .filter((email) => spamMatches(email, mailboxes, filters.spam))
-          .filter((email) => !filters.hideReviewed || !viewedIds.has(email.id))
+          .filter((email) => !filters.hideReviewed || !retainedIds.has(email.id))
           .map((email) => summary(email, mailboxes))
           .filter((email) => newsletterMatches(email, filters.newsletter)),
       )

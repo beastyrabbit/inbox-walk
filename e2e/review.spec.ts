@@ -15,7 +15,7 @@ test('configures every new round on a dedicated direct-selection screen', async 
     'aria-pressed',
     'true',
   )
-  await expect(page.getByLabel('Bereits angesehene ausblenden')).not.toBeChecked()
+  await expect(page.getByLabel('Zurückgestellte Nachrichten ausblenden')).not.toBeChecked()
   await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
 })
 

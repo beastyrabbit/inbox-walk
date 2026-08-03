@@ -20,11 +20,14 @@ The pod must mount `/data` writable for UID/GID `1000`; kub-homelab supplies
 no complete content can be recovered. Live mode refuses to start without an
 explicit HTTP(S) `TIKA_URL`.
 
-`inbox-walk.sqlite` records only opened Fastmail message IDs, first/last-viewed
-timestamps, and a view count. It is protected by the existing private `/data`
-volume and lets the user optionally exclude already-viewed unread messages from
-new rounds. Deleting only this database while the app is stopped resets that
-history; it does not change mail in Fastmail.
+`inbox-walk.sqlite` records only Fastmail message IDs deliberately kept unread,
+first/last-retained timestamps, and a retain count. It is protected by the
+existing private `/data` volume and lets the user optionally exclude those
+deferred messages from new rounds. IDs successfully marked read are removed,
+and the options request reconciles remaining IDs against Fastmail so messages
+read or deleted elsewhere do not inflate the count. Deleting only this database
+while the app is stopped resets that history; it does not change mail in
+Fastmail.
 
 ## Deployment path
 
