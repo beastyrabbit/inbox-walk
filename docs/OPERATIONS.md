@@ -6,7 +6,7 @@
 - Liveness: `GET /healthz`
 - Readiness: `GET /readyz`
 - Required live secret: `FASTMAIL_JMAP_TOKEN`
-- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record
+- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record and `inbox-walk.sqlite`
 - Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
 - Inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
@@ -19,6 +19,12 @@ The pod must mount `/data` writable for UID/GID `1000`; kub-homelab supplies
 `apache/tika:3.3.1.0-full` image with PDF OCR enabled and still fails closed when
 no complete content can be recovered. Live mode refuses to start without an
 explicit HTTP(S) `TIKA_URL`.
+
+`inbox-walk.sqlite` records only opened Fastmail message IDs, first/last-viewed
+timestamps, and a view count. It is protected by the existing private `/data`
+volume and lets the user optionally exclude already-viewed unread messages from
+new rounds. Deleting only this database while the app is stopped resets that
+history; it does not change mail in Fastmail.
 
 ## Deployment path
 
@@ -42,7 +48,8 @@ curl -fsS http://127.0.0.1:3000/readyz
 
 Check `/api/auth/codex/status` for the non-secret configured flag and model. Do
 not inspect or print `/data/pi/auth.json`; reconnect from the app when OAuth can
-no longer refresh.
+no longer refresh. For the review history, inspect schema and aggregate counts
+only rather than printing message IDs.
 
 Do not print Kubernetes Secret values or application credentials while
 troubleshooting. Inspect key names and sync status only.

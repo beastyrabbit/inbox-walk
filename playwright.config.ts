@@ -14,7 +14,13 @@ export default defineConfig({
     trace: 'retain-on-failure',
   },
   webServer: {
-    command: 'pnpm build && cross-env MAIL_REVIEW_DEMO=1 HOST=127.0.0.1 PORT=4173 pnpm start',
+    command: 'pnpm build && pnpm start',
+    env: {
+      DATA_DIR: 'test-results/runtime-data',
+      HOST: '127.0.0.1',
+      MAIL_REVIEW_DEMO: '1',
+      PORT: '4173',
+    },
     url: `${baseURL}/api/review/options`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,

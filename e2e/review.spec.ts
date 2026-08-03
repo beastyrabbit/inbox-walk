@@ -2,7 +2,21 @@ import { expect, test } from '@playwright/test'
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'Inbox Walk' })).toBeVisible()
+  await page.getByRole('button', { name: 'Review starten' }).click()
   await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+})
+
+test('configures every new round on a dedicated direct-selection screen', async ({ page }) => {
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await expect(page.getByRole('heading', { name: 'Inbox Walk' })).toBeVisible()
+  await expect(page.locator('select')).toHaveCount(0)
+  await expect(page.getByRole('button', { name: /Alles außer Spam/ })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await expect(page.getByLabel('Bereits angesehene ausblenden')).not.toBeChecked()
+  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
 })
 
 test('reviews mail with keyboard decisions and exact overview navigation', async ({ page }) => {
@@ -87,9 +101,9 @@ test('marks newsletters for deferred unsubscribe work', async ({ page }) => {
 })
 
 test('reviews Spam separately and makes Down mean Not Spam', async ({ page }) => {
-  await page.getByRole('button', { name: 'Filter', exact: true }).click()
-  await page.getByLabel('Bereich').selectOption('only')
-  await page.getByRole('button', { name: 'Auswahl laden' }).click()
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await page.getByRole('button', { name: /Nur Spam/ }).click()
+  await page.getByRole('button', { name: 'Review starten' }).click()
 
   await expect(page.getByRole('heading', { name: 'Falsch einsortierte Nachricht' })).toBeVisible()
   const action = page.getByRole('button', { name: 'Kein Spam', exact: true })

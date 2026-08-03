@@ -213,6 +213,7 @@ function responseFor<T>(responses: ResponseTuple<T>[], callId: string): MethodRe
 
 export function unreadFilter(
   filters: ReviewFilters = {
+    hideReviewed: false,
     mailboxId: null,
     newsletter: 'all',
     spam: 'exclude',
@@ -388,11 +389,13 @@ export async function fetchReviewOptions(token: string) {
 export async function fetchUnreadSnapshot(
   token: string,
   filters: ReviewFilters = {
+    hideReviewed: false,
     mailboxId: null,
     newsletter: 'all',
     spam: 'exclude',
     timeRange: 'all',
   },
+  viewedIds: ReadonlySet<string> = new Set(),
 ): Promise<LiveSnapshotData> {
   const context = await accountContext(token)
   const mailboxList = await fetchMailboxes(context, token)
@@ -450,6 +453,7 @@ export async function fetchUnreadSnapshot(
           .filter((email): email is JmapEmail => Boolean(email))
           .filter((email) => isIncoming(email, mailboxes))
           .filter((email) => spamMatches(email, mailboxes, filters.spam))
+          .filter((email) => !filters.hideReviewed || !viewedIds.has(email.id))
           .map((email) => summary(email, mailboxes))
           .filter((email) => newsletterMatches(email, filters.newsletter)),
       )

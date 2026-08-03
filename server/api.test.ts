@@ -13,6 +13,7 @@ import { clearApiStateForTests, createApiMiddleware, safeCodexLoginUrl } from '.
 
 let server: Server
 let baseUrl = ''
+const reviewedIds = new Set<string>()
 
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
@@ -33,6 +34,12 @@ function post(body: unknown, csrfToken?: string): RequestInit {
 beforeAll(async () => {
   const middleware = createApiMiddleware({
     forceDemo: true,
+    reviewHistory: {
+      close() {},
+      count: () => reviewedIds.size,
+      recordViewed: (emailId) => reviewedIds.add(emailId),
+      viewedIds: () => new Set(reviewedIds),
+    },
     codexAuthStorage: () => ({
       login: async (_provider, callbacks) => {
         const selected = await callbacks.onSelect({
@@ -75,7 +82,10 @@ afterAll(async () => {
   )
 })
 
-beforeEach(() => clearApiStateForTests())
+beforeEach(() => {
+  clearApiStateForTests()
+  reviewedIds.clear()
+})
 
 describe('demo API contract', () => {
   it('allows only the official OpenAI host for login links', () => {
@@ -143,6 +153,34 @@ describe('demo API contract', () => {
     )
     expect(unknownImage.response.status).toBe(403)
     expect(unknownImage.body.error.code).toBe('IMAGE_FORBIDDEN')
+  })
+
+  it('records opened messages and optionally excludes them from a new review', async () => {
+    const first = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const viewed = first.body.emails[0]
+    expect(viewed).toBeDefined()
+    if (!viewed) return
+    await json<ReviewEmail>(`/api/reviews/${first.body.snapshotId}/emails/${viewed.id}`)
+
+    const options = await json<ReviewOptions>('/api/review/options')
+    expect(options.body.reviewedCount).toBe(1)
+    const filtered = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({
+        filters: {
+          hideReviewed: true,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+      }),
+    )
+    expect(filtered.body.emails.map((email) => email.id)).not.toContain(viewed.id)
+    expect(filtered.body.emails).toHaveLength(3)
   })
 
   it('resumes only exact IDs and reports missing messages', async () => {

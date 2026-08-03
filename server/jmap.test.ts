@@ -28,7 +28,13 @@ describe('Fastmail JMAP adapter', () => {
   it('switches explicitly between non-spam and spam queries', () => {
     expect(
       unreadFilter(
-        { mailboxId: null, newsletter: 'all', spam: 'exclude', timeRange: 'all' },
+        {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
         'junk',
       ),
     ).toEqual({
@@ -40,7 +46,16 @@ describe('Fastmail JMAP adapter', () => {
       ],
     })
     expect(
-      unreadFilter({ mailboxId: null, newsletter: 'all', spam: 'only', timeRange: 'all' }, 'junk'),
+      unreadFilter(
+        {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'only',
+          timeRange: 'all',
+        },
+        'junk',
+      ),
     ).toEqual({
       operator: 'AND',
       conditions: [{ notKeyword: '$seen' }, { notKeyword: '$draft' }, { inMailbox: 'junk' }],

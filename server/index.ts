@@ -5,6 +5,7 @@ import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import { createApiMiddleware } from './api.ts'
 import { ensureCodexStorageReady } from './codex.ts'
+import { createReviewHistory } from './review-history.ts'
 
 const port = Number.parseInt(process.env.PORT || '3000', 10)
 const host = process.env.HOST || '0.0.0.0'
@@ -32,7 +33,8 @@ if (!existsSync(join(staticDirectory, 'index.html'))) {
   throw new Error(`Production frontend was not found at ${staticDirectory}`)
 }
 
-const api = createApiMiddleware({ fastmailToken, forceDemo })
+const reviewHistory = createReviewHistory()
+const api = createApiMiddleware({ fastmailToken, forceDemo, reviewHistory })
 const mimeTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -151,9 +153,14 @@ server.listen(port, host, () => {
   process.stdout.write(`Inbox Walk listening on ${host}:${port}\n`)
 })
 
+let shuttingDown = false
+
 function shutdown(signal: string) {
+  if (shuttingDown) return
+  shuttingDown = true
   process.stdout.write(`Inbox Walk received ${signal}; shutting down\n`)
   server.close((error) => {
+    reviewHistory.close()
     if (error) {
       process.stderr.write(`Shutdown failed: ${error.message}\n`)
       process.exitCode = 1

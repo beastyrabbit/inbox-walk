@@ -23,6 +23,7 @@ export type SpamFilter = 'exclude' | 'only'
 export type TimeRange = 'all' | '24h' | '7d' | '30d'
 
 export interface ReviewFilters {
+  hideReviewed: boolean
   mailboxId: string | null
   newsletter: NewsletterFilter
   spam: SpamFilter
@@ -60,6 +61,7 @@ export interface ReviewOptions {
   codex: CodexAuthStatus
   mailboxes: MailboxOption[]
   mode: 'demo' | 'live'
+  reviewedCount: number
 }
 
 export interface CodexAuthStatus {
@@ -95,7 +97,7 @@ export interface ReviewSnapshot {
 }
 
 export interface ReviewCheckpoint {
-  version: 4
+  version: 5
   emailIds: string[]
   filters: ReviewFilters
   index: number
@@ -193,6 +195,7 @@ export interface ApiError {
 }
 
 export const defaultReviewFilters: ReviewFilters = {
+  hideReviewed: false,
   mailboxId: null,
   newsletter: 'all',
   spam: 'exclude',

@@ -12,6 +12,7 @@ import {
   type MailAddress,
   type ReplyEditorState,
   type ReplyProposal,
+  type ReviewCheckpoint,
   type ReviewEmail,
   type ReviewFilters,
   type ReviewOptions,
@@ -133,6 +134,7 @@ function useFocusRegion<T extends HTMLElement>(trap: boolean) {
 function App() {
   const [options, setOptions] = useState<ReviewOptions | null>(null)
   const [filters, setFilters] = useState<ReviewFilters>(defaultReviewFilters)
+  const [checkpoint, setCheckpoint] = useState<ReviewCheckpoint | null>(null)
   const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null)
   const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
   const [index, setIndex] = useState(0)
@@ -145,7 +147,6 @@ function App() {
   const [draftResults, setDraftResults] = useState<Record<string, DraftResult>>({})
   const [view, setView] = useState<View>('review')
   const [overviewOpen, setOverviewOpen] = useState(false)
-  const [filtersOpen, setFiltersOpen] = useState(false)
   const [replyOpen, setReplyOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
   const [codexLoginOpen, setCodexLoginOpen] = useState(false)
@@ -206,7 +207,6 @@ function App() {
       setDraftResults({})
       setView('review')
       setOverviewOpen(false)
-      setFiltersOpen(false)
       setReplyOpen(false)
       if (resume) {
         setIndex(clampIndex(resume.index, nextSnapshot.emails.length))
@@ -238,6 +238,7 @@ function App() {
         setReplyDrafts({})
         setStatus(`${nextSnapshot.emails.length} ungelesene Nachrichten geladen.`)
       }
+      setCheckpoint(resume)
       restoredRef.current = true
     } catch (cause) {
       setError(errorMessage(cause))
@@ -254,9 +255,10 @@ function App() {
         const nextOptions = await api.options()
         if (!active) return
         setOptions(nextOptions)
-        const checkpoint = loadCheckpoint()
-        setFilters(checkpoint?.filters ?? defaultReviewFilters)
-        await startReview(checkpoint?.filters ?? defaultReviewFilters, checkpoint)
+        const savedCheckpoint = loadCheckpoint()
+        setCheckpoint(savedCheckpoint)
+        setFilters(savedCheckpoint?.filters ?? defaultReviewFilters)
+        setLoading(false)
       } catch (cause) {
         if (active) setError(errorMessage(cause))
         if (active) setLoading(false)
@@ -265,7 +267,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [startReview])
+  }, [])
 
   useEffect(() => {
     if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
@@ -309,7 +311,7 @@ function App() {
   useEffect(() => {
     if (!snapshot || !restoredRef.current || emails.length === 0) return
     const saved = saveCheckpoint({
-      version: 4,
+      version: 5,
       emailIds: emails.map((item) => item.id),
       filters: snapshot.filters,
       index,
@@ -422,7 +424,6 @@ function App() {
         if (helpOpen) setHelpOpen(false)
         else if (replyOpen) setReplyOpen(false)
         else if (overviewOpen) setOverviewOpen(false)
-        else if (filtersOpen) setFiltersOpen(false)
         else if (view === 'confirm') setView('review')
         return
       }
@@ -451,7 +452,6 @@ function App() {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [
-    filtersOpen,
     helpOpen,
     next,
     openReply,
@@ -573,16 +573,28 @@ function App() {
     }
   }
 
-  async function applyFilters() {
+  async function startNewReview() {
     clearCheckpoint()
+    setCheckpoint(null)
     restoredRef.current = false
     await startReview(filters, null)
   }
 
-  async function discardAndRestart() {
-    clearCheckpoint()
+  async function showSetup(discardCheckpoint = false) {
+    if (discardCheckpoint) clearCheckpoint()
     restoredRef.current = false
-    await startReview(filters, null)
+    setCheckpoint(discardCheckpoint ? null : loadCheckpoint())
+    setSnapshot(null)
+    setResult(null)
+    setView('review')
+    setOverviewOpen(false)
+    setReplyOpen(false)
+    setError(null)
+    try {
+      setOptions(await api.options())
+    } catch (cause) {
+      setError(errorMessage(cause))
+    }
   }
 
   async function startCodexLogin() {
@@ -608,41 +620,40 @@ function App() {
     )
   }
 
-  if (error && !snapshot) {
+  if (error && !options) {
     return (
       <main className="state-page">
         <h1>Postfach nicht erreichbar</h1>
         <p>{error}</p>
-        <button
-          type="button"
-          className="button primary"
-          onClick={() => void startReview(filters, loadCheckpoint())}
-        >
+        <button type="button" className="button primary" onClick={() => window.location.reload()}>
           Erneut versuchen
         </button>
       </main>
     )
   }
 
-  if (!snapshot) return null
+  if (!snapshot) {
+    return (
+      <ReviewSetup
+        checkpoint={checkpoint}
+        error={error}
+        filters={filters}
+        options={options}
+        onChange={setFilters}
+        onResume={() => checkpoint && void startReview(checkpoint.filters, checkpoint)}
+        onStart={() => void startNewReview()}
+      />
+    )
+  }
 
   if (emails.length === 0) {
     return (
       <main className="state-page">
         <h1>Keine ungelesenen Nachrichten</h1>
         <p>Für diese Auswahl ist dein Postfach bereits aufgeräumt.</p>
-        <button type="button" className="button secondary" onClick={() => setFiltersOpen(true)}>
-          Filter ändern
+        <button type="button" className="button secondary" onClick={() => void showSetup()}>
+          Auswahl ändern
         </button>
-        {filtersOpen && (
-          <FilterDialog
-            filters={filters}
-            options={options}
-            onChange={setFilters}
-            onClose={() => setFiltersOpen(false)}
-            onApply={() => void applyFilters()}
-          />
-        )}
       </main>
     )
   }
@@ -673,8 +684,8 @@ function App() {
             </ul>
           </div>
         )}
-        <button type="button" className="button primary" onClick={() => void discardAndRestart()}>
-          Neuen Review starten
+        <button type="button" className="button primary" onClick={() => void showSetup()}>
+          Neue Runde auswählen
         </button>
       </main>
     )
@@ -798,8 +809,8 @@ function App() {
               {options?.codex.configured ? 'Codex verbunden' : 'Codex anmelden'}
             </button>
           )}
-          <button type="button" className="text-button" onClick={() => setFiltersOpen(true)}>
-            Filter
+          <button type="button" className="text-button" onClick={() => void showSetup()}>
+            Neue Auswahl
           </button>
           <button
             type="button"
@@ -1003,16 +1014,7 @@ function App() {
             setReplyOpen(false)
             setOverviewOpen(false)
           }}
-          onDiscard={() => void discardAndRestart()}
-        />
-      )}
-      {filtersOpen && (
-        <FilterDialog
-          filters={filters}
-          options={options}
-          onChange={setFilters}
-          onClose={() => setFiltersOpen(false)}
-          onApply={() => void applyFilters()}
+          onDiscard={() => void showSetup(true)}
         />
       )}
       {helpOpen && <HelpDialog isSpamReview={isSpamReview} onClose={() => setHelpOpen(false)} />}
@@ -1044,112 +1046,231 @@ function App() {
   )
 }
 
-function FilterDialog({
+function ReviewSetup({
+  checkpoint,
+  error,
   filters,
   options,
-  onApply,
   onChange,
-  onClose,
+  onResume,
+  onStart,
 }: {
+  checkpoint: ReviewCheckpoint | null
+  error: string | null
   filters: ReviewFilters
   options: ReviewOptions | null
-  onApply: () => void
   onChange: (filters: ReviewFilters) => void
-  onClose: () => void
+  onResume: () => void
+  onStart: () => void
 }) {
-  const dialogRef = useFocusRegion<HTMLElement>(true)
+  const [mailboxQuery, setMailboxQuery] = useState('')
+  const timeRanges: Array<{ label: string; value: ReviewFilters['timeRange'] }> = [
+    { label: 'Alle', value: 'all' },
+    { label: '24 Stunden', value: '24h' },
+    { label: '7 Tage', value: '7d' },
+    { label: '30 Tage', value: '30d' },
+  ]
+  const newsletterFilters: Array<{ label: string; value: ReviewFilters['newsletter'] }> = [
+    { label: 'Alle', value: 'all' },
+    { label: 'Ohne Newsletter', value: 'exclude' },
+    { label: 'Nur Newsletter', value: 'only' },
+  ]
+  const mailboxes =
+    options?.mailboxes.filter(
+      (mailbox) => !mailbox.role || !['drafts', 'junk', 'sent', 'trash'].includes(mailbox.role),
+    ) ?? []
+  const selectedMailbox = mailboxes.find((mailbox) => mailbox.id === filters.mailboxId)
+  const visibleMailboxes = mailboxes.filter((mailbox) =>
+    mailbox.name
+      .toLocaleLowerCase('de-DE')
+      .includes(mailboxQuery.trim().toLocaleLowerCase('de-DE')),
+  )
   return (
-    <div className="dialog-backdrop">
-      <section
-        ref={dialogRef}
-        className="dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="filter-title"
-        tabIndex={-1}
+    <main className="setup-page">
+      <header className="setup-header">
+        <h1>Inbox Walk</h1>
+        <p>Stell die Runde zusammen, bevor eine einzige Nachricht geladen wird.</p>
+      </header>
+
+      {checkpoint && checkpoint.emailIds.length > 0 && (
+        <section className="resume-review" aria-labelledby="resume-title">
+          <div>
+            <h2 id="resume-title">Offene Runde</h2>
+            <p>
+              {checkpoint.emailIds.length} Nachrichten · {checkpoint.processedIds.length} bearbeitet
+            </p>
+          </div>
+          <button type="button" className="button secondary" onClick={onResume}>
+            Runde fortsetzen
+          </button>
+        </section>
+      )}
+
+      <form
+        className="setup-form"
+        onSubmit={(event) => {
+          event.preventDefault()
+          onStart()
+        }}
       >
-        <div className="dialog-header">
-          <h2 id="filter-title">Review auswählen</h2>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
-            ×
-          </button>
-        </div>
-        <label>
-          Bereich
-          <select
-            value={filters.spam}
-            onChange={(event) =>
-              onChange({
-                ...filters,
-                mailboxId: null,
-                spam: event.target.value as ReviewFilters['spam'],
-              })
-            }
-          >
-            <option value="exclude">Alles außer Spam</option>
-            <option value="only">Nur Spam</option>
-          </select>
-        </label>
-        <label>
-          Postfach
-          <select
-            disabled={filters.spam === 'only'}
-            value={filters.mailboxId ?? ''}
-            onChange={(event) => onChange({ ...filters, mailboxId: event.target.value || null })}
-          >
-            <option value="">Alle Postfächer</option>
-            {options?.mailboxes
-              .filter((mailbox) => mailbox.role !== 'junk')
-              .map((mailbox) => (
-                <option value={mailbox.id} key={mailbox.id}>
-                  {mailbox.name}
-                </option>
+        <section className="setup-section" aria-labelledby="scope-title">
+          <div className="setup-section-heading">
+            <h2 id="scope-title">Bereich</h2>
+            <p>Was soll in dieser Runde auftauchen?</p>
+          </div>
+          <div className="scope-choices">
+            <button
+              type="button"
+              className="setup-choice"
+              aria-pressed={filters.spam === 'exclude'}
+              onClick={() => onChange({ ...filters, spam: 'exclude' })}
+            >
+              <span className="choice-box" aria-hidden="true">
+                {filters.spam === 'exclude' ? '✓' : ''}
+              </span>
+              <span>
+                <strong>Alles außer Spam</strong>
+                <small>Die normale ungelesene Post</small>
+              </span>
+            </button>
+            <button
+              type="button"
+              className="setup-choice"
+              aria-pressed={filters.spam === 'only'}
+              onClick={() => onChange({ ...filters, mailboxId: null, spam: 'only' })}
+            >
+              <span className="choice-box" aria-hidden="true">
+                {filters.spam === 'only' ? '✓' : ''}
+              </span>
+              <span>
+                <strong>Nur Spam</strong>
+                <small>Mit ↓ falsch erkannte Mails zurückholen</small>
+              </span>
+            </button>
+          </div>
+        </section>
+
+        <section className="setup-section" aria-labelledby="time-title">
+          <div className="setup-section-heading">
+            <h2 id="time-title">Zeitraum</h2>
+            <p>Direkt wählen, ohne Menü.</p>
+          </div>
+          <div className="direct-choices">
+            {timeRanges.map((range) => (
+              <button
+                type="button"
+                key={range.value}
+                aria-pressed={filters.timeRange === range.value}
+                onClick={() => onChange({ ...filters, timeRange: range.value })}
+              >
+                {range.label}
+              </button>
+            ))}
+          </div>
+        </section>
+
+        <section className="setup-section" aria-labelledby="narrow-title">
+          <div className="setup-section-heading">
+            <h2 id="narrow-title">Eingrenzen</h2>
+            <p>Optional – nichts davon muss gewählt werden.</p>
+          </div>
+          <label className="setup-check history-check">
+            <input
+              type="checkbox"
+              checked={filters.hideReviewed}
+              onChange={(event) => onChange({ ...filters, hideReviewed: event.target.checked })}
+            />
+            <span className="choice-box" aria-hidden="true">
+              {filters.hideReviewed ? '✓' : ''}
+            </span>
+            <span>
+              <strong>Bereits angesehene ausblenden</strong>
+              <small>
+                {options?.reviewedCount ?? 0} Nachrichten sind bisher in der lokalen SQLite-Historie
+              </small>
+            </span>
+          </label>
+
+          <div className="setup-subsection">
+            <h3>Newsletter</h3>
+            <div className="direct-choices">
+              {newsletterFilters.map((filter) => (
+                <button
+                  type="button"
+                  key={filter.value}
+                  aria-pressed={filters.newsletter === filter.value}
+                  onClick={() => onChange({ ...filters, newsletter: filter.value })}
+                >
+                  {filter.label}
+                </button>
               ))}
-          </select>
-        </label>
-        <label>
-          Zeitraum
-          <select
-            value={filters.timeRange}
-            onChange={(event) =>
-              onChange({ ...filters, timeRange: event.target.value as ReviewFilters['timeRange'] })
-            }
-          >
-            <option value="all">Gesamter ungelesener Bestand</option>
-            <option value="24h">Letzte 24 Stunden</option>
-            <option value="7d">Letzte 7 Tage</option>
-            <option value="30d">Letzte 30 Tage</option>
-          </select>
-        </label>
-        <label>
-          Newsletter
-          <select
-            value={filters.newsletter}
-            onChange={(event) =>
-              onChange({
-                ...filters,
-                newsletter: event.target.value as ReviewFilters['newsletter'],
-              })
-            }
-          >
-            <option value="all">Mit Newslettern</option>
-            <option value="exclude">Newsletter ausblenden</option>
-            <option value="only">Nur Newsletter</option>
-          </select>
-        </label>
-        <p className="dialog-note">
-          Das Anwenden verwirft den aktuellen lokalen Checkpoint und lädt eine neue, feste Auswahl.
-        </p>
-        <div className="button-row">
-          <button type="button" className="button secondary" onClick={onClose}>
-            Abbrechen
+            </div>
+          </div>
+
+          {filters.spam === 'exclude' && mailboxes.length > 0 && (
+            <details className="mailbox-picker" open={selectedMailbox ? true : undefined}>
+              <summary>
+                <span>Postfach einschränken</span>
+                <small>{selectedMailbox?.name ?? 'Alle Postfächer'}</small>
+              </summary>
+              <div className="mailbox-picker-body">
+                <input
+                  type="search"
+                  value={mailboxQuery}
+                  onChange={(event) => setMailboxQuery(event.target.value)}
+                  placeholder="Postfach suchen …"
+                  aria-label="Postfach suchen"
+                />
+                <div className="mailbox-choices">
+                  {selectedMailbox && (
+                    <button
+                      type="button"
+                      className="clear-mailbox"
+                      onClick={() => onChange({ ...filters, mailboxId: null })}
+                    >
+                      Auswahl aufheben
+                    </button>
+                  )}
+                  {visibleMailboxes.map((mailbox) => {
+                    const checked = filters.mailboxId === mailbox.id
+                    return (
+                      <label className="setup-check compact" key={mailbox.id}>
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() =>
+                            onChange({ ...filters, mailboxId: checked ? null : mailbox.id })
+                          }
+                        />
+                        <span className="choice-box" aria-hidden="true">
+                          {checked ? '✓' : ''}
+                        </span>
+                        <span>{mailbox.name}</span>
+                      </label>
+                    )
+                  })}
+                  {visibleMailboxes.length === 0 && (
+                    <p className="empty-mailboxes">Kein passendes Postfach.</p>
+                  )}
+                </div>
+              </div>
+            </details>
+          )}
+        </section>
+
+        {error && (
+          <p className="setup-error" role="alert">
+            {error}
+          </p>
+        )}
+        <footer className="setup-footer">
+          <p>Die Auswahl wird als feste Runde geladen. Änderungen passieren erst beim Abschluss.</p>
+          <button type="submit" className="button primary">
+            Review starten
           </button>
-          <button type="button" className="button primary" onClick={onApply}>
-            Auswahl laden
-          </button>
-        </div>
-      </section>
-    </div>
+        </footer>
+      </form>
+    </main>
   )
 }
 
@@ -1225,7 +1346,7 @@ function OverviewDrawer({
         </ol>
         <div className="drawer-footer">
           <button type="button" className="danger-link" onClick={onDiscard}>
-            Checkpoint verwerfen und neu laden
+            Runde verwerfen und neue Auswahl treffen
           </button>
         </div>
       </aside>

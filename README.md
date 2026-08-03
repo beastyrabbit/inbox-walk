@@ -12,8 +12,10 @@ Fastmail.
 ## What it does
 
 - Loads at most 250 unread incoming messages into a stable JMAP snapshot.
+- Opens every new round with a dedicated selection page instead of loading mail immediately.
 - Resumes the exact snapshot and local decisions after a browser refresh.
-- Reviews either Spam only or all incoming mail except Spam, with additional mailbox, time, and newsletter filters.
+- Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
+- Can omit messages that were opened before using a small local SQLite history.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
 - Keeps selected messages unread and marks the rest read only after confirmation.
 - Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.
@@ -50,6 +52,12 @@ Choosing **Neu anmelden** while using that local fallback also refreshes the
 workstation's shared Pi login; set `DATA_DIR` to an app-specific directory if
 you want isolated local credentials.
 
+Opened Fastmail message IDs are recorded in `DATA_DIR/inbox-walk.sqlite` so a
+future round can optionally hide messages already seen. The database stores IDs,
+timestamps, and a view count only—never senders, subjects, bodies, or
+attachments. Leave **Bereits angesehene ausblenden** unchecked to include every
+matching unread message as before.
+
 ## Keyboard controls
 
 - `ArrowRight`: next message
@@ -77,8 +85,8 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 ## Production
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
-The Codex OAuth record is stored under `DATA_DIR`; `TIKA_URL` points to the
-document-extraction sidecar.
+The Codex OAuth record and viewed-message SQLite history are stored under
+`DATA_DIR`; `TIKA_URL` points to the document-extraction sidecar.
 
 Deployment is managed from `beasty/kub-homelab`. Runtime secrets are synced by
 the Infisical Operator; no secret values belong in this repository or in the

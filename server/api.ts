@@ -46,6 +46,7 @@ import {
   ReplyError,
   type ReplyRequest,
 } from './reply.ts'
+import type { ReviewHistory } from './review-history.ts'
 import { fetchRemoteImage, SafeHttpError } from './safe-http.ts'
 
 const MAX_JSON_BYTES = 256 * 1024
@@ -55,6 +56,7 @@ const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 const INLINE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp'])
 
 const filtersSchema = z.object({
+  hideReviewed: z.boolean().default(false),
   mailboxId: z.string().min(1).nullable(),
   newsletter: z.enum(['all', 'exclude', 'only']),
   spam: z.enum(['exclude', 'only']).default('exclude'),
@@ -97,6 +99,7 @@ export interface ApiOptions {
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
   fastmailToken?: string
   forceDemo?: boolean
+  reviewHistory?: ReviewHistory
 }
 
 const snapshots = new Map<string, StoredSnapshot>()
@@ -203,11 +206,12 @@ function pruneSnapshots() {
   for (const [id] of oldest.slice(0, snapshots.size - MAX_SNAPSHOTS)) snapshots.delete(id)
 }
 
-function filterDemoEmails(filters: ReviewFilters) {
+function filterDemoEmails(filters: ReviewFilters, viewedIds: ReadonlySet<string>) {
   const hours =
     filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
   const cutoff = hours ? Date.now() - hours * 3_600_000 : 0
   return demoEmails.filter((email) => {
+    if (filters.hideReviewed && viewedIds.has(email.id)) return false
     const isSpam = email.mailboxNames.includes('Spam')
     if ((filters.spam === 'only') !== isSpam) return false
     if (filters.mailboxId && !email.mailboxNames.includes(filters.mailboxId)) return false
@@ -345,8 +349,9 @@ async function createReview(
   options: ApiOptions,
 ) {
   const filters = parseFilters(body.filters)
+  const viewedIds = options.reviewHistory?.viewedIds() ?? new Set<string>()
   if (options.forceDemo) {
-    const details = filterDemoEmails(filters)
+    const details = filterDemoEmails(filters, viewedIds)
     const emails = summariesFor(details)
     const stored = storeSnapshot({
       emails,
@@ -365,7 +370,7 @@ async function createReview(
   const token = options.fastmailToken?.trim()
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
-  const data = await fetchUnreadSnapshot(token, filters)
+  const data = await fetchUnreadSnapshot(token, filters, viewedIds)
   const stored = storeSnapshot({ ...data, mode: 'live' })
   return json(
     res,
@@ -428,6 +433,7 @@ async function options(res: ServerResponse, apiOptions: ApiOptions) {
     return json(res, 200, {
       codex,
       mode: 'demo',
+      reviewedCount: apiOptions.reviewHistory?.count() ?? 0,
       mailboxes: [
         { id: 'Inbox', name: 'Inbox', role: 'inbox' },
         { id: 'Newsletter', name: 'Newsletter' },
@@ -440,7 +446,12 @@ async function options(res: ServerResponse, apiOptions: ApiOptions) {
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
   const result = await fetchReviewOptions(token)
-  return json(res, 200, { codex, mode: 'live', mailboxes: result.mailboxes })
+  return json(res, 200, {
+    codex,
+    mode: 'live',
+    mailboxes: result.mailboxes,
+    reviewedCount: apiOptions.reviewHistory?.count() ?? 0,
+  })
 }
 
 export function safeCodexLoginUrl(value: string) {
@@ -580,6 +591,7 @@ async function emailDetail(
     snapshot.detailCache.set(emailId, email)
     registerResources(snapshot, email)
   }
+  apiOptions.reviewHistory?.recordViewed(emailId)
   return json(res, 200, emailPayload(snapshot, email))
 }
 
