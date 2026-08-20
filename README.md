@@ -35,13 +35,13 @@ pnpm install
 docker run --rm --name inbox-walk-tika -p 9998:9998 apache/tika:3.3.1.0-full
 ```
 
-Run the live app through Portless:
+Run the live app:
 
 ```bash
-pnpm dev:portless
+pnpm dev
 ```
 
-Open <http://inbox-walk.localhost:1355>.
+Open <http://localhost:5173>.
 
 `pnpm dev` injects the read-only `FASTMAIL_JMAP_TOKEN` from the `Kub-Homelab`
 Infisical project, environment `dev`, path
