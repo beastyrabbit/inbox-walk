@@ -143,6 +143,15 @@ describe('demo API contract', () => {
     expect(state.body).not.toHaveProperty('refresh')
   })
 
+  it('does not allow model changes in demo mode', async () => {
+    const result = await json<{ error: { code: string } }>(
+      '/api/auth/codex/model',
+      post({ model: 'gpt-5.6-terra' }),
+    )
+    expect(result.response.status).toBe(403)
+    expect(result.body.error.code).toBe('DEMO_MODE')
+  })
+
   it('creates a fixed review and lazily loads a detail', async () => {
     const options = await json<ReviewOptions>('/api/review/options')
     expect(options.response.status).toBe(200)

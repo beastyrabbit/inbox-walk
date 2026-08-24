@@ -7,6 +7,7 @@ import type {
   ApiError,
   CodexAuthStatus,
   CodexLoginState,
+  CodexModelId,
   DraftResult,
   FinalizeResult,
   MailboxOption,
@@ -28,7 +29,12 @@ import {
   learningSignalsFor,
   singletonBundleRun,
 } from './bundles.ts'
-import { codexAuthStatus, getCodexAuthStorage, runCodexBundleDecision } from './codex.ts'
+import {
+  codexAuthStatus,
+  getCodexAuthStorage,
+  runCodexBundleDecision,
+  selectCodexModel,
+} from './codex.ts'
 import { demoEmails } from './demo.ts'
 import {
   createAndVerifyDraft,
@@ -73,6 +79,10 @@ const filtersSchema = z.object({
   timeRange: z.enum(['all', '24h', '7d', '30d']),
 })
 
+const codexModelSchema = z.object({
+  model: z.enum(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']),
+})
+
 const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
 
 interface StoredSnapshot {
@@ -111,6 +121,7 @@ export interface ApiOptions {
   bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
+  codexModelSelect?: (model: CodexModelId) => CodexAuthStatus
   demoMessages?: ReviewEmail[]
   fastmailToken?: string
   forceDemo?: boolean
@@ -1270,6 +1281,15 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
       if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
         validateOrigin(req)
         return await startCodexLogin(res, apiOptions)
+      }
+      if (req.method === 'POST' && url.pathname === '/api/auth/codex/model') {
+        validateOrigin(req)
+        if (apiOptions.forceDemo)
+          throw new ApiHttpError(403, 'DEMO_MODE', 'Das Codex-Modell ist im Demo-Modus fest.')
+        const parsed = codexModelSchema.safeParse(await readJson(req))
+        if (!parsed.success)
+          throw new ApiHttpError(400, 'INVALID_CODEX_MODEL', 'Unbekanntes Codex-Modell.')
+        return json(res, 200, (apiOptions.codexModelSelect ?? selectCodexModel)(parsed.data.model))
       }
       if (
         req.method === 'GET' &&

@@ -2,7 +2,7 @@
 
 ## Current deployment
 
-- Release: `v0.6.0`
+- Release: `v0.6.1`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -14,7 +14,7 @@
 - Liveness: `GET /healthz`
 - Readiness: `GET /readyz`
 - Required live secret: `FASTMAIL_JMAP_TOKEN`
-- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
+- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `codex-settings.json`, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
 - Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
 - Inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
@@ -66,7 +66,9 @@ curl -fsS http://127.0.0.1:3000/api/review/options \
 
 Check `/api/auth/codex/status` for the non-secret configured flag and model. Do
 not inspect or print `/data/pi/auth.json`; reconnect from the app when OAuth can
-no longer refresh. For the review history, inspect schema and aggregate counts
+no longer refresh. The Codex dialog stores its Sol, Terra, or Luna selection in
+`/data/codex-settings.json`; `CODEX_MODEL` remains the startup default. For the
+review history, inspect schema and aggregate counts
 only rather than printing message IDs.
 
 Do not print Kubernetes Secret values or application credentials while

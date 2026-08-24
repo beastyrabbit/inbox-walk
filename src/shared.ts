@@ -64,9 +64,29 @@ export interface ReviewOptions {
   reviewedCount: number
 }
 
+export const codexModels = [
+  {
+    description: 'Gründlich bei schwierigen Zusammenhängen.',
+    id: 'gpt-5.6-sol',
+    label: 'Sol',
+  },
+  {
+    description: 'Gute Balance für die tägliche Inbox.',
+    id: 'gpt-5.6-terra',
+    label: 'Terra',
+  },
+  {
+    description: 'Am schnellsten für große Mengen.',
+    id: 'gpt-5.6-luna',
+    label: 'Luna',
+  },
+] as const
+
+export type CodexModelId = (typeof codexModels)[number]['id']
+
 export interface CodexAuthStatus {
   configured: boolean
-  model: string
+  model: CodexModelId
   source?:
     | 'stored'
     | 'runtime'

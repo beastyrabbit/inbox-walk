@@ -4,7 +4,7 @@ Last updated: 2026-08-24
 
 ## Current release
 
-`v0.6.0` is the current usable release. It is deployed in kub-homelab at
+`v0.6.1` is the current usable release. It is deployed in kub-homelab at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 Forgejo publishes immutable images and Flux deploys the pinned release tag.
 
@@ -27,6 +27,7 @@ There are no active release blockers.
 - [x] Separate Spam review with an explicit deferred “Not Spam” action.
 - [x] Deferred newsletter-unsubscribe labeling without automatic link execution.
 - [x] Full-thread assisted replies with automatic all-attachment handling.
+- [x] Persistent in-app Codex model selection for Sol, Terra, and Luna.
 - [x] Editable and revisable reply text with selectable identity and recipients.
 - [x] Verified Fastmail draft construction with no send-mail path.
 - [x] Unit, API, security-contract, desktop, and mobile browser tests.

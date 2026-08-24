@@ -6,6 +6,8 @@ import { emailDocument } from './email-document.ts'
 import { clampIndex, idsToMarkRead, toggleKeptUnread } from './review-state.ts'
 import {
   type CodexLoginState,
+  type CodexModelId,
+  codexModels,
   type DraftResult,
   defaultReviewFilters,
   type FinalizeResult,
@@ -208,6 +210,7 @@ function App() {
   const [codexLoginOpen, setCodexLoginOpen] = useState(false)
   const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
   const [codexLoginBusy, setCodexLoginBusy] = useState(false)
+  const [codexModelBusy, setCodexModelBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [replyLoading, setReplyLoading] = useState(false)
@@ -714,6 +717,20 @@ function App() {
       setError(errorMessage(cause))
     } finally {
       setCodexLoginBusy(false)
+    }
+  }
+
+  async function changeCodexModel(model: CodexModelId) {
+    setCodexModelBusy(true)
+    setError(null)
+    try {
+      const codex = await api.selectCodexModel(model)
+      setOptions((current) => (current ? { ...current, codex } : current))
+      setStatus(`Codex verwendet jetzt ${codexModels.find((item) => item.id === model)?.label}.`)
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setCodexModelBusy(false)
     }
   }
 
@@ -1317,7 +1334,9 @@ function App() {
           busy={codexLoginBusy}
           login={codexLogin}
           model={options.codex.model}
+          modelBusy={codexModelBusy}
           onClose={() => setCodexLoginOpen(false)}
+          onModelChange={(model) => void changeCodexModel(model)}
           onStart={() => void startCodexLogin()}
         />
       )}
@@ -1784,18 +1803,24 @@ function CodexLoginDialog({
   busy,
   login,
   model,
+  modelBusy,
   onClose,
+  onModelChange,
   onStart,
 }: {
   authConfigured: boolean
   busy: boolean
   login: CodexLoginState | null
-  model: string
+  model: CodexModelId
+  modelBusy: boolean
   onClose: () => void
+  onModelChange: (model: CodexModelId) => void
   onStart: () => void
 }) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
+  const [selectedModel, setSelectedModel] = useState<CodexModelId>(model)
   const waiting = login?.status === 'starting' || login?.status === 'waiting'
+  useEffect(() => setSelectedModel(model), [model])
   return (
     <div className="dialog-backdrop">
       <section
@@ -1808,8 +1833,8 @@ function CodexLoginDialog({
       >
         <div className="dialog-header">
           <div>
-            <h2 id="codex-title">Codex verbinden</h2>
-            <p className="dialog-kicker">ChatGPT-Abo · {model}</p>
+            <h2 id="codex-title">Codex einrichten</h2>
+            <p className="dialog-kicker">ChatGPT-Abo</p>
           </div>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
             ×
@@ -1819,6 +1844,40 @@ function CodexLoginDialog({
           OpenAI erneuert diese OAuth-Anmeldung automatisch. Sie bleibt auf dem privaten
           App-Speicher; ein OpenAI-API-Schlüssel ist nicht nötig.
         </p>
+        <fieldset className="codex-model-section">
+          <legend>Modell</legend>
+          <p>Gilt für neue Bundles und Antwortentwürfe.</p>
+          <div className="codex-model-list">
+            {codexModels.map((option) => (
+              <label
+                className="codex-model-choice"
+                data-selected={selectedModel === option.id}
+                key={option.id}
+              >
+                <input
+                  type="radio"
+                  name="codex-model"
+                  value={option.id}
+                  checked={selectedModel === option.id}
+                  disabled={modelBusy}
+                  onChange={() => setSelectedModel(option.id)}
+                />
+                <span>
+                  <strong>{option.label}</strong>
+                  <small>{option.description}</small>
+                </span>
+              </label>
+            ))}
+          </div>
+          <button
+            type="button"
+            className="button secondary codex-model-save"
+            disabled={modelBusy || selectedModel === model}
+            onClick={() => onModelChange(selectedModel)}
+          >
+            {modelBusy ? 'Wird gespeichert …' : 'Modell speichern'}
+          </button>
+        </fieldset>
         {login ? (
           <div className={`codex-login-state ${login.status}`} aria-live="polite">
             <strong>{login.message}</strong>

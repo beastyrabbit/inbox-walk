@@ -24,6 +24,7 @@ Fastmail.
 - Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
 - Loads the complete bounded thread before preparing a reply.
 - Sends every supported image to Codex and extracts every supported document through Apache Tika.
+- Selects Sol, Terra, or Luna for new Codex work without restarting the app.
 - Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
 - Creates and reads back a normal Fastmail draft with reply headers and identity signature.
 - Exposes `/healthz` and `/readyz` for Kubernetes probes.
@@ -59,6 +60,11 @@ Choosing **Neu anmelden** while using that local fallback also refreshes the
 workstation's shared Pi login; set `DATA_DIR` to an app-specific directory if
 you want isolated local credentials.
 
+The Codex dialog also selects the model used for new bundle decisions and reply
+drafts. Sol is the deployment default; Sol, Terra, and Luna can be selected in
+the UI without restarting the app. The choice is stored in
+`DATA_DIR/codex-settings.json`.
+
 Fastmail message IDs are recorded in `DATA_DIR/inbox-walk.sqlite` only when a
 completed round deliberately keeps them unread. A future round can optionally
 hide those deferred messages. The database stores IDs, timestamps, and a retain
@@ -92,7 +98,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-The current usable release is `v0.6.0`, deployed at
+The current usable release is `v0.6.1`, deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

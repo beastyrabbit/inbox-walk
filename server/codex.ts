@@ -12,12 +12,49 @@ import {
   SettingsManager,
 } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
+import { type CodexModelId, codexModels } from '../src/shared.ts'
 import type { BundleDecision, BundleDecisionInput } from './bundles.ts'
 
 const CODEX_PROVIDER = 'openai-codex'
+const DEFAULT_CODEX_MODEL: CodexModelId = 'gpt-5.6-sol'
+const codexModelIds = new Set<CodexModelId>(codexModels.map((model) => model.id))
 
-export function selectedCodexModel() {
-  return process.env.CODEX_MODEL?.trim() || 'gpt-5.6-sol'
+function isCodexModelId(value: unknown): value is CodexModelId {
+  return typeof value === 'string' && codexModelIds.has(value as CodexModelId)
+}
+
+function codexSettingsPath() {
+  const dataDir = process.env.DATA_DIR ?? path.resolve('data')
+  return path.join(dataDir, 'codex-settings.json')
+}
+
+function storedCodexModel(): CodexModelId | null {
+  try {
+    const value = JSON.parse(fs.readFileSync(codexSettingsPath(), 'utf8')) as { model?: unknown }
+    return isCodexModelId(value.model) ? value.model : null
+  } catch {
+    return null
+  }
+}
+
+export function selectedCodexModel(): CodexModelId {
+  const configured = process.env.CODEX_MODEL?.trim()
+  return storedCodexModel() ?? (isCodexModelId(configured) ? configured : DEFAULT_CODEX_MODEL)
+}
+
+export function selectCodexModel(model: CodexModelId) {
+  if (!isCodexModelId(model)) throw new Error(`Unsupported Codex model: ${String(model)}`)
+  const settingsPath = codexSettingsPath()
+  const directory = path.dirname(settingsPath)
+  const temporaryPath = `${settingsPath}.${process.pid}.tmp`
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify({ model })}\n`, { mode: 0o600 })
+    fs.renameSync(temporaryPath, settingsPath)
+  } finally {
+    fs.rmSync(temporaryPath, { force: true })
+  }
+  return codexAuthStatus()
 }
 
 export interface CodexReplyInput {

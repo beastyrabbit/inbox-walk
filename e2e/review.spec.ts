@@ -117,6 +117,43 @@ test('opens keyboard help and closes it with Escape', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Tastatur' })).toBeHidden()
 })
 
+test('selects the Codex model from the connection dialog', async ({ page }) => {
+  await page.route('**/api/review/options', async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({
+      json: {
+        ...body,
+        codex: { configured: true, model: 'gpt-5.6-sol', source: 'stored' },
+        mode: 'live',
+      },
+    })
+  })
+  await page.route('**/api/reviews', async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({ json: { ...body, mode: 'live' } })
+  })
+  await page.route('**/api/auth/codex/model', async (route) => {
+    const request = route.request().postDataJSON() as { model: string }
+    await route.fulfill({
+      json: { configured: true, model: request.model, source: 'stored' },
+    })
+  })
+
+  await page.evaluate(() => localStorage.clear())
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Review starten' }).click()
+  await page.getByRole('button', { name: 'Codex verbunden' }).click()
+
+  await expect(page.getByRole('heading', { name: 'Codex einrichten' })).toBeVisible()
+  await expect(page.getByLabel('Sol')).toBeChecked()
+  await page.getByLabel('Terra').check()
+  await page.getByRole('button', { name: 'Modell speichern' }).click()
+  await expect(page.getByLabel('Terra')).toBeChecked()
+  await expect(page.getByRole('button', { name: 'Modell speichern' })).toBeDisabled()
+})
+
 test('keeps mail scripts blocked while allowing authenticated same-origin images', async ({
   page,
 }) => {

@@ -1150,6 +1150,82 @@
   line-height: 1.5;
 }
 
+.codex-dialog {
+  width: min(560px, 100%);
+}
+
+.codex-model-section {
+  display: grid;
+  gap: 10px;
+  margin: 18px 0;
+  padding: 16px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.codex-model-section legend {
+  float: left;
+  width: 100%;
+  margin: 0 0 2px;
+  padding: 0;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.codex-model-section > p {
+  clear: both;
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 12px;
+}
+
+.codex-model-list {
+  display: grid;
+  gap: 8px;
+}
+
+.codex-model-choice {
+  display: grid;
+  grid-template-columns: 18px 1fr;
+  gap: 10px;
+  align-items: start;
+  padding: 11px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+}
+
+.codex-model-choice[data-selected="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, var(--surface));
+}
+
+.codex-model-choice input {
+  margin: 2px 0 0;
+  accent-color: var(--accent);
+}
+
+.codex-model-choice span {
+  display: grid;
+  gap: 2px;
+}
+
+.codex-model-choice strong {
+  font-size: 13px;
+}
+
+.codex-model-choice small {
+  color: var(--ink-soft);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.codex-model-save {
+  justify-self: start;
+  min-height: 36px;
+}
+
 .codex-login-state code {
   padding: 12px;
   border: 1px dashed var(--line-strong);

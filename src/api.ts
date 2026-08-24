@@ -2,6 +2,7 @@ import type {
   ApiError,
   CodexAuthStatus,
   CodexLoginState,
+  CodexModelId,
   DraftResult,
   FinalizeResult,
   MailAddress,
@@ -60,6 +61,9 @@ export const api = {
   },
   async startCodexLogin() {
     return post<{ id: string }>('/api/auth/codex/start', {})
+  },
+  async selectCodexModel(model: CodexModelId) {
+    return post<CodexAuthStatus>('/api/auth/codex/model', { model })
   },
   async codexLoginState(id: string) {
     return payload<CodexLoginState>(await fetch(`/api/auth/codex/${encodeURIComponent(id)}`))
