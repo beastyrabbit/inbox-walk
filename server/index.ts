@@ -4,6 +4,7 @@ import { extname, join, normalize, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
 import { createApiMiddleware } from './api.ts'
+import { createBundleStore } from './bundle-store.ts'
 import { ensureCodexStorageReady } from './codex.ts'
 import { createReviewHistory } from './review-history.ts'
 
@@ -34,7 +35,8 @@ if (!existsSync(join(staticDirectory, 'index.html'))) {
 }
 
 const reviewHistory = createReviewHistory()
-const api = createApiMiddleware({ fastmailToken, forceDemo, reviewHistory })
+const bundleStore = createBundleStore()
+const api = createApiMiddleware({ bundleStore, fastmailToken, forceDemo, reviewHistory })
 const mimeTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -161,6 +163,7 @@ function shutdown(signal: string) {
   process.stdout.write(`Inbox Walk received ${signal}; shutting down\n`)
   server.close((error) => {
     reviewHistory.close()
+    bundleStore.close()
     if (error) {
       process.stderr.write(`Shutdown failed: ${error.message}\n`)
       process.exitCode = 1

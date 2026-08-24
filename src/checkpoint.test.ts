@@ -38,7 +38,8 @@ beforeEach(() => storage.clear())
 describe('local review checkpoint', () => {
   it('stores IDs and decisions without message bodies', () => {
     saveCheckpoint({
-      version: 5,
+      version: 6,
+      bundleGroups: [['mail-1']],
       emailIds: ['mail-1'],
       filters: {
         hideReviewed: false,
@@ -61,11 +62,34 @@ describe('local review checkpoint', () => {
     expect(JSON.stringify(localStorage)).not.toContain('message body')
   })
 
+  it('restores more than 250 stable snapshot IDs', () => {
+    const emailIds = Array.from({ length: 301 }, (_, index) => `mail-${index}`)
+    saveCheckpoint({
+      version: 6,
+      bundleGroups: [emailIds],
+      emailIds,
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      index: 0,
+      keptUnreadIds: [],
+      processedIds: [],
+      secondaryActionIds: [],
+      replyDrafts: {},
+    })
+    expect(loadCheckpoint()?.emailIds).toEqual(emailIds)
+  })
+
   it('removes invalid and explicitly cleared checkpoints', () => {
     localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
     expect(loadCheckpoint()).toBeNull()
     saveCheckpoint({
-      version: 5,
+      version: 6,
+      bundleGroups: [],
       emailIds: [],
       filters: {
         hideReviewed: false,
@@ -90,7 +114,8 @@ describe('local review checkpoint', () => {
     })
     expect(
       saveCheckpoint({
-        version: 5,
+        version: 6,
+        bundleGroups: [['mail-1']],
         emailIds: ['mail-1'],
         filters: {
           hideReviewed: false,
@@ -122,7 +147,8 @@ describe('local review checkpoint', () => {
       }),
     )
     expect(loadCheckpoint()).toMatchObject({
-      version: 5,
+      version: 6,
+      index: 0,
       filters: { hideReviewed: false, spam: 'exclude' },
       processedIds: [],
       secondaryActionIds: ['mail-1'],

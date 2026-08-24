@@ -96,8 +96,41 @@ export interface ReviewSnapshot {
   truncated: boolean
 }
 
+export type BundleKind =
+  | 'development_workstream'
+  | 'order_delivery'
+  | 'incident'
+  | 'conversation'
+  | 'standalone'
+
+export interface ReviewBundleTimelineItem {
+  emailId: string
+  event: string
+  occurredAt: string
+  source: string
+}
+
+export interface ReviewBundle {
+  bundleId: string
+  currentState: string
+  emailIds: string[]
+  kind: BundleKind
+  linkEvidence: string[]
+  membershipConfidence: number
+  summary: string
+  timeline: ReviewBundleTimelineItem[]
+  title: string
+}
+
+export interface ReviewBundleRun {
+  bundles: ReviewBundle[]
+  fallback: boolean
+  snapshotId: string
+}
+
 export interface ReviewCheckpoint {
-  version: 5
+  version: 6
+  bundleGroups: string[][]
   emailIds: string[]
   filters: ReviewFilters
   index: number

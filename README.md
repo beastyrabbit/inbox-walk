@@ -1,8 +1,8 @@
 # Inbox Walk
 
 Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one
-bounded snapshot of unread incoming mail, shows the original messages one at a
-time, and applies read-state changes only after a final confirmation.
+complete snapshot of unread incoming mail, groups related notifications into
+review stories, and applies read-state changes only after a final confirmation.
 
 For messages that need an answer, Inbox Walk can use Codex through a ChatGPT
 Plus/Pro subscription to prepare a thread-aware reply and save it as a verified
@@ -11,7 +11,9 @@ Fastmail.
 
 ## What it does
 
-- Loads at most 250 unread incoming messages into a stable JMAP snapshot.
+- Loads every matching unread incoming message into a stable, paginated JMAP snapshot.
+- Bundles related threads, repository activity, deployments, orders, and carrier updates while keeping every original inspectable.
+- Learns only from explicit bundle corrections and gives Codex at most two confirmed positive and two confirmed negative examples per decision.
 - Opens every new round with a dedicated selection page instead of loading mail immediately.
 - Resumes the exact snapshot and local decisions after a browser refresh.
 - Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
@@ -66,9 +68,9 @@ unchecked to include every matching unread message as before.
 
 ## Keyboard controls
 
-- `ArrowRight`: next message
-- `ArrowLeft`: previous message
-- `ArrowUp`: toggle “keep unread”
+- `ArrowRight`: complete the current story and continue
+- `ArrowLeft`: previous story
+- `ArrowUp`: toggle “keep unread” for the selected original
 - `ArrowDown`: mark “Not Spam” in Spam reviews, otherwise tag a newsletter for later unsubscribe work
 - `R`: open the reply-draft panel
 - `?`: keyboard help

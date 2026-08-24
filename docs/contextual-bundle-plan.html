@@ -1,0 +1,1116 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Inbox Walk contextual bundle plan</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17211b;
+      --muted: #5d6a62;
+      --paper: #f4f1e8;
+      --panel: #fffdf7;
+      --line: #d7d1c2;
+      --green: #176b4a;
+      --green-soft: #dcece3;
+      --amber: #a45b12;
+      --amber-soft: #f5e6cd;
+      --red: #a13b32;
+      --red-soft: #f2ddda;
+      --blue: #245f79;
+      --blue-soft: #dceaf0;
+      --shadow: 0 12px 36px rgba(39, 47, 40, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      background:
+        linear-gradient(rgba(23, 33, 27, 0.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(23, 33, 27, 0.025) 1px, transparent 1px),
+        var(--paper);
+      background-size: 28px 28px;
+      color: var(--ink);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    a { color: var(--blue); }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    code { font-size: 0.9em; }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 32px auto 72px;
+    }
+
+    header, section {
+      background: color-mix(in srgb, var(--panel) 96%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    header { padding: clamp(24px, 5vw, 52px); }
+    section { margin-top: 18px; padding: clamp(20px, 3vw, 34px); }
+
+    .eyebrow {
+      margin: 0 0 12px;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.14; letter-spacing: -0.025em; }
+    h1 { max-width: 880px; margin: 0; font-size: clamp(34px, 6vw, 68px); }
+    h2 { margin: 0 0 18px; font-size: clamp(25px, 3.2vw, 38px); }
+    h3 { margin: 0 0 8px; font-size: 18px; }
+    p { margin: 0 0 14px; }
+    p:last-child { margin-bottom: 0; }
+    ul, ol { margin: 10px 0 0; padding-left: 22px; }
+    li + li { margin-top: 7px; }
+
+    .lede {
+      max-width: 850px;
+      margin: 20px 0 0;
+      color: var(--muted);
+      font-size: clamp(17px, 2vw, 21px);
+    }
+
+    .verdict {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 14px;
+      align-items: start;
+      max-width: 900px;
+      margin-top: 26px;
+      padding: 18px;
+      border: 1px solid #b9d4c3;
+      border-radius: 14px;
+      background: var(--green-soft);
+    }
+
+    .verdict-mark {
+      display: grid;
+      width: 32px;
+      height: 32px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--green);
+      color: white;
+      font-weight: 900;
+    }
+
+    .meta, .chips, .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .meta { margin-top: 22px; }
+    .chip, .tag {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: white;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      padding: 6px 10px;
+    }
+
+    .toc {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .toc a {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: white;
+      color: var(--ink);
+      padding: 12px 14px;
+      text-decoration: none;
+    }
+
+    .toc a:hover { border-color: var(--green); }
+
+    .grid-2, .grid-3, .decision-grid, .phase-grid {
+      display: grid;
+      gap: 14px;
+    }
+
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .decision-grid { grid-template-columns: 1fr 1.35fr; }
+    .phase-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: white;
+      padding: 18px;
+    }
+
+    .card p, .card li { color: var(--muted); }
+    .card.good { border-top: 4px solid var(--green); }
+    .card.wait { border-top: 4px solid var(--amber); }
+    .card.stop { border-top: 4px solid var(--red); }
+    .card.info { border-top: 4px solid var(--blue); }
+
+    .callout {
+      margin: 18px 0 0;
+      padding: 15px 17px;
+      border-left: 4px solid var(--amber);
+      border-radius: 0 10px 10px 0;
+      background: var(--amber-soft);
+    }
+
+    .callout strong { display: block; margin-bottom: 3px; }
+
+    .architecture {
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fbfaf5;
+      padding: 18px;
+    }
+
+    .architecture svg { display: block; min-width: 860px; width: 100%; height: auto; }
+
+    .flow-list {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(140px, 1fr));
+      gap: 8px;
+      margin-top: 16px;
+      overflow-x: auto;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 122px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: white;
+      padding: 14px;
+    }
+
+    .flow-step:not(:last-child)::after {
+      content: "";
+      position: absolute;
+      z-index: 2;
+      top: 31px;
+      right: -9px;
+      width: 16px;
+      height: 2px;
+      background: var(--green);
+    }
+
+    .step-number {
+      display: inline-grid;
+      width: 26px;
+      height: 26px;
+      place-items: center;
+      margin-bottom: 10px;
+      border-radius: 50%;
+      background: var(--ink);
+      color: white;
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .flow-step strong { display: block; line-height: 1.25; }
+    .flow-step small { display: block; margin-top: 6px; color: var(--muted); line-height: 1.4; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+      background: white;
+    }
+
+    th, td { padding: 12px 14px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #ebe7dc; font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    td p { color: var(--muted); }
+
+    .table-wrap { overflow-x: auto; border-radius: 12px; }
+    .table-wrap table { min-width: 760px; }
+
+    .action {
+      display: inline-block;
+      border-radius: 6px;
+      font-size: 11px;
+      font-weight: 900;
+      letter-spacing: 0.04em;
+      padding: 3px 7px;
+      white-space: nowrap;
+    }
+
+    .action.read { background: var(--green-soft); color: var(--green); }
+    .action.keep { background: var(--red-soft); color: var(--red); }
+    .action.review { background: var(--amber-soft); color: var(--amber); }
+
+    .mock-shell {
+      overflow: hidden;
+      border: 1px solid #bcb6a7;
+      border-radius: 16px;
+      background: #e9e5d9;
+      box-shadow: var(--shadow);
+    }
+
+    .mock-topbar {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 13px 17px;
+      background: var(--ink);
+      color: white;
+    }
+
+    .mock-topbar span:last-child { color: #cbd7cf; }
+
+    .mock-content {
+      display: grid;
+      grid-template-columns: 190px 1fr;
+      min-height: 500px;
+    }
+
+    .mock-sidebar { padding: 16px; border-right: 1px solid var(--line); background: #f5f1e7; }
+    .mock-sidebar strong { display: block; margin-bottom: 12px; }
+    .mock-sidebar div { margin: 7px 0; color: var(--muted); }
+    .mock-sidebar .active { color: var(--green); font-weight: 800; }
+    .mock-main { padding: 18px; background: #fffdf7; }
+
+    .run-summary {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+      padding: 14px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: white;
+    }
+
+    .counts { display: flex; flex-wrap: wrap; gap: 18px; }
+    .count strong { display: block; font-size: 22px; }
+    .count small { color: var(--muted); }
+    .mock-button { align-self: center; border-radius: 9px; background: var(--green); color: white; padding: 9px 12px; font-weight: 800; }
+
+    .mock-mail {
+      display: grid;
+      grid-template-columns: 24px 1.2fr 2fr auto;
+      gap: 10px;
+      align-items: start;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-bottom: 0;
+      background: white;
+    }
+
+    .mock-mail:last-child { border-bottom: 1px solid var(--line); border-radius: 0 0 10px 10px; }
+    .mock-mail:first-child { border-radius: 10px 10px 0 0; }
+    .mock-mail .why { color: var(--muted); font-size: 13px; }
+    .mock-mail .source { font-weight: 800; }
+
+    .feedback-row {
+      grid-column: 2 / -1;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+      margin-top: 4px;
+    }
+
+    .feedback {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #faf8f1;
+      color: var(--muted);
+      font-size: 12px;
+      padding: 5px 8px;
+    }
+
+    .story-slide {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: white;
+      padding: 18px;
+    }
+
+    .story-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: start;
+      border-bottom: 1px solid var(--line);
+      padding-bottom: 14px;
+    }
+
+    .story-head h3 { font-size: 22px; }
+    .story-status { color: var(--green); font-weight: 900; white-space: nowrap; }
+    .story-summary { margin: 15px 0; font-size: 17px; }
+    .source-pill { display: inline-block; margin: 3px 5px 3px 0; border-radius: 999px; background: var(--blue-soft); color: var(--blue); padding: 4px 8px; font-size: 11px; font-weight: 800; }
+
+    .timeline { margin: 18px 0; border-left: 2px solid #b9d4c3; padding-left: 18px; }
+    .timeline-event { position: relative; padding: 0 0 14px; }
+    .timeline-event:last-child { padding-bottom: 0; }
+    .timeline-event::before { content: ""; position: absolute; left: -24px; top: 5px; width: 10px; height: 10px; border: 2px solid white; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 1px var(--green); }
+    .timeline-event time { display: block; color: var(--muted); font-size: 11px; }
+    .timeline-event strong { display: block; }
+    .originals { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+    .original { border: 1px solid var(--line); border-radius: 8px; background: #faf8f1; padding: 7px 9px; color: var(--muted); font-size: 12px; }
+    .slide-actions { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 10px; margin-top: 16px; }
+    .secondary-button { border: 1px solid var(--line); border-radius: 9px; background: white; padding: 8px 11px; color: var(--muted); font-weight: 800; }
+
+    pre {
+      overflow: auto;
+      margin: 0;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #17211b;
+      color: #e8f2eb;
+      padding: 18px;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    .phase { position: relative; padding-top: 46px; }
+    .phase-label {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      border-radius: 999px;
+      background: var(--ink);
+      color: white;
+      font-size: 11px;
+      font-weight: 900;
+      padding: 5px 9px;
+    }
+
+    .gate {
+      margin-top: 12px;
+      border-top: 1px dashed var(--line);
+      padding-top: 10px;
+      color: var(--green);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .risk-list { counter-reset: risk; list-style: none; padding: 0; }
+    .risk-list li {
+      display: grid;
+      grid-template-columns: 34px 1fr;
+      gap: 12px;
+      align-items: start;
+      margin: 0;
+      border-bottom: 1px solid var(--line);
+      padding: 13px 0;
+    }
+
+    .risk-list li:last-child { border-bottom: 0; }
+    .risk-list li::before {
+      counter-increment: risk;
+      content: counter(risk);
+      display: grid;
+      width: 28px;
+      height: 28px;
+      place-items: center;
+      border-radius: 50%;
+      background: var(--red-soft);
+      color: var(--red);
+      font-weight: 900;
+    }
+
+    .checklist { list-style: none; padding: 0; }
+    .checklist li { position: relative; padding-left: 27px; }
+    .checklist li::before { content: "✓"; position: absolute; left: 0; color: var(--green); font-weight: 900; }
+
+    footer { padding: 22px 4px; color: var(--muted); font-size: 13px; }
+
+    @media (max-width: 900px) {
+      .toc, .phase-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3 { grid-template-columns: 1fr; }
+      .decision-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 650px) {
+      .page { width: min(100% - 18px, 1180px); margin-top: 9px; }
+      header, section { border-radius: 12px; }
+      .toc, .grid-2, .phase-grid { grid-template-columns: 1fr; }
+      .mock-content { grid-template-columns: 1fr; }
+      .mock-sidebar { display: none; }
+      .mock-mail { grid-template-columns: 20px 1fr auto; }
+      .mock-mail .why { grid-column: 2 / -1; }
+      .feedback-row { grid-column: 2 / -1; }
+      .story-head { display: block; }
+      .story-status { display: block; margin-top: 8px; }
+      th, td { padding: 10px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <p class="eyebrow">Inbox Walk proposal · 23 August 2026</p>
+      <h1>Turn related email into one reviewable story</h1>
+      <p class="lede">
+        Add a Codex bundling run that sees the complete matching inbox snapshot, connects messages that describe the same work or order, and gives you one slide per story. A GitHub merge and its Railway deployment belong together. An Amazon order and its DHL shipment belong together. Every original remains inspectable.
+      </p>
+
+      <div class="verdict">
+        <span class="verdict-mark">✓</span>
+        <div>
+          <strong>Recommendation</strong>
+          <p>Make bundling the product, not auto-read. Build it beside the existing Codex reply path and reuse Inbox Walk's explicit finalization. Start a review from a set of contextual slides. When you finish a slide, the app can mark its exact member messages read after confirmation.</p>
+        </div>
+      </div>
+
+      <div class="meta">
+        <span class="chip">Whole-snapshot context</span>
+        <span class="chip">Cross-sender bundles</span>
+        <span class="chip">Explicit relationship feedback</span>
+        <span class="chip">Fail closed</span>
+        <span class="chip">Originals preserved</span>
+        <span class="chip">No sending</span>
+      </div>
+
+      <nav class="toc" aria-label="Document sections">
+        <a href="#outcome">1. Product outcome</a>
+        <a href="#architecture">2. Architecture</a>
+        <a href="#algorithm">3. Bundling algorithm</a>
+        <a href="#learning">4. Learning loop</a>
+        <a href="#rollout">5. Rollout</a>
+        <a href="#ui">6. UI proposal</a>
+        <a href="#data">7. Data and API</a>
+        <a href="#safety">8. Safety</a>
+        <a href="#delivery">9. Delivery slices</a>
+      </nav>
+    </header>
+
+    <section id="outcome">
+      <p class="eyebrow">Product outcome</p>
+      <h2>Review events, orders, and incidents instead of notification fragments</h2>
+      <div class="decision-grid">
+        <div class="card good">
+          <h3>The unit of work</h3>
+          <p>One bundle contains the messages that describe a single real-world story. The snapshot contains every matching unread message at the moment the review starts. There is no fixed message-count limit.</p>
+          <div class="chips">
+            <span class="tag">development workstream</span>
+            <span class="tag">order and delivery</span>
+            <span class="tag">incident</span>
+            <span class="tag">standalone message</span>
+          </div>
+        </div>
+        <div class="card info">
+          <h3>One slide, several sources</h3>
+          <p>A repository slide can combine PR creation, review comments, merge status, deployment attempts, and the latest Railway outcome. An order slide can combine payment, merchant confirmation, carrier handoff, and delivery.</p>
+          <p>The slide summarizes the current state and shows a short timeline. It does not replace or delete the source messages.</p>
+        </div>
+      </div>
+
+      <div class="grid-3" style="margin-top:14px">
+        <article class="card good">
+          <h3>Strong link</h3>
+          <p>Shared order number, tracking number, repository, pull request, commit SHA, deployment ID, service, or an explicit link from one message to the next.</p>
+        </article>
+        <article class="card stop">
+          <h3>Conflicting evidence</h3>
+          <p>Similar subjects are not enough. Different order numbers, repositories, environments, recipients, or distant time windows keep messages in separate bundles.</p>
+        </article>
+        <article class="card wait">
+          <h3>Suggested link</h3>
+          <p>When the relationship looks plausible but lacks a hard identifier, the UI can place the messages nearby and ask whether they belong together.</p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong>Default cost of uncertainty</strong>
+        Create an extra slide. A needless split costs one swipe. A false merge can hide an unrelated problem inside a reassuring summary.
+      </div>
+    </section>
+
+    <section id="architecture">
+      <p class="eyebrow">Architecture</p>
+      <h2>An indexed seed-and-retrieve bundler with one mutation boundary</h2>
+      <p>The system first extracts reliable links and builds a searchable graph across the complete snapshot. It then takes one unassigned seed, retrieves plausible companions, and asks Codex to decide membership. A final pass names each story, summarizes its current state, and checks the bundle boundaries. Nothing changes in Fastmail while bundles are built or reviewed.</p>
+
+      <div class="architecture">
+        <svg viewBox="0 0 1060 430" role="img" aria-labelledby="arch-title arch-desc">
+          <title id="arch-title">Inbox Walk contextual bundle architecture</title>
+          <desc id="arch-desc">A Fastmail snapshot flows through deterministic extraction, a relationship graph, Codex bundle summaries, an integrity gate, the bundled review interface, and explicit JMAP read changes. Relationship feedback flows to a separate preference learner.</desc>
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M 0 0 L 10 5 L 0 10 z" fill="#176b4a"/>
+            </marker>
+            <style>
+              .box { fill: #fffdf7; stroke: #bdb6a7; stroke-width: 1.5; }
+              .box-green { fill: #dcece3; stroke: #176b4a; stroke-width: 1.7; }
+              .box-amber { fill: #f5e6cd; stroke: #a45b12; stroke-width: 1.7; }
+              .label { fill: #17211b; font: 700 15px ui-sans-serif, system-ui; }
+              .small { fill: #5d6a62; font: 12px ui-sans-serif, system-ui; }
+              .line { fill: none; stroke: #176b4a; stroke-width: 2; marker-end: url(#arrow); }
+              .dash { stroke-dasharray: 5 5; }
+            </style>
+          </defs>
+          <rect class="box" x="20" y="62" width="150" height="105" rx="13"/>
+          <text class="label" x="38" y="91">Fastmail snapshot</text>
+          <text class="small" x="38" y="116">All summaries first</text>
+          <text class="small" x="38" y="136">All matching explicit IDs</text>
+
+          <rect class="box" x="218" y="62" width="164" height="105" rx="13"/>
+          <text class="label" x="236" y="91">Signal extractor</text>
+          <text class="small" x="236" y="116">Provider, event, repo</text>
+          <text class="small" x="236" y="136">service, actor, status</text>
+
+          <rect class="box" x="430" y="62" width="170" height="105" rx="13"/>
+          <text class="label" x="448" y="91">Relationship graph</text>
+          <text class="small" x="448" y="116">Hard keys and timelines</text>
+          <text class="small" x="448" y="136">Cross-source candidates</text>
+
+          <rect class="box-green" x="648" y="62" width="174" height="105" rx="13"/>
+          <text class="label" x="666" y="91">Codex bundler</text>
+          <text class="small" x="666" y="116">Story and current state</text>
+          <text class="small" x="666" y="136">Structured membership</text>
+
+          <rect class="box-amber" x="870" y="62" width="170" height="105" rx="13"/>
+          <text class="label" x="888" y="91">Integrity gate</text>
+          <text class="small" x="888" y="116">Every ID exactly once</text>
+          <text class="small" x="888" y="136">Weak links stay split</text>
+
+          <path class="line" d="M170 114 H218"/>
+          <path class="line" d="M382 114 H430"/>
+          <path class="line" d="M600 114 H648"/>
+          <path class="line" d="M822 114 H870"/>
+
+          <rect class="box-green" x="620" y="255" width="202" height="110" rx="13"/>
+          <text class="label" x="638" y="285">Bundle review UI</text>
+          <text class="small" x="638" y="310">One slide per story</text>
+          <text class="small" x="638" y="331">Merge, split, or inspect</text>
+
+          <rect class="box" x="870" y="255" width="170" height="110" rx="13"/>
+          <text class="label" x="888" y="285">JMAP mutation</text>
+          <text class="small" x="888" y="310">Only reviewed bundle IDs</text>
+          <text class="small" x="888" y="331">Keep selected originals</text>
+
+          <rect class="box" x="218" y="255" width="278" height="110" rx="13"/>
+          <text class="label" x="236" y="285">Preference learner</text>
+          <text class="small" x="236" y="310">Merge and split labels</text>
+          <text class="small" x="236" y="331">Versioned linking preferences</text>
+
+          <path class="line" d="M955 167 V255"/>
+          <path class="line" d="M822 310 H870"/>
+          <path class="line dash" d="M620 310 H496"/>
+          <path class="line dash" d="M357 255 V210 H735 V167"/>
+        </svg>
+      </div>
+
+      <ol class="flow-list" aria-label="Bundle run sequence">
+        <div class="flow-step"><span class="step-number">1</span><strong>Freeze the round</strong><small>Reuse the current stable unread snapshot and explicit IDs.</small></div>
+        <div class="flow-step"><span class="step-number">2</span><strong>Index every summary</strong><small>No bundle is final until the run has seen the full snapshot.</small></div>
+        <div class="flow-step"><span class="step-number">3</span><strong>Extract link keys</strong><small>Find repository, commit, service, order, tracking, sender, and time signals.</small></div>
+        <div class="flow-step"><span class="step-number">4</span><strong>Build a graph</strong><small>Join strong matches. Ask Codex to judge only the uncertain edges.</small></div>
+        <div class="flow-step"><span class="step-number">5</span><strong>Write bundle slides</strong><small>Return membership, title, current state, timeline, and possible action.</small></div>
+        <div class="flow-step"><span class="step-number">6</span><strong>Review normally</strong><small>One slide processes all explicit members unless you protect an original.</small></div>
+      </ol>
+
+      <div class="callout">
+        <strong>No fixed inbox limit, no giant prompt</strong>
+        Fetch JMAP results page by page until every matching ID belongs to the stable snapshot. Extract hard identifiers locally for each page. Partition only the uncertain relationships into model-sized jobs, then reconcile the complete proposed bundle graph. The final membership check covers every snapshot ID. Internal page sizes control memory and request size, but never truncate the review.
+      </div>
+
+      <div class="grid-2" style="margin-top:14px">
+        <article class="card good">
+          <h3>Freeze all IDs safely</h3>
+          <p>Page through <code>Email/query</code> while its query state stays unchanged. If the state changes mid-fetch, restart the query. Once complete, freeze that full ordered ID list as the review snapshot.</p>
+        </article>
+        <article class="card info">
+          <h3>Load summaries on demand</h3>
+          <p>Keep the ID list and compact bundle index server-side. Fetch summary pages and the current bundle into the browser as needed. Bodies and attachments remain lazy.</p>
+        </article>
+        <article class="card wait">
+          <h3>Bundle across page boundaries</h3>
+          <p>Exact keys enter one global relationship index, so page 1 and page 20 can still join. Model jobs handle uncertain edges, not arbitrary page-sized islands.</p>
+        </article>
+        <article class="card stop">
+          <h3>Finalize in bounded batches</h3>
+          <p>Lock the complete reviewed selection first, then mark its explicit snapshot IDs read in retryable internal batches. Newer mail and context-only IDs stay untouched.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="algorithm">
+      <p class="eyebrow">Bundling algorithm</p>
+      <h2>Use the first open email as a seed, but search through an index</h2>
+      <p>Your second idea is the better base. Start with the first unassigned email, retrieve related messages from everything still open, create the bundle, remove its members from the open set, and continue with the next unassigned email. The important change is that retrieval uses a prebuilt index rather than asking Codex to scan the entire remainder every time.</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Approach</th><th>Work</th><th>Main problem</th><th>Verdict</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>Email-by-email assignment</strong><br>Email 1 creates bundle 1. Every later email chooses an existing bundle or starts a new one.</td>
+              <td>Roughly one model decision per email. Each decision needs summaries of plausible existing bundles.</td>
+              <td>Order matters. Early bundles lack later evidence, and a final merge pass is still necessary.</td>
+              <td><span class="action review">SIMPLE, MORE CALLS</span></td>
+            </tr>
+            <tr>
+              <td><strong>Seed scans every remaining email</strong><br>Email 1 searches all later emails and pulls matches into its bundle.</td>
+              <td>Potentially compares the inbox with itself. A naive implementation approaches quadratic work.</td>
+              <td>Large prompts, repeated comparisons, and a wrong seed decision can absorb too much at once.</td>
+              <td><span class="action keep">DO NOT FULL-SCAN</span></td>
+            </tr>
+            <tr>
+              <td><strong>Indexed seed and retrieve</strong><br>Email 1 searches a candidate index, judges only plausible matches, then removes accepted members.</td>
+              <td>One membership call per proposed bundle, plus one bounded reconciliation pass.</td>
+              <td>The candidate index must favor recall so a real relationship is not hidden before Codex sees it.</td>
+              <td><span class="action read">RECOMMENDED</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <ol class="flow-list" style="grid-template-columns:repeat(7,minmax(145px,1fr))" aria-label="Seed and retrieve bundling sequence">
+        <div class="flow-step"><span class="step-number">1</span><strong>Index all mail</strong><small>Record hard keys, normalized entities, time, sender, and searchable subject and preview terms.</small></div>
+        <div class="flow-step"><span class="step-number">2</span><strong>Prejoin exact matches</strong><small>Union identical order, tracking, pull request, commit, deployment, and thread identifiers.</small></div>
+        <div class="flow-step"><span class="step-number">3</span><strong>Pick one seed</strong><small>Take the first still-unassigned component in stable review order.</small></div>
+        <div class="flow-step"><span class="step-number">4</span><strong>Retrieve candidates</strong><small>Search both unassigned components and existing related context. Do not scan the full inbox in the prompt.</small></div>
+        <div class="flow-step"><span class="step-number">5</span><strong>Judge membership</strong><small>Codex includes, excludes, or flags each candidate. The result must cite link evidence.</small></div>
+        <div class="flow-step"><span class="step-number">6</span><strong>Close the bundle</strong><small>Remove accepted unread members from the open set. Excluded candidates remain available.</small></div>
+        <div class="flow-step"><span class="step-number">7</span><strong>Reconcile once</strong><small>Compare neighboring bundle summaries and shared entities, fix missed joins, then validate every ID exactly once.</small></div>
+      </ol>
+
+      <div class="grid-2" style="margin-top:14px">
+        <article class="card good">
+          <h3>What retrieval should use</h3>
+          <ul>
+            <li>Exact IDs and URLs first.</li>
+            <li>Known repo-to-service and merchant-to-carrier mappings.</li>
+            <li>Shared entities such as item, branch, address fragment, actor, or service.</li>
+            <li>Time windows and subject or preview similarity as broad recall signals, never final proof.</li>
+          </ul>
+        </article>
+        <article class="card stop">
+          <h3>What Codex must not do</h3>
+          <ul>
+            <li>Search the full mailbox by itself.</li>
+            <li>Create identifiers that did not come from extraction.</li>
+            <li>Remove excluded candidates from future consideration.</li>
+            <li>Make Fastmail mutations while membership is still being built.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong>Keep candidates broad, membership strict</strong>
+        Missing a candidate means Codex never gets a chance to connect it. Retrieval should therefore include doubtful possibilities. The membership judge can reject them, and an excluded candidate stays in the open set for another seed.
+      </div>
+
+      <div class="callout">
+        <strong>Large candidate sets continue in pages</strong>
+        A repository or large order may produce more candidates than one model request should contain. Rank candidates, judge a bounded page, update the provisional bundle summary, and continue until every retrieved candidate has a decision. The page size is an internal request limit, not a bundle-size limit.
+      </div>
+
+      <div class="callout">
+        <strong>Keep version one cheap</strong>
+        Start with inverted maps for exact identifiers plus SQLite FTS over subjects and previews. Do not add an embedding service yet. The correction data will show whether lexical retrieval misses enough real relationships to justify it.
+      </div>
+    </section>
+
+    <section>
+      <p class="eyebrow">Bundle examples</p>
+      <h2>The relationship can matter more than the sender</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Messages found</th><th>Link evidence</th><th>Bundle slide</th><th>What you review</th></tr></thead>
+          <tbody>
+            <tr>
+              <td>GitHub PR opened, merged, Railway deploy started, failed twice, then succeeded</td>
+              <td>Repository, branch, commit SHA, service mapping, and a 24-minute window</td>
+              <td><span class="action read">REPO WORKSTREAM</span></td>
+              <td>"PR merged and the latest deploy is healthy." One slide contains the complete timeline.</td>
+            </tr>
+            <tr>
+              <td>GitHub PR merged, Railway production deploy failed with no later success</td>
+              <td>Shared commit and service mapping, production environment</td>
+              <td><span class="action keep">UNRESOLVED DEPLOY</span></td>
+              <td>"Code merged, but production deployment is still failing." The warning stays prominent.</td>
+            </tr>
+            <tr>
+              <td>Amazon order confirmation, DHL shipment notice, DHL delivery notice</td>
+              <td>Tracking number, order date, destination, merchant reference, and matching item name</td>
+              <td><span class="action read">ORDER DELIVERED</span></td>
+              <td>"USB hub ordered from Amazon and delivered by DHL." The carrier messages become timeline entries.</td>
+            </tr>
+            <tr>
+              <td>Amazon order with two shipments, one from DHL and one from Hermes</td>
+              <td>Same order number, different tracking numbers and delivery dates</td>
+              <td><span class="action review">ORDER, 2 PARCELS</span></td>
+              <td>One order slide with separate parcel timelines. It must not claim the whole order arrived after only one parcel.</td>
+            </tr>
+            <tr>
+              <td>Two GitHub repositories and two Railway services changed during the same hour</td>
+              <td>No shared commit, branch, link, or known repo-to-service mapping</td>
+              <td><span class="action review">2 SEPARATE SLIDES</span></td>
+              <td>Time proximity alone is too weak. The app keeps both workstreams separate.</td>
+            </tr>
+            <tr>
+              <td>DHL notice without a tracking number visible in the summary</td>
+              <td>Delivery address and date resemble an Amazon order, but no hard key exists</td>
+              <td><span class="action review">SUGGESTED LINK</span></td>
+              <td>The app asks whether to merge it with the order. A correction becomes relationship training data.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section id="learning">
+      <p class="eyebrow">Learning loop</p>
+      <h2>Learn which messages belong together</h2>
+      <div class="grid-2">
+        <article class="card good">
+          <h3>What counts as a label</h3>
+          <ul>
+            <li>You merge two suggested slides.</li>
+            <li>You split an incorrect bundle.</li>
+            <li>You move one message to a different bundle.</li>
+            <li>You confirm a rule such as "this Railway service deploys this GitHub repo".</li>
+          </ul>
+        </article>
+        <article class="card stop">
+          <h3>What must never count</h3>
+          <ul>
+            <li>The bundler's own proposed relationship.</li>
+            <li>A message becoming read because another client opened it.</li>
+            <li>Two messages arriving close together without another shared signal.</li>
+            <li>A generated repo, service, merchant, or carrier mapping that you have not approved.</li>
+          </ul>
+        </article>
+      </div>
+
+      <div class="flow-list" style="grid-template-columns:repeat(5,minmax(155px,1fr))">
+        <div class="flow-step"><span class="step-number">1</span><strong>Capture correction</strong><small>Store the merge, split, or move plus the structured link signals.</small></div>
+        <div class="flow-step"><span class="step-number">2</span><strong>Accumulate evidence</strong><small>Wait for enough examples. One correction does not become a global rule.</small></div>
+        <div class="flow-step"><span class="step-number">3</span><strong>Run learner</strong><small>Codex proposes a small profile diff with supporting example IDs.</small></div>
+        <div class="flow-step"><span class="step-number">4</span><strong>Replay and score</strong><small>Test bundle membership against labeled history and held-out stories.</small></div>
+        <div class="flow-step"><span class="step-number">5</span><strong>Approve version</strong><small>You see the rule change and its measured effect before activation.</small></div>
+      </div>
+
+      <h3 style="margin-top:24px">Preference profile, not model training</h3>
+      <p>Start with a versioned, human-readable linking profile injected into each bundling run. It records trusted mappings, required evidence, and forbidden joins. This is easier to inspect, correct, roll back, and test than fine-tuning. Until the app has hundreds of reliable merge and split labels, a "learning run" should only propose profile changes.</p>
+
+      <div class="grid-2" style="margin-top:14px">
+        <article class="card good">
+          <h3>Few-shot limit per Codex call</h3>
+          <p>Include at most two confirmed positive examples and two confirmed negative examples. This means four examples at most, split evenly by outcome. If fewer relevant confirmed examples exist, send fewer. Never fill the quota with generated examples.</p>
+          <ul>
+            <li>Positive means the user confirmed that the candidate belongs with the seed.</li>
+            <li>Negative means the user split or rejected the same kind of proposed relationship.</li>
+            <li>Prefer examples from the same provider pair and bundle kind as the current decision.</li>
+          </ul>
+        </article>
+        <article class="card info">
+          <h3>Examples contain signals, not old mail</h3>
+          <p>Store and inject a compact decision record rather than message bodies. Each example contains the provider pair, extracted identifiers, relevant time gap, accepted or rejected outcome, and a short user-approved reason.</p>
+          <p>The active linking profile carries stable rules. Few-shot examples only help with the current ambiguous edge and should not grow with history.</p>
+        </article>
+      </div>
+
+      <pre>few_shot_examples:
+  positive: select_most_relevant(confirmed_positive, max = 2)
+  negative: select_most_relevant(confirmed_negative, max = 2)
+  total_max: 4
+  require_user_label: true
+  include_message_body: false
+  fallback_when_empty: use_profile_and_current_signals_only</pre>
+
+      <pre>profile_version: 7
+defaults:
+  weak_semantic_match: keep_separate
+  every_email_must_have_one_bundle: true
+trusted_mappings:
+  - github_repo: beasty/inbox-walk
+    railway_service: inbox-walk
+    require_any: [commit_sha, branch_and_time]
+    evidence: 18 confirmed bundles, 0 splits
+  - merchant: amazon
+    carriers: [dhl, hermes]
+    require_any: [tracking_number, order_reference]
+    evidence: 11 confirmed bundles, 1 split
+never_merge_across:
+  - different_order_numbers
+  - different_repositories_without_shared_commit
+  - production_and_development_incidents_without_shared_deployment</pre>
+
+      <div class="callout">
+        <strong>Good learning is asymmetric</strong>
+        A false merge is worse than an extra slide. Score incorrect joins separately from missed joins and require a much lower false-merge rate.
+      </div>
+    </section>
+
+    <section id="rollout">
+      <p class="eyebrow">Rollout</p>
+      <h2>Start with obvious bundles, then learn cross-source relationships</h2>
+      <div class="phase-grid">
+        <article class="card phase info">
+          <span class="phase-label">Phase 0</span>
+          <h3>Offline replay</h3>
+          <p>Build GitHub, Railway, Amazon, DHL, and multi-parcel fixtures. Label correct membership and intentional splits.</p>
+          <p class="gate">Gate: every message appears exactly once and false joins fail tests.</p>
+        </article>
+        <article class="card phase wait">
+          <span class="phase-label">Phase 1</span>
+          <h3>Provider bundles</h3>
+          <p>Bundle GitHub messages by repository and pull request, Railway messages by service and deployment, and carrier updates by tracking number.</p>
+          <p class="gate">Gate: manual merge and split controls work without changing Fastmail unexpectedly.</p>
+        </article>
+        <article class="card phase good">
+          <span class="phase-label">Phase 2</span>
+          <h3>Cross-source bundles</h3>
+          <p>Connect GitHub to Railway and merchants to carriers when identifiers or approved mappings support the relationship.</p>
+          <p class="gate">Gate: false-merge rate stays below the chosen threshold on held-out stories.</p>
+        </article>
+        <article class="card phase stop">
+          <span class="phase-label">Phase 3</span>
+          <h3>Context lookback</h3>
+          <p>Use recent already-read summaries to explain new unread messages, such as a shipment notice for yesterday's order.</p>
+          <p class="gate">Gate: context-only IDs can never enter the JMAP mutation set.</p>
+        </article>
+      </div>
+
+      <div class="grid-2" style="margin-top:14px">
+        <article class="card">
+          <h3>Suggested initial link policy</h3>
+          <ul>
+            <li>Auto-join on exact tracking number, order number, pull request URL, deployment ID, or commit SHA.</li>
+            <li>Require at least two independent soft signals for a proposed cross-sender link.</li>
+            <li>Never auto-join across conflicting order numbers, repositories, accounts, or environments.</li>
+            <li>Show weak candidates as suggestions rather than bundle members.</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h3>Bundle scorecard</h3>
+          <ul>
+            <li>False joins, where unrelated messages land on one slide.</li>
+            <li>Missed joins, where one story still needs several slides.</li>
+            <li>Split and merge corrections by provider pair.</li>
+            <li>Slide reduction, compared with the raw unread message count.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="ui">
+      <p class="eyebrow">UI proposal</p>
+      <h2>One slide shows the state, timeline, and source messages</h2>
+      <p>The bundled review keeps Inbox Walk's current left and right navigation. The change is what a slide represents. Instead of one email, it represents one story with a current state and collapsible originals.</p>
+
+      <div class="mock-shell" role="img" aria-label="Mockup of a contextual bundle slide in Inbox Walk">
+        <div class="mock-topbar"><strong>Inbox Walk</strong><span>Bundle 3 of 18 · 47 original messages</span></div>
+        <div class="mock-content">
+          <aside class="mock-sidebar">
+            <strong>Today's stories</strong>
+            <div>kub-homelab updates</div>
+            <div class="active">inbox-walk PR 184</div>
+            <div>Amazon order, 2 parcels</div>
+            <div>Electricity invoice</div>
+            <div>DHL, possible match</div>
+          </aside>
+          <div class="mock-main">
+            <article class="story-slide">
+              <div class="story-head">
+                <div>
+                  <div><span class="source-pill">GitHub</span><span class="source-pill">Railway</span></div>
+                  <h3>inbox-walk PR 184 deployed successfully</h3>
+                </div>
+                <span class="story-status">Recovered</span>
+              </div>
+              <p class="story-summary">The dependency PR merged at 10:14. Railway failed twice while building the new image, then deployed commit <code>7d2c1f</code> successfully at 10:31. No action appears necessary.</p>
+              <div class="timeline">
+                <div class="timeline-event"><time>10:08 · GitHub</time><strong>Bot opened PR 184</strong><span class="why">Dependency update in beasty/inbox-walk</span></div>
+                <div class="timeline-event"><time>10:14 · GitHub</time><strong>PR merged</strong><span class="why">Commit 7d2c1f</span></div>
+                <div class="timeline-event"><time>10:20 and 10:24 · Railway</time><strong>Two deployment failures</strong><span class="why">Same service, branch, and commit</span></div>
+                <div class="timeline-event"><time>10:31 · Railway</time><strong>Deployment succeeded</strong><span class="why">Latest state is healthy</span></div>
+              </div>
+              <strong>4 original messages</strong>
+              <div class="originals"><span class="original">GitHub · PR opened</span><span class="original">GitHub · merged</span><span class="original">Railway · failures ×2</span><span class="original">Railway · success</span></div>
+              <div class="slide-actions"><span class="secondary-button">Split bundle</span><span class="secondary-button">Keep one original unread</span><span class="mock-button">Done, next story →</span></div>
+            </article>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid-3" style="margin-top:14px">
+        <article class="card"><h3>Current state first</h3><p>The slide answers what happened and whether anything still needs attention before showing the notification history.</p></article>
+        <article class="card"><h3>Originals stay available</h3><p>Expand any timeline entry to render the original email. A bundle summary must never be the only route to its sources.</p></article>
+        <article class="card"><h3>Correction is part of review</h3><p>Split, merge, move, and protect controls sit on the slide. They both fix the current round and create explicit labels.</p></article>
+      </div>
+    </section>
+
+    <section id="data">
+      <p class="eyebrow">Data and API</p>
+      <h2>Small additions that fit the current codebase</h2>
+      <div class="grid-2">
+        <article class="card info">
+          <h3>Server modules</h3>
+          <ul>
+            <li><code>snapshot-store.ts</code> freezes the complete paginated JMAP ID manifest and serves bundle pages without a count cap.</li>
+            <li><code>bundle-index.ts</code> retrieves broad candidate sets from exact-key maps, approved mappings, entities, time, and SQLite FTS over subjects and previews.</li>
+            <li><code>bundles.ts</code> runs the seed queue, selects at most two positive and two negative examples, validates membership, and starts fresh no-tools Codex sessions.</li>
+            <li><code>bundle-signals.ts</code> extracts provider, repository, deployment, order, tracking, and time signals.</li>
+            <li><code>bundle-store.ts</code> stores relationship labels, approved mappings, and profile versions in SQLite.</li>
+            <li>The existing review finalizer remains the only path that marks snapshot IDs read.</li>
+          </ul>
+        </article>
+        <article class="card good">
+          <h3>Client additions</h3>
+          <ul>
+            <li>A "Bundle related messages" option before the review starts.</li>
+            <li>A lightweight checkpoint with the opaque snapshot ID, bundle revision, position, and decisions rather than thousands of copied message IDs.</li>
+            <li>One slide per bundle with a generated state summary and timeline.</li>
+            <li>Merge, split, move, inspect, and keep-unread controls.</li>
+            <li>A linking-profile view with approved repo-service and merchant-carrier mappings.</li>
+          </ul>
+        </article>
+      </div>
+
+      <h3 style="margin-top:24px">Structured bundle result</h3>
+      <pre>{
+  "snapshotId": "opaque snapshot id",
+  "profileVersion": 7,
+  "bundles": [{
+    "bundleId": "run-local opaque id",
+    "emailIds": ["explicit unread Fastmail ids"],
+    "contextEmailIds": ["recent read ids, never actionable"],
+    "kind": "development_workstream",
+    "title": "inbox-walk PR 184 deployed successfully",
+    "currentState": "recovered",
+    "summary": "The PR merged. Two deploys failed, then the same commit deployed.",
+    "timeline": [{"emailId": "id", "event": "PR merged"}],
+    "linkEvidence": ["commit_sha:7d2c1f", "repo_service_mapping"],
+    "membershipConfidence": 0.99
+  }]
+}</pre>
+
+      <div class="table-wrap" style="margin-top:18px">
+        <table>
+          <thead><tr><th>Endpoint</th><th>Purpose</th><th>Mutation</th></tr></thead>
+          <tbody>
+            <tr><td><code>POST /api/reviews/:id/bundles</code></td><td>Build bundles from the complete stable snapshot and optional context lookback.</td><td>No Fastmail change.</td></tr>
+            <tr><td><code>POST /api/bundle-runs/:id/labels</code></td><td>Record an explicit merge, split, move, or accepted mapping.</td><td>Local learning data only.</td></tr>
+            <tr><td><code>POST /api/bundle-runs/:id/finalize</code></td><td>Resolve each reviewed bundle back to its unread member IDs and call finalization.</td><td>Explicit snapshot IDs only.</td></tr>
+            <tr><td><code>POST /api/bundle-learning-runs</code></td><td>Propose and replay a linking-profile revision.</td><td>Creates an inactive profile candidate.</td></tr>
+            <tr><td><code>POST /api/bundle-profiles/:id/activate</code></td><td>Activate an inspected linking profile.</td><td>Local configuration only.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3 style="margin-top:24px">Storage policy</h3>
+      <ul>
+        <li>Store the complete ordered snapshot ID manifest server-side. Do not truncate it or send the entire manifest to the browser.</li>
+        <li>Keep raw message bodies and attachment content in the existing server snapshot cache only. Do not persist them for relationship learning.</li>
+        <li>Persist message IDs, bundle membership, structured link signals, profile versions, confidence, timestamps, and explicit merge or split labels.</li>
+        <li>Make retained snippets opt-in if later evaluation proves that structured signals are insufficient. Encrypt them and set a retention limit.</li>
+        <li>Keep a short, bounded context lookback of recent summaries or fetch them on demand. Mark every lookback ID as context-only.</li>
+        <li>Delete expired bundle runs and reconcile message IDs that no longer exist.</li>
+      </ul>
+
+      <div class="callout">
+        <strong>Stable snapshot rule</strong>
+        A bundle may cite an already-read Amazon order as context for an unread DHL notice. Finalization must discard every context-only ID and accept only unread IDs from the explicit snapshot. This keeps the current stable snapshot invariant intact.
+      </div>
+
+      <p style="margin-top:18px">The current Codex integration already creates a fresh in-memory session, disables built-in tools and project context, and accepts one schema-constrained submission. Reuse that shape. Official OpenAI documentation also supports schema-constrained output through Structured Outputs in the Responses API, so a later move to the direct API would preserve the same typed contract. <a href="https://developers.openai.com/api/docs/guides/structured-outputs">Official OpenAI Structured Outputs guide</a>.</p>
+    </section>
+
+    <section id="safety">
+      <p class="eyebrow">Safety and failure modes</p>
+      <h2>Mail is untrusted data, and read-state changes still matter</h2>
+      <ol class="risk-list">
+        <li><div><strong>Prompt injection in email content</strong><p>Use no built-in tools, one schema-only result channel, strict delimiters, bounded fields, and server validation. Text inside mail can describe relationships but cannot alter policy or call functions.</p></div></li>
+        <li><div><strong>Two unrelated stories get merged</strong><p>Prefer exact identifiers and approved mappings. Treat semantic similarity and time proximity as suggestions. Conflicting hard keys always force a split.</p></div></li>
+        <li><div><strong>A summary hides an unresolved problem</strong><p>Derive the current state from the last relevant event and preserve warnings. "Merge succeeded" must not override a later production deployment failure.</p></div></li>
+        <li><div><strong>Self-reinforcing relationships</strong><p>Learn only from explicit merge, split, and move labels. Candidate mappings stay inactive until replay evaluation and approval.</p></div></li>
+        <li><div><strong>Partial or stale snapshot</strong><p>Bind every bundle to the snapshot ID. Validate that each snapshot email appears in exactly one bundle and that context-only IDs never become actionable.</p></div></li>
+        <li><div><strong>Attachments omit important context</strong><p>Keep the original message inspectable and flag attachment-bearing events. If attachment content influences a bundle summary, use the existing fail-closed extraction rules.</p></div></li>
+        <li><div><strong>Provider outage or invalid model output</strong><p>Fall back to one slide per email. Leave every message unread until the normal review finalizes it. Never accept partial bundle membership.</p></div></li>
+      </ol>
+    </section>
+
+    <section id="delivery">
+      <p class="eyebrow">Delivery plan</p>
+      <h2>Four implementation slices, each useful on its own</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Slice</th><th>Build</th><th>Proof</th><th>Not included yet</th></tr></thead>
+          <tbody>
+            <tr>
+              <td><strong>1. Complete snapshots and signals</strong></td>
+              <td>Remove the fixed count cap, add paginated snapshot construction, provider parsers, relationship index, seed queue, bundle schema, and source fixtures.</td>
+              <td>A test with more than 250 messages proves no IDs disappear. Unit tests prove exact identifiers join, conflicting identifiers split, and excluded candidates remain open.</td>
+              <td>Live Codex call and UI.</td>
+            </tr>
+            <tr>
+              <td><strong>2. Bundled review</strong></td>
+              <td>Fresh Codex bundling session, whole-snapshot orchestration, strict membership validation, and bundle slides.</td>
+              <td>API and Playwright tests run only with <code>MAIL_REVIEW_DEMO=1</code>. Manual live run requires explicit approval.</td>
+              <td>Cross-sender linking and context lookback.</td>
+            </tr>
+            <tr>
+              <td><strong>3. Feedback and learning runs</strong></td>
+              <td>Merge, split, and move labels, approved mappings, replay evaluator, and linking-profile UI.</td>
+              <td>A candidate reduces missed links without adding false joins to held-out stories.</td>
+              <td>Automatic activation of learned mappings.</td>
+            </tr>
+            <tr>
+              <td><strong>4. Cross-source context</strong></td>
+              <td>GitHub-to-Railway and merchant-to-carrier joins, plus a bounded recent-message lookback.</td>
+              <td>Focused JMAP tests prove that context-only IDs can never change. Browser tests cover split, merge, and per-original keep-unread.</td>
+              <td>Generic autonomous inbox agent.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="grid-2" style="margin-top:18px">
+        <article class="card good">
+          <h3>Acceptance criteria for the first release</h3>
+          <ul class="checklist">
+            <li>The system indexes every summary, and Codex reconciles the complete relationship graph before returning bundles.</li>
+            <li>A snapshot containing more than 250 messages completes without truncation.</li>
+            <li>Every snapshot email belongs to exactly one bundle or the whole run fails.</li>
+            <li>A standalone email becomes a valid one-message bundle.</li>
+            <li>No Codex request contains more than two confirmed positive and two confirmed negative examples.</li>
+            <li>The final reconciliation can merge missed neighbors but cannot silently drop or duplicate an ID.</li>
+            <li>The UI shows current state, link evidence, timeline, originals, and correction controls.</li>
+            <li>Finalization receives only explicit unread snapshot IDs.</li>
+            <li>Automated tests never call live mail or AI providers.</li>
+          </ul>
+        </article>
+        <article class="card info">
+          <h3>Recommended first milestone</h3>
+          <p>Ship same-provider GitHub and Railway bundles first, with one slide per repository or service story. Add their cross-source mapping next. Then add Amazon and carrier bundles with explicit multi-parcel handling.</p>
+          <p>This sequence proves the slide interaction before the harder relationship work and collects real merge and split labels.</p>
+        </article>
+      </div>
+
+      <div class="callout">
+        <strong>Decision to lock before coding</strong>
+        Completing a bundle should process its unread member messages as one review action. The user can keep any original unread before final confirmation. The app does not need unattended auto-read to remove most of the repetitive work.
+      </div>
+    </section>
+
+    <footer>
+      This plan evolves Inbox Walk v0.5.2 from a 250-message snapshot to a complete paginated snapshot with no fixed message-count cap. It keeps lazy bodies, explicit finalization, minimal SQLite history, and the existing server-side Codex session. It proposes no send-mail capability and no Railway or GitHub account integration. GitHub, Railway, Amazon, and carrier relationships come from the mail itself and from mappings the user confirms.
+    </footer>
+  </main>
+</body>
+</html>

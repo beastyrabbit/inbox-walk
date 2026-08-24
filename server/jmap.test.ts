@@ -150,6 +150,77 @@ describe('Fastmail JMAP adapter', () => {
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual({ Authorization: 'Bearer secret-token' })
   })
 
+  it('freezes every matching message when the snapshot contains more than 250 IDs', async () => {
+    const ids = Array.from({ length: 301 }, (_, index) => `mail-${index}`)
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      if (String(input).includes('/jmap/session')) {
+        return new Response(
+          JSON.stringify({
+            apiUrl: 'https://api.example/jmap',
+            downloadUrl: 'https://api.example/download/{accountId}/{blobId}/{name}',
+            primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acc-1' },
+            capabilities: { 'urn:ietf:params:jmap:core': { maxObjectsInGet: 500 } },
+          }),
+          { status: 200 },
+        )
+      }
+      const request = JSON.parse(String(init?.body)) as {
+        methodCalls: Array<[string, Record<string, unknown>, string]>
+      }
+      const [method, arguments_, callId] = request.methodCalls[0] ?? []
+      if (method === 'Mailbox/get') {
+        return jmapResponse([
+          ['Mailbox/get', { list: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }] }, callId],
+        ])
+      }
+      if (method === 'Email/query') {
+        const position = Number(arguments_?.position ?? 0)
+        const limit = Number(arguments_?.limit ?? 250)
+        return jmapResponse([
+          [
+            'Email/query',
+            {
+              ids: limit === 1 ? ids.slice(0, 1) : ids.slice(position, position + limit),
+              queryState: 'stable-state',
+              total: ids.length,
+            },
+            callId,
+          ],
+        ])
+      }
+      if (method === 'Email/get') {
+        const wanted = arguments_?.ids as string[]
+        return jmapResponse([
+          [
+            'Email/get',
+            {
+              list: wanted.map((id) => ({
+                id,
+                threadId: `thread-${id}`,
+                mailboxIds: { inbox: true },
+                receivedAt: '2026-08-24T10:00:00Z',
+                from: [{ name: 'Sender', email: 'sender@example.test' }],
+                to: [{ name: 'Alex', email: 'alex@example.test' }],
+                subject: id,
+                preview: 'Snapshot test',
+                bodyValues: {},
+              })),
+            },
+            callId,
+          ],
+        ])
+      }
+      throw new Error(`Unexpected JMAP method: ${method}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    const snapshot = await fetchUnreadSnapshot('secret-token')
+    expect(snapshot.emails).toHaveLength(301)
+    expect(snapshot.emails.map((email) => email.id)).toEqual(ids)
+    expect(snapshot.truncated).toBe(false)
+    expect(snapshot.totalBeforeLimit).toBe(301)
+  })
+
   it('does not classify message body blobs as attachments', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
       jmapResponse([

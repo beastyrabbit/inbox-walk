@@ -13,6 +13,7 @@ import type {
   MailIdentity,
   MailResource,
   ReplyProposal,
+  ReviewBundleRun,
   ReviewEmail,
   ReviewEmailSummary,
   ReviewFilters,
@@ -20,7 +21,14 @@ import type {
   ThreadMessage,
 } from '../src/shared.ts'
 import { defaultReviewFilters } from '../src/shared.ts'
-import { codexAuthStatus, getCodexAuthStorage } from './codex.ts'
+import type { BundleStore } from './bundle-store.ts'
+import {
+  buildReviewBundles,
+  type DecideBundle,
+  learningSignalsFor,
+  singletonBundleRun,
+} from './bundles.ts'
+import { codexAuthStatus, getCodexAuthStorage, runCodexBundleDecision } from './codex.ts'
 import { demoEmails } from './demo.ts'
 import {
   createAndVerifyDraft,
@@ -51,6 +59,7 @@ import type { ReviewHistory } from './review-history.ts'
 import { fetchRemoteImage, SafeHttpError } from './safe-http.ts'
 
 const MAX_JSON_BYTES = 256 * 1024
+const MAX_SELECTION_JSON_BYTES = 16 * 1024 * 1024
 const MAX_SNAPSHOTS = 20
 const SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
@@ -68,6 +77,8 @@ const addressSchema = z.object({ name: z.string().max(320), email: z.string().em
 
 interface StoredSnapshot {
   blobMetadata: Map<string, MailResource>
+  bundleRun?: ReviewBundleRun
+  bundleWork?: Promise<ReviewBundleRun>
   context?: MailAccountContext
   createdAt: number
   csrfToken: string
@@ -96,8 +107,11 @@ interface StoredSnapshot {
 }
 
 export interface ApiOptions {
+  bundleDecider?: DecideBundle
+  bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
+  demoMessages?: ReviewEmail[]
   fastmailToken?: string
   forceDemo?: boolean
   reviewHistory?: ReviewHistory
@@ -146,13 +160,13 @@ function apiError(
   return json(res, status, payload)
 }
 
-async function readJson(req: IncomingMessage) {
+async function readJson(req: IncomingMessage, maximumBytes = MAX_JSON_BYTES) {
   const chunks: Buffer[] = []
   let size = 0
   for await (const chunk of req) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     size += buffer.length
-    if (size > MAX_JSON_BYTES)
+    if (size > maximumBytes)
       throw new ApiHttpError(413, 'BODY_TOO_LARGE', 'Request body is too large')
     chunks.push(buffer)
   }
@@ -207,11 +221,15 @@ function pruneSnapshots() {
   for (const [id] of oldest.slice(0, snapshots.size - MAX_SNAPSHOTS)) snapshots.delete(id)
 }
 
-function filterDemoEmails(filters: ReviewFilters, retainedIds: ReadonlySet<string>) {
+function filterDemoEmails(
+  filters: ReviewFilters,
+  retainedIds: ReadonlySet<string>,
+  messages = demoEmails,
+) {
   const hours =
     filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
   const cutoff = hours ? Date.now() - hours * 3_600_000 : 0
-  return demoEmails.filter((email) => {
+  return messages.filter((email) => {
     if (filters.hideReviewed && retainedIds.has(email.id)) return false
     const isSpam = email.mailboxNames.includes('Spam')
     if ((filters.spam === 'only') !== isSpam) return false
@@ -371,7 +389,7 @@ async function createReview(
   const filters = parseFilters(body.filters)
   const retainedIds = options.reviewHistory?.retainedIds() ?? new Set<string>()
   if (options.forceDemo) {
-    const details = filterDemoEmails(filters, retainedIds)
+    const details = filterDemoEmails(filters, retainedIds, options.demoMessages)
     const emails = summariesFor(details)
     const stored = storeSnapshot({
       emails,
@@ -408,12 +426,12 @@ async function resumeReview(
   body: Record<string, unknown>,
   options: ApiOptions,
 ) {
-  const emailIds = z.array(z.string().min(1)).max(250).safeParse(body.emailIds)
+  const emailIds = z.array(z.string().min(1)).safeParse(body.emailIds)
   if (!emailIds.success) throw new ApiHttpError(400, 'INVALID_RESUME', 'Ungültiger Checkpoint.')
   const filters = parseFilters(body.filters)
   if (options.forceDemo) {
     const wanted = new Set(emailIds.data)
-    const details = demoEmails.filter((email) => wanted.has(email.id))
+    const details = (options.demoMessages ?? demoEmails).filter((email) => wanted.has(email.id))
     const missingIds = emailIds.data.filter((id) => !details.some((email) => email.id === id))
     const ordered = emailIds.data
       .map((id) => details.find((email) => email.id === id))
@@ -756,6 +774,90 @@ async function threadContext(
   })
 }
 
+async function bundles(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  await readJson(req)
+  if (snapshot.bundleRun) return json(res, 200, snapshot.bundleRun)
+  if (!snapshot.bundleWork) {
+    const emails = snapshot.emailIds
+      .map((id) => snapshot.summaries.get(id))
+      .filter((email): email is ReviewEmailSummary => Boolean(email))
+    snapshot.bundleWork = (async () => {
+      try {
+        const auth =
+          snapshot.mode === 'demo'
+            ? { configured: false }
+            : (apiOptions.codexAuthStatus ?? codexAuthStatus)()
+        const decide =
+          apiOptions.bundleDecider ??
+          (snapshot.mode === 'live' && auth.configured ? runCodexBundleDecision : undefined)
+        return await buildReviewBundles(
+          snapshotId,
+          emails,
+          decide,
+          apiOptions.bundleStore?.examples() ?? [],
+        )
+      } catch (error) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'bundle_fallback',
+            message: error instanceof Error ? error.message : 'unknown',
+          })}\n`,
+        )
+        return singletonBundleRun(snapshotId, emails)
+      }
+    })()
+  }
+  try {
+    snapshot.bundleRun = await snapshot.bundleWork
+    return json(res, 200, snapshot.bundleRun)
+  } finally {
+    snapshot.bundleWork = undefined
+  }
+}
+
+async function bundleLabel(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
+  const parsed = z
+    .object({
+      anchorEmailIds: z.array(z.string().min(1)).min(1),
+      candidateEmailIds: z.array(z.string().min(1)).min(1),
+      label: z.enum(['merge', 'split']),
+      reason: z.string().max(2_000).default('Vom Nutzer im Review bestätigt.'),
+    })
+    .safeParse(body)
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_BUNDLE_LABEL', 'Ungültige Korrektur.')
+  const known = new Set(snapshot.emailIds)
+  const ids = [...parsed.data.anchorEmailIds, ...parsed.data.candidateEmailIds]
+  if (ids.some((id) => !known.has(id))) {
+    throw new ApiHttpError(400, 'UNKNOWN_EMAIL', 'Die Korrektur enthält eine unbekannte Nachricht.')
+  }
+  const summaries = (wanted: readonly string[]) =>
+    wanted
+      .map((id) => snapshot.summaries.get(id))
+      .filter((email): email is ReviewEmailSummary => Boolean(email))
+  apiOptions.bundleStore?.record({
+    anchorSignals: learningSignalsFor(summaries(parsed.data.anchorEmailIds)),
+    candidateSignals: learningSignalsFor(summaries(parsed.data.candidateEmailIds)),
+    label: parsed.data.label,
+    reason: parsed.data.reason,
+  })
+  return json(res, 201, { recorded: Boolean(apiOptions.bundleStore) })
+}
+
 async function finalize(
   req: IncomingMessage,
   res: ServerResponse,
@@ -764,12 +866,11 @@ async function finalize(
 ) {
   const snapshot = getSnapshot(snapshotId)
   requireCsrf(req, snapshot)
-  const body = await readJson(req)
-  const finalized = z.array(z.string().min(1)).min(1).max(250).safeParse(body.finalizeIds)
-  const kept = z.array(z.string().min(1)).max(250).safeParse(body.keepUnreadIds)
+  const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
+  const finalized = z.array(z.string().min(1)).min(1).safeParse(body.finalizeIds)
+  const kept = z.array(z.string().min(1)).safeParse(body.keepUnreadIds)
   const secondaryAction = z
     .array(z.string().min(1))
-    .max(250)
     .safeParse(body.secondaryActionIds ?? body.unsubscribeIds ?? [])
   if (!finalized.success || !kept.success || !secondaryAction.success)
     throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
@@ -1188,7 +1289,7 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
       }
       if (req.method === 'POST' && url.pathname === '/api/reviews/resume') {
         validateOrigin(req)
-        return await resumeReview(res, await readJson(req), apiOptions)
+        return await resumeReview(res, await readJson(req, MAX_SELECTION_JSON_BYTES), apiOptions)
       }
       if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
         const snapshotId = parts[2]
@@ -1218,6 +1319,12 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
         }
         if (req.method === 'POST' && parts[3] === 'finalize') {
           return await finalize(req, res, snapshotId, apiOptions)
+        }
+        if (req.method === 'POST' && parts[3] === 'bundles') {
+          return await bundles(req, res, snapshotId, apiOptions)
+        }
+        if (req.method === 'POST' && parts[3] === 'bundle-labels') {
+          return await bundleLabel(req, res, snapshotId, apiOptions)
         }
         if (req.method === 'POST' && parts[3] === 'replies') {
           return await reply(req, res, snapshotId, apiOptions)

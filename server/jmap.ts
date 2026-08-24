@@ -14,9 +14,7 @@ const MAIL = 'urn:ietf:params:jmap:mail'
 const SUBMISSION = 'urn:ietf:params:jmap:submission'
 const SESSION_URL = 'https://api.fastmail.com/jmap/session'
 const EXCLUDED_MAILBOX_ROLES = new Set(['drafts', 'sent', 'trash'])
-const SNAPSHOT_LIMIT = 250
 const QUERY_PAGE_SIZE = 250
-const MAX_QUERY_CANDIDATES = 5_000
 const THREAD_LIMIT = 100
 
 interface JmapSession {
@@ -457,7 +455,7 @@ export async function fetchUnreadSnapshot(
     const selected: ReviewEmailSummary[] = []
     const missingIds: string[] = []
 
-    while (selected.length <= SNAPSHOT_LIMIT && position < MAX_QUERY_CANDIDATES) {
+    while (!exhausted) {
       const pageResponses = await callJmap<never>(context.apiUrl, token, [
         ['Email/query', { ...queryArguments, position, limit: QUERY_PAGE_SIZE }, 'query'],
       ])
@@ -498,15 +496,14 @@ export async function fetchUnreadSnapshot(
     ])
     const second = responseFor(secondResponses, 'query-check')
     if (queryState !== second.queryState) continue
-    const emails = selected.slice(0, SNAPSHOT_LIMIT)
     return {
       context,
-      emails,
+      emails: selected,
       filters,
       mailboxes: mailboxList.map(({ id, name, role }) => ({ id, name, role })),
       missingIds,
-      totalBeforeLimit: exhausted ? selected.length : Math.max(selected.length, SNAPSHOT_LIMIT + 1),
-      truncated: selected.length > SNAPSHOT_LIMIT || !exhausted,
+      totalBeforeLimit: selected.length,
+      truncated: false,
     }
   }
   throw new JmapError(
@@ -520,7 +517,6 @@ export async function resumeSnapshot(
   ids: readonly string[],
   filters: ReviewFilters,
 ) {
-  if (ids.length > SNAPSHOT_LIMIT) throw new JmapError('Too many resume IDs', 'INVALID_RESUME')
   const context = await accountContext(token)
   const mailboxList = await fetchMailboxes(context, token)
   const mailboxes = new Map(mailboxList.map((mailbox) => [mailbox.id, mailbox]))

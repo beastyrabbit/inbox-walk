@@ -12,6 +12,8 @@ import {
   type MailAddress,
   type ReplyEditorState,
   type ReplyProposal,
+  type ReviewBundle,
+  type ReviewBundleRun,
   type ReviewCheckpoint,
   type ReviewEmail,
   type ReviewFilters,
@@ -85,6 +87,56 @@ function initialEditor(context: ThreadContext): ReplyEditorState {
   }
 }
 
+function restoreBundleGroups(
+  run: ReviewBundleRun,
+  groups: readonly (readonly string[])[],
+  emails: ReviewSnapshot['emails'],
+) {
+  const expected = new Set(emails.map((email) => email.id))
+  const restoredIds = groups.flat()
+  if (
+    restoredIds.length !== expected.size ||
+    new Set(restoredIds).size !== expected.size ||
+    restoredIds.some((id) => !expected.has(id))
+  ) {
+    return run
+  }
+  const timelineById = new Map(
+    run.bundles.flatMap((bundle) => bundle.timeline.map((item) => [item.emailId, item] as const)),
+  )
+  return {
+    ...run,
+    bundles: groups.map((group, groupIndex) => {
+      const sources = run.bundles.filter((bundle) =>
+        bundle.emailIds.some((id) => group.includes(id)),
+      )
+      const primary = sources[0]
+      const original = emails.find((email) => email.id === group[0])
+      return {
+        bundleId: `restored-${groupIndex}-${group[0]}`,
+        currentState:
+          group.length === 1 ? 'Einzelne Nachricht' : (primary?.currentState ?? 'Letzter Stand'),
+        emailIds: [...group],
+        kind: group.length === 1 ? 'standalone' : (primary?.kind ?? 'standalone'),
+        linkEvidence: [...new Set(sources.flatMap((bundle) => bundle.linkEvidence))],
+        membershipConfidence: 1,
+        summary:
+          group.length === 1
+            ? original?.preview || original?.subject || ''
+            : sources.map((bundle) => bundle.summary).join(' '),
+        timeline: group
+          .map((id) => timelineById.get(id))
+          .filter((item): item is NonNullable<typeof item> => Boolean(item))
+          .sort((left, right) => Date.parse(left.occurredAt) - Date.parse(right.occurredAt)),
+        title:
+          group.length === 1
+            ? original?.subject || '(Kein Betreff)'
+            : primary?.title || original?.subject || '(Kein Betreff)',
+      } satisfies ReviewBundle
+    }),
+  }
+}
+
 function isTypingTarget(target: EventTarget | null) {
   return (
     target instanceof HTMLInputElement ||
@@ -136,8 +188,11 @@ function App() {
   const [filters, setFilters] = useState<ReviewFilters>(defaultReviewFilters)
   const [checkpoint, setCheckpoint] = useState<ReviewCheckpoint | null>(null)
   const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null)
+  const [bundleRun, setBundleRun] = useState<ReviewBundleRun | null>(null)
   const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
   const [index, setIndex] = useState(0)
+  const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null)
+  const [confirmedBundleIds, setConfirmedBundleIds] = useState<Set<string>>(new Set())
   const [keptUnread, setKeptUnread] = useState<Set<string>>(new Set())
   const [processedIds, setProcessedIds] = useState<Set<string>>(new Set())
   const [secondaryActionIds, setSecondaryActionIds] = useState<Set<string>>(new Set())
@@ -149,6 +204,7 @@ function App() {
   const [overviewOpen, setOverviewOpen] = useState(false)
   const [replyOpen, setReplyOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
+  const [mergeOpen, setMergeOpen] = useState(false)
   const [codexLoginOpen, setCodexLoginOpen] = useState(false)
   const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
   const [codexLoginBusy, setCodexLoginBusy] = useState(false)
@@ -162,7 +218,13 @@ function App() {
   const restoredRef = useRef(false)
 
   const emails = snapshot?.emails ?? []
-  const summary = emails[index]
+  const bundles = bundleRun?.bundles ?? []
+  const currentBundle = bundles[index]
+  const summary = currentBundle
+    ? (emails.find(
+        (item) => item.id === selectedMemberId && currentBundle.emailIds.includes(item.id),
+      ) ?? emails.find((item) => item.id === currentBundle.emailIds[0]))
+    : undefined
   const email = summary ? details[summary.id] : undefined
   const editor = summary ? replyDrafts[summary.id] : undefined
   const thread = summary ? threadContexts[summary.id] : undefined
@@ -200,6 +262,8 @@ function App() {
           ? await api.resumeReview(resume.emailIds, resume.filters)
           : await api.createReview(nextFilters)
       setSnapshot(nextSnapshot)
+      setBundleRun(null)
+      setConfirmedBundleIds(new Set())
       setFilters(nextSnapshot.filters)
       setDetails({})
       setThreadContexts({})
@@ -209,7 +273,7 @@ function App() {
       setOverviewOpen(false)
       setReplyOpen(false)
       if (resume) {
-        setIndex(clampIndex(resume.index, nextSnapshot.emails.length))
+        setIndex(resume.index)
         const available = new Set(nextSnapshot.emails.map((item) => item.id))
         setKeptUnread(new Set(resume.keptUnreadIds.filter((id) => available.has(id))))
         setProcessedIds(new Set(resume.processedIds.filter((id) => available.has(id))))
@@ -238,6 +302,22 @@ function App() {
         setReplyDrafts({})
         setStatus(`${nextSnapshot.emails.length} ungelesene Nachrichten geladen.`)
       }
+      setStatus('Zusammengehörige Nachrichten werden gebündelt …')
+      const loadedBundleRun = await api.bundles(nextSnapshot)
+      const nextBundleRun = resume
+        ? restoreBundleGroups(loadedBundleRun, resume.bundleGroups, nextSnapshot.emails)
+        : loadedBundleRun
+      setBundleRun(nextBundleRun)
+      const nextIndex = clampIndex(resume?.index ?? 0, nextBundleRun.bundles.length)
+      setIndex(nextIndex)
+      setSelectedMemberId(nextBundleRun.bundles[nextIndex]?.emailIds[0] ?? null)
+      if (nextBundleRun.fallback) {
+        setStatus('Bundelung war nicht verfügbar; jede Nachricht bleibt einzeln prüfbar.')
+      } else if (!resume) {
+        setStatus(
+          `${nextSnapshot.emails.length} Nachrichten in ${nextBundleRun.bundles.length} Storys gebündelt.`,
+        )
+      }
       setCheckpoint(resume)
       restoredRef.current = true
     } catch (cause) {
@@ -247,6 +327,13 @@ function App() {
       setLoading(false)
     }
   }, [])
+
+  useEffect(() => {
+    if (!currentBundle) return
+    if (!selectedMemberId || !currentBundle.emailIds.includes(selectedMemberId)) {
+      setSelectedMemberId(currentBundle.emailIds[0] ?? null)
+    }
+  }, [currentBundle, selectedMemberId])
 
   useEffect(() => {
     let active = true
@@ -311,7 +398,8 @@ function App() {
   useEffect(() => {
     if (!snapshot || !restoredRef.current || emails.length === 0) return
     const saved = saveCheckpoint({
-      version: 5,
+      version: 6,
+      bundleGroups: bundles.map((bundle) => bundle.emailIds),
       emailIds: emails.map((item) => item.id),
       filters: snapshot.filters,
       index,
@@ -324,7 +412,7 @@ function App() {
       setError(
         'Der lokale Checkpoint konnte nicht gespeichert werden. Dieses Fenster offen lassen.',
       )
-  }, [emails, index, keptUnread, processedIds, replyDrafts, secondaryActionIds, snapshot])
+  }, [bundles, emails, index, keptUnread, processedIds, replyDrafts, secondaryActionIds, snapshot])
 
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
@@ -360,12 +448,16 @@ function App() {
   }, [view])
 
   const next = useCallback(() => {
-    if (view !== 'review' || !summary) return
+    if (view !== 'review' || !currentBundle) return
     setReplyOpen(false)
-    setProcessedIds((current) => new Set(current).add(summary.id))
-    if (index >= emails.length - 1) setView('confirm')
+    setProcessedIds((current) => {
+      const nextProcessed = new Set(current)
+      for (const id of currentBundle.emailIds) nextProcessed.add(id)
+      return nextProcessed
+    })
+    if (index >= bundles.length - 1) setView('confirm')
     else setIndex((current) => current + 1)
-  }, [emails.length, index, summary, view])
+  }, [bundles.length, currentBundle, index, view])
 
   const finishProcessed = useCallback(() => {
     if (view !== 'review' || processedIds.size === 0) return
@@ -422,6 +514,7 @@ function App() {
       if (event.ctrlKey || event.metaKey || event.altKey) return
       if (event.key === 'Escape') {
         if (helpOpen) setHelpOpen(false)
+        else if (mergeOpen) setMergeOpen(false)
         else if (replyOpen) setReplyOpen(false)
         else if (overviewOpen) setOverviewOpen(false)
         else if (view === 'confirm') setView('review')
@@ -453,6 +546,7 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [
     helpOpen,
+    mergeOpen,
     next,
     openReply,
     overviewOpen,
@@ -582,6 +676,19 @@ function App() {
 
   async function showSetup(discardCheckpoint = false) {
     if (discardCheckpoint) clearCheckpoint()
+    else if (snapshot && emails.length > 0) {
+      saveCheckpoint({
+        version: 6,
+        bundleGroups: bundles.map((bundle) => bundle.emailIds),
+        emailIds: emails.map((item) => item.id),
+        filters: snapshot.filters,
+        index,
+        keptUnreadIds: [...keptUnread],
+        processedIds: [...processedIds],
+        secondaryActionIds: [...secondaryActionIds],
+        replyDrafts,
+      })
+    }
     restoredRef.current = false
     setCheckpoint(discardCheckpoint ? null : loadCheckpoint())
     setSnapshot(null)
@@ -607,6 +714,111 @@ function App() {
       setError(errorMessage(cause))
     } finally {
       setCodexLoginBusy(false)
+    }
+  }
+
+  async function splitSelectedOriginal() {
+    if (!snapshot || !bundleRun || !currentBundle || !summary || currentBundle.emailIds.length < 2)
+      return
+    const remainingIds = currentBundle.emailIds.filter((id) => id !== summary.id)
+    const selectedTimeline = currentBundle.timeline.filter((item) => item.emailId === summary.id)
+    const remainingTimeline = currentBundle.timeline.filter((item) => item.emailId !== summary.id)
+    const selectedBundle: ReviewBundle = {
+      bundleId: `split-${summary.id}`,
+      currentState: 'Einzelne Nachricht',
+      emailIds: [summary.id],
+      kind: 'standalone',
+      linkEvidence: [],
+      membershipConfidence: 1,
+      summary: summary.preview || summary.subject,
+      timeline: selectedTimeline,
+      title: summary.subject || '(Kein Betreff)',
+    }
+    const remainingBundle: ReviewBundle = {
+      ...currentBundle,
+      emailIds: remainingIds,
+      timeline: remainingTimeline,
+    }
+    setBundleRun({
+      ...bundleRun,
+      bundles: [
+        ...bundleRun.bundles.slice(0, index),
+        remainingBundle,
+        selectedBundle,
+        ...bundleRun.bundles.slice(index + 1),
+      ],
+    })
+    setSelectedMemberId(remainingIds[0] ?? summary.id)
+    setStatus('Original aus der Story gelöst. Die Korrektur wird für spätere Läufe gemerkt.')
+    try {
+      await api.bundleLabel(snapshot, {
+        anchorEmailIds: remainingIds,
+        candidateEmailIds: [summary.id],
+        label: 'split',
+      })
+    } catch (cause) {
+      setError(`Die Story wurde getrennt, aber die Lernkorrektur fehlte: ${errorMessage(cause)}`)
+    }
+  }
+
+  async function confirmCurrentBundle() {
+    if (!snapshot || !currentBundle || currentBundle.emailIds.length < 2) return
+    setConfirmedBundleIds((current) => new Set(current).add(currentBundle.bundleId))
+    setStatus('Verknüpfung bestätigt. Sie kann in späteren Läufen als Beispiel dienen.')
+    try {
+      await api.bundleLabel(snapshot, {
+        anchorEmailIds: [currentBundle.emailIds[0] as string],
+        candidateEmailIds: currentBundle.emailIds.slice(1),
+        label: 'merge',
+      })
+    } catch (cause) {
+      setConfirmedBundleIds((current) => {
+        const nextConfirmed = new Set(current)
+        nextConfirmed.delete(currentBundle.bundleId)
+        return nextConfirmed
+      })
+      setError(`Die Bestätigung konnte nicht gespeichert werden: ${errorMessage(cause)}`)
+    }
+  }
+
+  async function mergeCurrentBundle(targetIndex: number) {
+    if (!snapshot || !bundleRun || !currentBundle || targetIndex === index) return
+    const target = bundleRun.bundles[targetIndex]
+    if (!target) return
+    const mergedEmailIds = [...currentBundle.emailIds, ...target.emailIds].sort((left, right) => {
+      const leftEmail = emails.find((email) => email.id === left)
+      const rightEmail = emails.find((email) => email.id === right)
+      return Date.parse(leftEmail?.receivedAt ?? '') - Date.parse(rightEmail?.receivedAt ?? '')
+    })
+    const merged: ReviewBundle = {
+      ...currentBundle,
+      bundleId: `merged-${currentBundle.bundleId}-${target.bundleId}`,
+      emailIds: mergedEmailIds,
+      linkEvidence: [...new Set([...currentBundle.linkEvidence, ...target.linkEvidence])],
+      membershipConfidence: 1,
+      summary: `${currentBundle.summary} ${target.summary}`,
+      timeline: [...currentBundle.timeline, ...target.timeline].sort(
+        (left, right) => Date.parse(left.occurredAt) - Date.parse(right.occurredAt),
+      ),
+    }
+    const keepIndex = Math.min(index, targetIndex)
+    const nextBundles = bundleRun.bundles.filter(
+      (_bundle, bundleIndex) => bundleIndex !== index && bundleIndex !== targetIndex,
+    )
+    nextBundles.splice(keepIndex, 0, merged)
+    setBundleRun({ ...bundleRun, bundles: nextBundles })
+    setIndex(keepIndex)
+    setSelectedMemberId(merged.emailIds[0] ?? null)
+    setMergeOpen(false)
+    setStatus('Storys verbunden. Die Korrektur wird für spätere Läufe gemerkt.')
+    try {
+      await api.bundleLabel(snapshot, {
+        anchorEmailIds: currentBundle.emailIds,
+        candidateEmailIds: target.emailIds,
+        label: 'merge',
+      })
+    } catch (cause) {
+      setError(`Die Storys wurden verbunden, aber die Lernkorrektur fehlte: ${errorMessage(cause)}`)
     }
   }
 
@@ -781,7 +993,9 @@ function App() {
 
   if (!summary) return null
 
-  const progress = ((index + 1) / emails.length) * 100
+  if (!currentBundle) return null
+
+  const progress = ((index + 1) / bundles.length) * 100
 
   return (
     <div className={`app-shell ${replyOpen ? 'with-reply' : ''}`}>
@@ -794,7 +1008,7 @@ function App() {
         >
           <span>Inbox Walk</span>
           <span className="counter">
-            {index + 1} / {emails.length}
+            Story {index + 1} / {bundles.length} · {emails.length} Nachrichten
           </span>
         </button>
         <div className="top-actions">
@@ -826,14 +1040,84 @@ function App() {
         </div>
       </header>
 
-      {snapshot.truncated && (
-        <p className="snapshot-warning" role="status">
-          Diese feste Runde ist auf {emails.length} Nachrichten begrenzt. Weitere passende
-          ungelesene Nachrichten bleiben für die nächste Runde unberührt.
-        </p>
-      )}
-
       <main className="reader">
+        <section className="bundle-story" aria-labelledby="bundle-title">
+          <header className="bundle-heading">
+            <div>
+              <p className="bundle-kicker">
+                {currentBundle.timeline
+                  .map((item) => item.source)
+                  .filter((source, sourceIndex, sources) => sources.indexOf(source) === sourceIndex)
+                  .join(' · ')}
+              </p>
+              <h1 id="bundle-title">{currentBundle.title}</h1>
+            </div>
+            <span className="bundle-state">{currentBundle.currentState}</span>
+          </header>
+          <p className="bundle-summary">{currentBundle.summary}</p>
+          <ol className="bundle-timeline" aria-label="Verlauf der Story">
+            {currentBundle.timeline.map((item) => {
+              const original = emails.find((emailItem) => emailItem.id === item.emailId)
+              return (
+                <li key={item.emailId}>
+                  <button
+                    type="button"
+                    className={summary.id === item.emailId ? 'selected' : ''}
+                    onClick={() => {
+                      setSelectedMemberId(item.emailId)
+                      setReplyOpen(false)
+                    }}
+                  >
+                    <time dateTime={item.occurredAt}>{formatDate(item.occurredAt)}</time>
+                    <strong>
+                      {item.source} · {item.event}
+                    </strong>
+                    <span>
+                      {keptUnread.has(item.emailId) ? 'Bleibt ungelesen' : original?.preview}
+                    </span>
+                  </button>
+                </li>
+              )
+            })}
+          </ol>
+          <div className="bundle-tools">
+            <span>
+              {currentBundle.emailIds.length}{' '}
+              {currentBundle.emailIds.length === 1 ? 'Original' : 'Originale'}
+            </span>
+            <div>
+              <button
+                type="button"
+                className="text-button"
+                disabled={bundles.length < 2}
+                onClick={() => setMergeOpen(true)}
+              >
+                Mit anderer Story verbinden
+              </button>
+              <button
+                type="button"
+                className="text-button"
+                disabled={
+                  currentBundle.emailIds.length < 2 ||
+                  confirmedBundleIds.has(currentBundle.bundleId)
+                }
+                onClick={() => void confirmCurrentBundle()}
+              >
+                {confirmedBundleIds.has(currentBundle.bundleId)
+                  ? 'Verknüpfung bestätigt'
+                  : 'Verknüpfung stimmt'}
+              </button>
+              <button
+                type="button"
+                className="text-button"
+                disabled={currentBundle.emailIds.length < 2}
+                onClick={() => void splitSelectedOriginal()}
+              >
+                Ausgewähltes Original lösen
+              </button>
+            </div>
+          </div>
+        </section>
         <article className="message-card">
           <header className="message-header">
             <div className="message-heading">
@@ -841,7 +1125,7 @@ function App() {
                 <p className="sender" title={fullAddress(summary.from)}>
                   {addressLine(summary.from)}
                 </p>
-                <h1>{summary.subject || '(Kein Betreff)'}</h1>
+                <p className="original-subject">{summary.subject || '(Kein Betreff)'}</p>
               </div>
               <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
             </div>
@@ -982,7 +1266,7 @@ function App() {
             <span className="partial-finish-compact">{processedIds.size} fertig</span>
           </button>
           <button type="button" className="control-button next" onClick={next}>
-            <span>{index === emails.length - 1 ? 'Abschließen' : 'Weiter'}</span>
+            <span>{index === bundles.length - 1 ? 'Abschließen' : 'Story erledigt'}</span>
             <kbd>→</kbd>
           </button>
         </div>
@@ -1002,7 +1286,7 @@ function App() {
 
       {overviewOpen && (
         <OverviewDrawer
-          emails={emails}
+          bundles={bundles}
           currentIndex={index}
           keptUnread={keptUnread}
           processedIds={processedIds}
@@ -1011,6 +1295,7 @@ function App() {
           onClose={() => setOverviewOpen(false)}
           onSelect={(nextIndex) => {
             setIndex(nextIndex)
+            setSelectedMemberId(bundles[nextIndex]?.emailIds[0] ?? null)
             setReplyOpen(false)
             setOverviewOpen(false)
           }}
@@ -1018,6 +1303,14 @@ function App() {
         />
       )}
       {helpOpen && <HelpDialog isSpamReview={isSpamReview} onClose={() => setHelpOpen(false)} />}
+      {mergeOpen && (
+        <MergeDialog
+          bundles={bundles}
+          currentIndex={index}
+          onClose={() => setMergeOpen(false)}
+          onSelect={(targetIndex) => void mergeCurrentBundle(targetIndex)}
+        />
+      )}
       {codexLoginOpen && options && (
         <CodexLoginDialog
           authConfigured={options.codex.configured}
@@ -1042,6 +1335,52 @@ function App() {
           onUpdate={updateEditor}
         />
       )}
+    </div>
+  )
+}
+
+function MergeDialog({
+  bundles,
+  currentIndex,
+  onClose,
+  onSelect,
+}: {
+  bundles: ReviewBundle[]
+  currentIndex: number
+  onClose: () => void
+  onSelect: (index: number) => void
+}) {
+  const dialogRef = useFocusRegion<HTMLElement>(true)
+  return (
+    <div className="dialog-backdrop">
+      <section
+        ref={dialogRef}
+        className="dialog merge-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="merge-title"
+        tabIndex={-1}
+      >
+        <div className="dialog-header">
+          <div>
+            <h2 id="merge-title">Story verbinden</h2>
+            <p className="dialog-kicker">Welche Story beschreibt denselben Zusammenhang?</p>
+          </div>
+          <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
+            ×
+          </button>
+        </div>
+        <div className="merge-list">
+          {bundles.map((bundle, bundleIndex) =>
+            bundleIndex === currentIndex ? null : (
+              <button type="button" key={bundle.bundleId} onClick={() => onSelect(bundleIndex)}>
+                <strong>{bundle.title}</strong>
+                <span>{bundle.emailIds.length} Nachrichten</span>
+              </button>
+            ),
+          )}
+        </div>
+      </section>
     </div>
   )
 }
@@ -1277,7 +1616,7 @@ function ReviewSetup({
 }
 
 function OverviewDrawer({
-  emails,
+  bundles,
   currentIndex,
   keptUnread,
   processedIds,
@@ -1287,7 +1626,7 @@ function OverviewDrawer({
   onDiscard,
   onSelect,
 }: {
-  emails: ReviewSnapshot['emails']
+  bundles: ReviewBundle[]
   currentIndex: number
   keptUnread: ReadonlySet<string>
   processedIds: ReadonlySet<string>
@@ -1321,8 +1660,8 @@ function OverviewDrawer({
           </button>
         </div>
         <ol className="overview-list">
-          {emails.map((item, itemIndex) => (
-            <li key={item.id}>
+          {bundles.map((bundle, itemIndex) => (
+            <li key={bundle.bundleId}>
               <button
                 type="button"
                 className={itemIndex === currentIndex ? 'current' : ''}
@@ -1330,13 +1669,26 @@ function OverviewDrawer({
               >
                 <span className="overview-index">{String(itemIndex + 1).padStart(2, '0')}</span>
                 <span className="overview-copy">
-                  <strong>{item.subject || '(Kein Betreff)'}</strong>
-                  <small>{addressLine(item.from)}</small>
+                  <strong>{bundle.title || '(Kein Betreff)'}</strong>
+                  <small>
+                    {bundle.emailIds.length}{' '}
+                    {bundle.emailIds.length === 1 ? 'Nachricht' : 'Nachrichten'} ·{' '}
+                    {bundle.timeline
+                      .map((item) => item.source)
+                      .filter(
+                        (source, sourceIndex, sources) => sources.indexOf(source) === sourceIndex,
+                      )
+                      .join(', ')}
+                  </small>
                 </span>
                 <span className="overview-marks">
-                  {processedIds.has(item.id) && <span className="processed-mark">bearbeitet</span>}
-                  {keptUnread.has(item.id) && <span className="unread-mark">ungelesen</span>}
-                  {secondaryActionIds.has(item.id) && (
+                  {bundle.emailIds.every((id) => processedIds.has(id)) && (
+                    <span className="processed-mark">bearbeitet</span>
+                  )}
+                  {bundle.emailIds.some((id) => keptUnread.has(id)) && (
+                    <span className="unread-mark">ungelesen</span>
+                  )}
+                  {bundle.emailIds.some((id) => secondaryActionIds.has(id)) && (
                     <span className="unsubscribe-mark">
                       {isSpamReview ? 'kein Spam' : 'abmelden'}
                     </span>
@@ -1385,13 +1737,13 @@ function HelpDialog({
             <dt>
               <kbd>←</kbd> <kbd>→</kbd>
             </dt>
-            <dd>Nachricht wechseln</dd>
+            <dd>Story wechseln</dd>
           </div>
           <div>
             <dt>
               <kbd>↑</kbd>
             </dt>
-            <dd>Ungelesen schützen</dd>
+            <dd>Ausgewähltes Original ungelesen schützen</dd>
           </div>
           <div>
             <dt>

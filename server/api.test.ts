@@ -4,16 +4,19 @@ import type {
   DraftResult,
   FinalizeResult,
   ReplyProposal,
+  ReviewBundleRun,
   ReviewEmail,
   ReviewOptions,
   ReviewSnapshot,
   ThreadContext,
 } from '../src/shared.ts'
 import { clearApiStateForTests, createApiMiddleware, safeCodexLoginUrl } from './api.ts'
+import { demoEmails } from './demo.ts'
 
 let server: Server
 let baseUrl = ''
 const retainedIds = new Set<string>()
+let injectUnknownBundleId = false
 
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
@@ -75,6 +78,15 @@ beforeAll(async () => {
         })
       },
     }),
+    bundleDecider: async () => ({
+      includedEmailIds: injectUnknownBundleId ? ['outside-frozen-snapshot'] : [],
+      kind: 'standalone',
+      title: 'Demo bundle',
+      currentState: 'Demo',
+      summary: 'Deterministic test decision.',
+      linkEvidence: [],
+      membershipConfidence: 1,
+    }),
   })
   server = createServer((request, response) => {
     void middleware(request, response, () => {
@@ -97,6 +109,7 @@ afterAll(async () => {
 beforeEach(() => {
   clearApiStateForTests()
   retainedIds.clear()
+  injectUnknownBundleId = false
 })
 
 describe('demo API contract', () => {
@@ -140,7 +153,7 @@ describe('demo API contract', () => {
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
     )
     expect(review.response.status).toBe(201)
-    expect(review.body.emails).toHaveLength(4)
+    expect(review.body.emails).toHaveLength(9)
     expect(review.body.emails[0]).not.toHaveProperty('html')
 
     const detail = await json<ReviewEmail>(
@@ -199,7 +212,7 @@ describe('demo API contract', () => {
       }),
     )
     expect(filtered.body.emails.map((email) => email.id)).not.toContain(viewed.id)
-    expect(filtered.body.emails).toHaveLength(3)
+    expect(filtered.body.emails).toHaveLength(8)
 
     const unfiltered = await json<ReviewSnapshot>(
       '/api/reviews',
@@ -236,6 +249,61 @@ describe('demo API contract', () => {
     )
     expect(rejected.response.status).toBe(403)
     expect(rejected.body.error.code).toBe('INVALID_CSRF')
+  })
+
+  it('builds an exact bundle partition and rejects unknown learning IDs', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const run = await json<ReviewBundleRun>(
+      `/api/reviews/${review.body.snapshotId}/bundles`,
+      post({}, review.body.csrfToken),
+    )
+    expect(run.response.status).toBe(200)
+    const bundledIds = run.body.bundles.flatMap((bundle) => bundle.emailIds)
+    expect(new Set(bundledIds)).toEqual(new Set(review.body.emails.map((email) => email.id)))
+    expect(bundledIds).toHaveLength(review.body.emails.length)
+    expect(
+      run.body.bundles.find((bundle) => bundle.emailIds.includes('demo-github-merged'))?.emailIds,
+    ).toEqual(
+      expect.arrayContaining([
+        'demo-github-opened',
+        'demo-github-merged',
+        'demo-railway-failed',
+        'demo-railway-success',
+      ]),
+    )
+    const rejected = await json<{ error: { code: string } }>(
+      `/api/reviews/${review.body.snapshotId}/bundle-labels`,
+      post(
+        {
+          anchorEmailIds: [review.body.emails[0]?.id],
+          candidateEmailIds: ['not-in-the-snapshot'],
+          label: 'split',
+        },
+        review.body.csrfToken,
+      ),
+    )
+    expect(rejected.response.status).toBe(400)
+    expect(rejected.body.error.code).toBe('UNKNOWN_EMAIL')
+  })
+
+  it('falls back to safe singletons when a bundle decision injects an unknown ID', async () => {
+    injectUnknownBundleId = true
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const run = await json<ReviewBundleRun>(
+      `/api/reviews/${review.body.snapshotId}/bundles`,
+      post({}, review.body.csrfToken),
+    )
+    expect(run.body.fallback).toBe(true)
+    expect(run.body.bundles).toHaveLength(review.body.emails.length)
+    expect(run.body.bundles.flatMap((bundle) => bundle.emailIds)).not.toContain(
+      'outside-frozen-snapshot',
+    )
   })
 
   it('builds reply context, proposes text, saves a draft, and exposes no send route', async () => {
@@ -324,6 +392,69 @@ describe('demo API contract', () => {
     expect(changed.body.error.code).toBe('FINALIZE_SELECTION_LOCKED')
   })
 
+  it('accepts and locks an exact completion selection larger than 250 messages', async () => {
+    const template = demoEmails.find((email) => email.id === 'demo-human')
+    expect(template).toBeDefined()
+    if (!template) return
+    const messages = Array.from({ length: 301 }, (_, index) => ({
+      ...template,
+      id: `bulk-${index}`,
+      threadId: `bulk-thread-${index}`,
+      subject: `Bulk message ${index}`,
+      messageId: [`bulk-${index}@example.test`],
+    }))
+    const localMiddleware = createApiMiddleware({ forceDemo: true, demoMessages: messages })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const createdResponse = await fetch(
+        `${localBase}/api/reviews`,
+        post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+      )
+      const created = (await createdResponse.json()) as ReviewSnapshot
+      expect(created.emails).toHaveLength(301)
+      const finalizeIds = created.emails.slice(0, 300).map((email) => email.id)
+      const finalResponse = await fetch(
+        `${localBase}/api/reviews/${created.snapshotId}/finalize`,
+        post(
+          { finalizeIds, keepUnreadIds: [finalizeIds[0]], secondaryActionIds: [] },
+          created.csrfToken,
+        ),
+      )
+      const finalized = (await finalResponse.json()) as FinalizeResult
+      expect(finalResponse.status).toBe(200)
+      expect(finalized).toMatchObject({
+        processed: 300,
+        keptUnread: 1,
+        markedRead: 299,
+        untouched: 1,
+      })
+      const changed = await fetch(
+        `${localBase}/api/reviews/${created.snapshotId}/finalize`,
+        post(
+          { finalizeIds: created.emails.map((email) => email.id), keepUnreadIds: [] },
+          created.csrfToken,
+        ),
+      )
+      expect(changed.status).toBe(409)
+      expect((await changed.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'FINALIZE_SELECTION_LOCKED' },
+      })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+    }
+  })
+
   it('rejects decisions for messages outside the partial completion selection', async () => {
     const review = await json<ReviewSnapshot>(
       '/api/reviews',
@@ -340,6 +471,22 @@ describe('demo API contract', () => {
     )
     expect(rejected.response.status).toBe(400)
     expect(rejected.body.error.code).toBe('INVALID_SELECTION')
+  })
+
+  it('never finalizes an ID outside the frozen snapshot', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const rejected = await json<{ error: { code: string } }>(
+      `/api/reviews/${review.body.snapshotId}/finalize`,
+      post(
+        { finalizeIds: ['new-mail-outside-snapshot'], keepUnreadIds: [] },
+        review.body.csrfToken,
+      ),
+    )
+    expect(rejected.response.status).toBe(400)
+    expect(rejected.body.error.code).toBe('UNKNOWN_EMAIL')
   })
 
   it('defers newsletter unsubscribe work as a mailbox label', async () => {

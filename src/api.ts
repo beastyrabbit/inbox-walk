@@ -6,6 +6,7 @@ import type {
   FinalizeResult,
   MailAddress,
   ReplyProposal,
+  ReviewBundleRun,
   ReviewEmail,
   ReviewFilters,
   ReviewOptions,
@@ -77,6 +78,28 @@ export const api = {
       await fetch(
         `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}`,
       ),
+    )
+  },
+  async bundles(snapshot: ReviewSnapshot) {
+    return post<ReviewBundleRun>(
+      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundles`,
+      {},
+      snapshot.csrfToken,
+    )
+  },
+  async bundleLabel(
+    snapshot: ReviewSnapshot,
+    body: {
+      anchorEmailIds: string[]
+      candidateEmailIds: string[]
+      label: 'merge' | 'split'
+      reason?: string
+    },
+  ) {
+    return post<{ recorded: boolean }>(
+      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundle-labels`,
+      body,
+      snapshot.csrfToken,
     )
   },
   async thread(snapshotId: string, threadId: string, emailId: string) {
