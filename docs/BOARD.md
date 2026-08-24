@@ -1,10 +1,10 @@
 # Release status
 
-Last updated: 2026-08-03
+Last updated: 2026-08-24
 
 ## Current release
 
-`v0.5.2` is the current usable release. It is deployed in kub-homelab at
+`v0.6.0` is the current usable release. It is deployed in kub-homelab at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 Forgejo publishes immutable images and Flux deploys the pinned release tag.
 
@@ -12,7 +12,10 @@ There are no active release blockers.
 
 ## Shipped
 
-- [x] Stable bounded JMAP unread snapshot and exact checkpoint resume.
+- [x] Complete paginated JMAP unread snapshot without a fixed message limit.
+- [x] Contextual review bundles for related repository, deployment, order, and carrier mail.
+- [x] Per-original keep-unread controls plus explicit merge, split, and learning feedback.
+- [x] Exact checkpoint resume for snapshot IDs, bundle groups, and review decisions.
 - [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.
 - [x] Safe remote-image proxying with authenticated same-origin iframe resources.
 - [x] Dedicated pre-review selection for normal mail or Spam with direct controls.

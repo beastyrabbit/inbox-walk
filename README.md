@@ -92,7 +92,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-The current usable release is `v0.5.2`, deployed at
+The current usable release is `v0.6.0`, deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

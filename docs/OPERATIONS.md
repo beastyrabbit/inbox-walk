@@ -2,7 +2,7 @@
 
 ## Current deployment
 
-- Release: `v0.5.2`
+- Release: `v0.6.0`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -14,7 +14,7 @@
 - Liveness: `GET /healthz`
 - Readiness: `GET /readyz`
 - Required live secret: `FASTMAIL_JMAP_TOKEN`
-- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record and `inbox-walk.sqlite`
+- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
 - Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
 - Inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
@@ -36,6 +36,10 @@ and the options request reconciles remaining IDs against Fastmail so messages
 read or deleted elsewhere do not inflate the count. Deleting only this database
 while the app is stopped resets that history; it does not change mail in
 Fastmail.
+
+`bundle-learning.sqlite` stores hashed relationship signals from explicit merge,
+split, and confirmation actions. It does not store message bodies, previews, or
+attachment content. The app retains at most 1,000 relationship labels.
 
 ## Deployment path
 
