@@ -16,14 +16,14 @@ function cleanAddresses(value: unknown): MailAddress[] {
     if (!candidate || typeof candidate !== 'object') return []
     const address = candidate as Record<string, unknown>
     if (
-      typeof address.name !== 'string' ||
-      address.name.length > 320 ||
+      (address.name !== null && typeof address.name !== 'string') ||
+      (typeof address.name === 'string' && address.name.length > 320) ||
       typeof address.email !== 'string' ||
       address.email.length > 320
     ) {
       return []
     }
-    return [{ name: address.name, email: address.email }]
+    return [{ name: address.name ?? '', email: address.email }]
   })
 }
 

@@ -160,6 +160,7 @@ export interface ApiOptions {
   autoStartBundles?: boolean
   bundleCallLimit?: number
   bundleDecider?: DecideBundle
+  bundleFallback?: typeof singletonBundleRun
   bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
@@ -1205,6 +1206,7 @@ function applyBundleProgress(
 
 function startBundleJob(snapshotId: string, snapshot: StoredSnapshot, apiOptions: ApiOptions) {
   if (snapshot.bundleRun || bundleJobs.has(snapshotId)) return
+  const fallback = apiOptions.bundleFallback ?? singletonBundleRun
   const emails = snapshot.emailIds
     .map((id) => snapshot.summaries.get(id))
     .filter((email): email is ReviewEmailSummary => Boolean(email))
@@ -1346,7 +1348,7 @@ function startBundleJob(snapshotId: string, snapshot: StoredSnapshot, apiOptions
         })}\n`,
       )
       snapshot.analysis = { ...snapshot.analysis, error: publicBundleFailure(error) }
-      snapshot.bundleRun = singletonBundleRun(snapshotId, emails, {
+      snapshot.bundleRun = fallback(snapshotId, emails, {
         codexCallCount: snapshot.analysis.callCount,
         ...(model ? { model } : {}),
         onProgress: (progress) =>
@@ -1377,24 +1379,48 @@ function startBundleJob(snapshotId: string, snapshot: StoredSnapshot, apiOptions
           message: error instanceof Error ? error.message : 'unknown',
         })}\n`,
       )
-      snapshot.analysis = {
-        ...snapshot.analysis,
-        engine: 'fallback',
-        error: publicBundleFailure(error),
-        phase: 'complete',
-        progress: 1,
-        status: 'complete',
-      }
-      snapshot.bundleRun = singletonBundleRun(snapshotId, emails)
-      if (apiOptions.roundStore) {
-        const persisted = persistAnalysisUpdate('bundle_emergency_fallback_persist_failed', () =>
-          apiOptions.roundStore?.saveBundleRun(
-            snapshotId,
-            snapshot.bundleRun as ReviewBundleRun,
-            snapshot.analysis,
-          ),
+      try {
+        snapshot.analysis = {
+          ...snapshot.analysis,
+          engine: 'fallback',
+          error: publicBundleFailure(error),
+          phase: 'complete',
+          progress: 1,
+          status: 'complete',
+        }
+        snapshot.bundleRun = fallback(snapshotId, emails)
+        if (apiOptions.roundStore) {
+          const persisted = persistAnalysisUpdate('bundle_emergency_fallback_persist_failed', () =>
+            apiOptions.roundStore?.saveBundleRun(
+              snapshotId,
+              snapshot.bundleRun as ReviewBundleRun,
+              snapshot.analysis,
+            ),
+          )
+          if (!persisted) markAnalysisPersistenceFailure(snapshot)
+        }
+      } catch (fallbackError) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'bundle_emergency_fallback_failed',
+            message: fallbackError instanceof Error ? fallbackError.message : 'unknown',
+          })}\n`,
         )
-        if (!persisted) markAnalysisPersistenceFailure(snapshot)
+        snapshot.bundleRun = undefined
+        snapshot.analysis = {
+          ...snapshot.analysis,
+          engine: 'fallback',
+          error:
+            'Die Analyse ist fehlgeschlagen. Die gespeicherte Runde kann nach einem Neustart erneut geladen werden.',
+          phase: 'waiting',
+          progress: 0,
+          status: 'pending',
+        }
+        if (apiOptions.roundStore) {
+          persistAnalysisUpdate('bundle_terminal_error_persist_failed', () =>
+            apiOptions.roundStore?.updateAnalysis(snapshotId, snapshot.analysis),
+          )
+        }
       }
     })
     .finally(() => bundleJobs.delete(snapshotId))

@@ -40,12 +40,17 @@ interface BodyPart {
   type: string
 }
 
+interface JmapMailAddress {
+  email: string
+  name?: string | null
+}
+
 interface JmapEmail {
   attachments?: BodyPart[]
   bodyStructure?: BodyPart
   bodyValues?: Record<string, { isTruncated?: boolean; value: string }>
-  cc?: MailAddress[] | null
-  from?: MailAddress[] | null
+  cc?: JmapMailAddress[] | null
+  from?: JmapMailAddress[] | null
   hasAttachment?: boolean
   htmlBody?: BodyPart[]
   id: string
@@ -55,12 +60,12 @@ interface JmapEmail {
   preview?: string
   receivedAt: string
   references?: string[] | null
-  replyTo?: MailAddress[] | null
+  replyTo?: JmapMailAddress[] | null
   sentAt?: string | null
   subject?: string | null
   textBody?: BodyPart[]
   threadId: string
-  to?: MailAddress[] | null
+  to?: JmapMailAddress[] | null
   'header:List-Id:asText'?: string | null
   'header:List-Unsubscribe:asURLs'?: string[] | null
   'header:List-Unsubscribe-Post:asText'?: string | null
@@ -270,14 +275,23 @@ function isNewsletter(email: JmapEmail) {
   )
 }
 
+function normalizeJmapAddresses(
+  addresses: readonly JmapMailAddress[] | null | undefined,
+): MailAddress[] {
+  return (addresses ?? []).map((address) => ({
+    email: address.email,
+    name: address.name ?? '',
+  }))
+}
+
 function summary(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmailSummary {
   return {
     id: email.id,
     threadId: email.threadId,
     subject: email.subject?.trim() || '(Kein Betreff)',
     receivedAt: email.receivedAt,
-    from: email.from ?? [],
-    to: email.to ?? [],
+    from: normalizeJmapAddresses(email.from),
+    to: normalizeJmapAddresses(email.to),
     preview: email.preview ?? '',
     mailboxNames: assignedMailboxes(email, mailboxes).map((mailbox) => mailbox.name),
     hasAttachment: Boolean(email.hasAttachment),
@@ -578,8 +592,8 @@ function detail(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmail 
     .filter((partId): partId is string => Boolean(partId))
   return {
     ...summary(email, mailboxes),
-    cc: email.cc ?? [],
-    replyTo: email.replyTo ?? [],
+    cc: normalizeJmapAddresses(email.cc),
+    replyTo: normalizeJmapAddresses(email.replyTo),
     messageId: email.messageId ?? [],
     inReplyTo: email.inReplyTo ?? [],
     references: email.references ?? [],
@@ -829,7 +843,7 @@ export async function downloadBlob(
   return response
 }
 
-function normalizedAddresses(addresses: MailAddress[]) {
+function normalizedAddresses(addresses: readonly { email: string }[]) {
   return addresses
     .map((address) => address.email.trim().toLowerCase())
     .sort()

@@ -94,6 +94,21 @@ describe('contextual bundle builder', () => {
     ).toHaveLength(1)
   })
 
+  it('keeps signal extraction and the emergency fallback safe for null sender names', () => {
+    const legacyEmail = mail('1', 'Plain notice', 'Fallback notice')
+    legacyEmail.from = [
+      { name: null, email: 'notify@example.test' },
+    ] as unknown as ReviewEmailSummary['from']
+
+    expect(extractBundleSignals(legacyEmail).provider).toBe('example.test')
+    expect(learningSignalsFor([legacyEmail])).toContain(hashLearningSignal('provider:example.test'))
+    expect(() => singletonBundleRun('snapshot', [legacyEmail])).not.toThrow()
+    expect(singletonBundleRun('snapshot', [legacyEmail])).toMatchObject({
+      bundles: [{ timeline: [{ source: 'example.test' }] }],
+      fallback: true,
+    })
+  })
+
   it('prejoins exact keys, preserves exclusions, and partitions every message once', async () => {
     const emails = [
       mail('1', '[beasty/inbox-walk] PR #184 merged', 'Commit 7d2c1fa'),

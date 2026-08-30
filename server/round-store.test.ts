@@ -326,6 +326,50 @@ describe('SQLite review round store', () => {
     inspected.close()
   })
 
+  it('normalizes null address names from legacy persisted rounds and reply drafts', () => {
+    const databasePath = createDatabasePath()
+    const { store } = createRound(databasePath)
+    store.close()
+
+    const legacy = new DatabaseSync(databasePath)
+    legacy
+      .prepare(
+        'UPDATE review_round_message SET from_json = ?, to_json = ? WHERE round_id = ? AND email_id = ?',
+      )
+      .run(
+        JSON.stringify([{ email: 'alice@example.com', name: null }]),
+        JSON.stringify([{ email: 'me@example.com', name: null }]),
+        'round-1',
+        'mail-1',
+      )
+    legacy
+      .prepare('UPDATE review_round_user_state SET reply_drafts_json = ? WHERE round_id = ?')
+      .run(
+        JSON.stringify({
+          'mail-1': {
+            ...replyDraft,
+            cc: [{ email: 'copy@example.com', name: null }],
+            to: [{ email: 'alice@example.com', name: null }],
+          },
+        }),
+        'round-1',
+      )
+    legacy.close()
+
+    const reopened = createRoundStore(databasePath)
+    const restored = reopened.get('round-1')
+
+    expect(restored?.emails[0]?.from).toEqual([{ email: 'alice@example.com', name: '' }])
+    expect(restored?.emails[0]?.to).toEqual([{ email: 'me@example.com', name: '' }])
+    expect(restored?.userState.replyDrafts['mail-1']?.cc).toEqual([
+      { email: 'copy@example.com', name: '' },
+    ])
+    expect(restored?.userState.replyDrafts['mail-1']?.to).toEqual([
+      { email: 'alice@example.com', name: '' },
+    ])
+    reopened.close()
+  })
+
   it('bounds and hashes the learning corpus before writing it to the round database', () => {
     const databasePath = createDatabasePath()
     const store = createRoundStore(databasePath)

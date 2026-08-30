@@ -449,6 +449,67 @@ describe('demo API contract', () => {
     expect(rejectedFallback.body.error.code).toBe('ANALYSIS_ALREADY_COMPLETE')
   })
 
+  it('keeps the process alive when both bundle fallback layers fail', async () => {
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: true,
+      bundleDecider: async () => {
+        throw new Error('Primary bundle analysis failed')
+      },
+      bundleFallback: () => {
+        throw new Error('Emergency fallback failed')
+      },
+      demoMessages: [
+        source,
+        {
+          ...source,
+          id: `${source.id}-related`,
+          messageId: [`${source.id}-related@example.test`],
+        },
+      ],
+      forceDemo: true,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const created = (await (
+        await fetch(
+          `${localBase}/api/reviews`,
+          post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+        )
+      ).json()) as ReviewSnapshot
+
+      await waitForApiJobs()
+      const recovered = (await (
+        await fetch(`${localBase}/api/reviews/${created.snapshotId}`)
+      ).json()) as ReviewSnapshot
+
+      expect(recovered.bundleRun).toBeUndefined()
+      expect(recovered.analysis).toMatchObject({
+        engine: 'fallback',
+        phase: 'waiting',
+        progress: 0,
+        status: 'pending',
+      })
+      expect(recovered.analysis.error).toContain('gespeicherte Runde')
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      clearApiStateForTests()
+    }
+  })
+
   it('rejects the explicit fallback immediately while Codex analysis is running', async () => {
     bundleDecisionGate = new Promise<void>((resolve) => {
       releaseBundleDecision = resolve

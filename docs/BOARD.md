@@ -4,7 +4,7 @@ Last updated: 2026-08-30
 
 ## Current release
 
-`v0.7.0` is the current usable release. It is deployed in kub-homelab at
+`v0.7.1` is the current usable release. It is deployed in kub-homelab at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 Forgejo publishes immutable images and Flux deploys the pinned release tag.
 
@@ -16,6 +16,7 @@ There are no active release blockers.
 - [x] Contextual review bundles for related repository, deployment, order, and carrier mail.
 - [x] Per-original keep-unread controls plus explicit merge, split, and learning feedback.
 - [x] Durable review rounds with stable URLs, persisted bundle analysis, decisions, and finalization.
+- [x] Null-safe Fastmail address normalization and resilient gateway error handling.
 - [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.
 - [x] Safe remote-image proxying with authenticated same-origin iframe resources.
 - [x] Dedicated pre-review selection for normal mail or Spam with direct controls.
@@ -39,5 +40,7 @@ There are no active release blockers.
 
 ## Deferred until needed
 
+- [ ] Move round creation into a persistent background Run with status, ready-to-open gating,
+  restart recovery, and an explicit backend cancel/delete action.
 - [ ] Add operational metrics only if live troubleshooting shows a concrete need.
 - [ ] Reassess the broad personal-runner trust boundary if repository collaboration expands.

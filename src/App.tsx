@@ -1386,9 +1386,9 @@ function App() {
           className="state-page analysis-page"
           aria-busy={snapshot.analysis.status !== 'complete'}
         >
-          {snapshot.analysis.status !== 'complete' && !waitingForCodex && (
-            <div className="spinner" aria-hidden="true" />
-          )}
+          {snapshot.analysis.status !== 'complete' &&
+            !snapshot.analysis.error &&
+            !waitingForCodex && <div className="spinner" aria-hidden="true" />}
           <p className="analysis-origin">{analysisOrigin(snapshot.analysis)}</p>
           <h1>
             {waitingForCodex ? 'Codex-Anmeldung erforderlich' : 'Zusammenhänge werden analysiert'}

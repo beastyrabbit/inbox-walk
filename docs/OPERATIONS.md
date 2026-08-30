@@ -2,7 +2,7 @@
 
 ## Current deployment
 
-- Release: `v0.7.0`
+- Release: `v0.7.1`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`

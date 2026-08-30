@@ -139,19 +139,19 @@ function unique(values: Iterable<string>) {
 }
 
 function senderDomain(email: ReviewEmailSummary) {
-  return email.from[0]?.email.split('@').at(-1)?.toLowerCase() ?? ''
+  return email.from[0]?.email?.split('@').at(-1)?.toLowerCase() ?? ''
 }
 
 function providerFor(email: ReviewEmailSummary) {
   const haystack = normalized(
-    `${email.from.map((item) => `${item.name} ${item.email}`).join(' ')} ${email.subject}`,
+    `${email.from.map((item) => `${item.name ?? ''} ${item.email ?? ''}`).join(' ')} ${email.subject}`,
   )
   if (/github/.test(haystack)) return 'GitHub'
   if (/railway/.test(haystack)) return 'Railway'
   if (/amazon/.test(haystack)) return 'Amazon'
   if (/\bdhl\b/.test(haystack)) return 'DHL'
   if (/hermes/.test(haystack)) return 'Hermes'
-  return email.from[0]?.name.trim() || senderDomain(email) || 'E-Mail'
+  return email.from[0]?.name?.trim() || senderDomain(email) || 'E-Mail'
 }
 
 function matches(text: string, pattern: RegExp, prefix: string) {

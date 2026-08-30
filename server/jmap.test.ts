@@ -457,6 +457,43 @@ describe('Fastmail JMAP adapter', () => {
     expect(detail.bodyTruncated).toBe(false)
   })
 
+  it('normalizes null JMAP address names at the adapter boundary', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      jmapResponse([
+        [
+          'Email/get',
+          {
+            list: [
+              {
+                id: 'mail-null-names',
+                threadId: 'thread-null-names',
+                mailboxIds: { inbox: true },
+                receivedAt: '2026-08-30T10:00:00Z',
+                from: [{ name: null, email: 'sender@example.test' }],
+                to: [{ name: null, email: 'recipient@example.test' }],
+                cc: [{ name: null, email: 'copy@example.test' }],
+                replyTo: [{ name: null, email: 'reply@example.test' }],
+                subject: 'Null display names',
+                bodyValues: {},
+              },
+            ],
+          },
+          'emails',
+        ],
+      ]),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    const detail = await fetchEmailDetail(draftContext, 'token', 'mail-null-names', [
+      { id: 'inbox', name: 'Inbox', role: 'inbox' },
+    ])
+
+    expect(detail.from).toEqual([{ name: '', email: 'sender@example.test' }])
+    expect(detail.to).toEqual([{ name: '', email: 'recipient@example.test' }])
+    expect(detail.cc).toEqual([{ name: '', email: 'copy@example.test' }])
+    expect(detail.replyTo).toEqual([{ name: '', email: 'reply@example.test' }])
+  })
+
   it('uses an Email/set keyword patch and reports individual failures', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValueOnce(
       jmapResponse([

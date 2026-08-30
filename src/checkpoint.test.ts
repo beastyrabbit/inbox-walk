@@ -107,7 +107,7 @@ describe('local review checkpoint', () => {
             revisionInstruction: '',
             roughNotes: '',
             subject: 'Re: Test',
-            to: [{ email: 'partial@', name: '' }],
+            to: [{ email: 'partial@', name: null }],
           },
         },
       }),
@@ -118,6 +118,9 @@ describe('local review checkpoint', () => {
     expect(stored).not.toContain('attachmentContent')
     expect(stored).not.toContain('injectedField')
     expect(stored).toContain('Eigener Entwurf')
+    expect(firstMount).toMatchObject({
+      replyDrafts: { 'mail-1': { to: [{ email: 'partial@', name: '' }] } },
+    })
 
     vi.resetModules()
     const freshDocument = await import('./checkpoint.ts')

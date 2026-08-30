@@ -226,6 +226,8 @@ interface FinalizationRow {
   updated_at: string
 }
 
+type PersistedMailAddress = Omit<MailAddress, 'name'> & { name?: string | null }
+
 function assertNonNegativeInteger(value: number, label: string) {
   if (!Number.isSafeInteger(value) || value < 0) {
     throw new RangeError(`${label} must be a non-negative safe integer.`)
@@ -283,8 +285,8 @@ export function cleanBundleExamples(value: unknown): BundleExample[] {
   return examples
 }
 
-function cleanAddress(address: MailAddress): MailAddress {
-  return { email: address.email, name: address.name }
+function cleanAddress(address: PersistedMailAddress): MailAddress {
+  return { email: address.email, name: address.name ?? '' }
 }
 
 function cleanSummary(email: ReviewEmailSummary): ReviewEmailSummary {
@@ -814,7 +816,9 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       index: Number(row.current_index),
       keptUnreadIds: jsonParse<string[]>(row.kept_unread_ids_json),
       processedIds: jsonParse<string[]>(row.processed_ids_json),
-      replyDrafts: jsonParse<Record<string, ReplyEditorState>>(row.reply_drafts_json),
+      replyDrafts: cleanReplyDrafts(
+        jsonParse<Record<string, ReplyEditorState>>(row.reply_drafts_json),
+      ),
       revision: Number(row.revision),
       secondaryActionIds: jsonParse<string[]>(row.secondary_action_ids_json),
       selectedMemberId: row.selected_member_id,
@@ -842,7 +846,7 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     const row = selectRound.get(roundId) as RoundRow | undefined
     if (!row) return null
     const emails = (selectMessages.all(roundId) as unknown as MessageRow[]).map((message) => ({
-      from: jsonParse<MailAddress[]>(message.from_json),
+      from: jsonParse<PersistedMailAddress[]>(message.from_json).map(cleanAddress),
       hasAttachment: Boolean(message.has_attachment),
       id: message.email_id,
       isNewsletter: Boolean(message.is_newsletter),
@@ -851,7 +855,7 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       receivedAt: message.received_at,
       subject: message.subject,
       threadId: message.thread_id,
-      to: jsonParse<MailAddress[]>(message.to_json),
+      to: jsonParse<PersistedMailAddress[]>(message.to_json).map(cleanAddress),
     }))
     const bundle = selectBundleRun.get(roundId) as { run_json: string } | undefined
     return {
