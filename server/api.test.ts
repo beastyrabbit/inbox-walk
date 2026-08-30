@@ -1040,6 +1040,66 @@ describe('demo API contract', () => {
     })
   })
 
+  it('persists incomplete recipient input but rejects it at draft creation', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const emailId = created.body.emails.find((email) => email.id === 'demo-human')?.id
+    expect(emailId).toBeDefined()
+    if (!emailId) return
+    const replyEditor = {
+      bodyText: 'Antworttext',
+      cc: [{ name: '', email: 'team@' }],
+      identityId: 'demo-identity',
+      revisionInstruction: '',
+      roughNotes: '',
+      subject: 'Re: Test',
+      to: [{ name: '', email: 'alex@' }],
+    }
+    const state = await json<ReviewSnapshot['userState']>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post(
+        {
+          revision: 0,
+          state: {
+            bundleGroups: [],
+            index: 0,
+            keptUnreadIds: [],
+            processedIds: [],
+            replyDrafts: { [emailId]: replyEditor },
+            secondaryActionIds: [],
+            selectedMemberId: emailId,
+          },
+        },
+        created.body.csrfToken,
+      ),
+    )
+    expect(state.response.status).toBe(200)
+
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(restored.body.userState.replyDrafts[emailId]).toEqual(replyEditor)
+
+    const draft = await json<{ error: { code: string } }>(
+      `/api/reviews/${created.body.snapshotId}/drafts`,
+      post(
+        {
+          bodyText: replyEditor.bodyText,
+          cc: replyEditor.cc,
+          emailId,
+          identityId: replyEditor.identityId,
+          requestId: crypto.randomUUID(),
+          subject: replyEditor.subject,
+          to: replyEditor.to,
+        },
+        restored.body.csrfToken,
+      ),
+    )
+    expect(draft.response.status).toBe(400)
+    expect(draft.body.error.code).toBe('INVALID_DRAFT')
+  })
+
   it('does not let a stale tab finalize over newer persisted decisions', async () => {
     const created = await json<ReviewSnapshot>(
       '/api/reviews',

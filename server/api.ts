@@ -100,16 +100,20 @@ const filtersSchema = z.object({
 const codexModelSchema = z.object({ model: z.custom<CodexModelId>(isCodexModelId) })
 
 const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
+const replyEditorAddressSchema = z.object({
+  name: z.string().max(320),
+  email: z.string().max(320),
+})
 
 const replyEditorSchema = z.object({
   bodyText: z.string().max(256_000),
-  cc: z.array(addressSchema).max(100),
+  cc: z.array(replyEditorAddressSchema).max(100),
   draftRequestId: z.string().uuid().optional(),
   identityId: z.string().max(512),
   revisionInstruction: z.string().max(64_000),
   roughNotes: z.string().max(64_000),
   subject: z.string().max(998),
-  to: z.array(addressSchema).max(100),
+  to: z.array(replyEditorAddressSchema).max(100),
 })
 
 interface StoredSnapshot {

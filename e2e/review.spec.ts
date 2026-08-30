@@ -344,6 +344,27 @@ test('debounces typed reply state and creates a draft without a send action', as
   expect(stateWrites).toBeLessThanOrEqual(3)
 })
 
+test('persists incomplete reply recipients without blocking the round', async ({ page }) => {
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  const saved = page.waitForResponse(
+    (response) =>
+      /\/api\/reviews\/[^/]+\/state$/.test(new URL(response.url()).pathname) &&
+      Boolean(response.request().postData()?.includes('alex@')),
+  )
+  await page.getByRole('textbox', { name: 'An', exact: true }).fill('alex@')
+  await page.getByRole('textbox', { name: 'Cc', exact: true }).fill('Team <team@')
+  expect((await saved).status()).toBe(200)
+  await expect(
+    page.getByRole('heading', { name: 'Rundenstand konnte nicht gespeichert werden' }),
+  ).toHaveCount(0)
+
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(page.getByRole('textbox', { name: 'An', exact: true })).toHaveValue('alex@')
+  await expect(page.getByRole('textbox', { name: 'Cc', exact: true })).toHaveValue('Team <team@')
+})
+
 test('flushes pending reply notes before leaving and resuming the round', async ({ page }) => {
   const notes = 'Diese noch ungespeicherten Stichpunkte müssen einen sofortigen Wechsel überleben.'
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
