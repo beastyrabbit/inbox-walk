@@ -22,7 +22,7 @@ Fastmail.
 - Keeps selected messages unread and marks the rest read only after confirmation.
 - Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.
 - Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
-- Loads the complete bounded thread before preparing a reply.
+- Loads up to 100 messages from the selected reply thread; this limit does not cap a review round.
 - Sends every supported image to Codex and extracts every supported document through Apache Tika.
 - Selects Sol, Terra, or Luna for new Codex work without restarting the app.
 - Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
@@ -121,7 +121,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-The current usable release is `v0.6.1`, deployed at
+The current usable release is `v0.7.0`, deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

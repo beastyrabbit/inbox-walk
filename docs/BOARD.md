@@ -1,10 +1,10 @@
 # Release status
 
-Last updated: 2026-08-24
+Last updated: 2026-08-30
 
 ## Current release
 
-`v0.6.1` is the current usable release. It is deployed in kub-homelab at
+`v0.7.0` is the current usable release. It is deployed in kub-homelab at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 Forgejo publishes immutable images and Flux deploys the pinned release tag.
 
