@@ -346,11 +346,14 @@ test('debounces typed reply state and creates a draft without a send action', as
 
 test('persists incomplete reply recipients without blocking the round', async ({ page }) => {
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
-  const saved = page.waitForResponse(
-    (response) =>
+  const saved = page.waitForResponse((response) => {
+    const body = response.request().postData() ?? ''
+    return (
       /\/api\/reviews\/[^/]+\/state$/.test(new URL(response.url()).pathname) &&
-      Boolean(response.request().postData()?.includes('alex@')),
-  )
+      body.includes('alex@') &&
+      body.includes('Team <team@')
+    )
+  })
   await page.getByRole('textbox', { name: 'An', exact: true }).fill('alex@')
   await page.getByRole('textbox', { name: 'Cc', exact: true }).fill('Team <team@')
   expect((await saved).status()).toBe(200)
@@ -363,6 +366,66 @@ test('persists incomplete reply recipients without blocking the round', async ({
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await expect(page.getByRole('textbox', { name: 'An', exact: true })).toHaveValue('alex@')
   await expect(page.getByRole('textbox', { name: 'Cc', exact: true })).toHaveValue('Team <team@')
+})
+
+test('keeps a legacy round recoverable when its server migration fails', async ({ page }) => {
+  await page.evaluate(() => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [],
+        emailIds: ['demo-human', 'demo-train'],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: ['demo-human'],
+        processedIds: ['demo-human'],
+        secondaryActionIds: [],
+        replyDrafts: {},
+      }),
+    )
+  })
+  await page.goto('/')
+  await page.route('**/api/reviews/*/state', async (route) => {
+    await route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: {
+          code: 'ROUND_PERSIST_FAILED',
+          message: 'Der Rundenstand konnte nicht dauerhaft gespeichert werden.',
+          retryable: true,
+        },
+      }),
+    })
+  })
+  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+  await expect(
+    page.getByText('Der Rundenstand konnte nicht dauerhaft gespeichert werden.'),
+  ).toBeVisible()
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? '{}').version,
+    ),
+  ).toBe(6)
+
+  await page.reload()
+  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
+  await page.unroute('**/api/reviews/*/state')
+  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
+  await expect(page).toHaveURL(/\/rounds\/[0-9a-f-]+$/)
+  expect(
+    await page.evaluate(
+      () => JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? '{}').version,
+    ),
+  ).toBe(7)
 })
 
 test('flushes pending reply notes before leaving and resuming the round', async ({ page }) => {

@@ -1,13 +1,70 @@
 import type {
   LegacyReviewCheckpoint,
   LoadedReviewCheckpoint,
+  MailAddress,
   ReplyEditorState,
   ReviewCheckpoint,
-  ReviewFilters,
 } from './shared.ts'
 
 const KEY = 'inbox-walk:checkpoint:v1'
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 let volatileLegacyCheckpoint: LegacyReviewCheckpoint | null = null
+
+function cleanAddresses(value: unknown): MailAddress[] {
+  if (!Array.isArray(value)) return []
+  return value.slice(0, 100).flatMap((candidate) => {
+    if (!candidate || typeof candidate !== 'object') return []
+    const address = candidate as Record<string, unknown>
+    if (
+      typeof address.name !== 'string' ||
+      address.name.length > 320 ||
+      typeof address.email !== 'string' ||
+      address.email.length > 320
+    ) {
+      return []
+    }
+    return [{ name: address.name, email: address.email }]
+  })
+}
+
+function cleanReplyDrafts(value: unknown): Record<string, ReplyEditorState> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([emailId, candidate]) => {
+      if (!emailId || !candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
+        return []
+      }
+      const draft = candidate as Record<string, unknown>
+      if (
+        typeof draft.bodyText !== 'string' ||
+        draft.bodyText.length > 256_000 ||
+        typeof draft.identityId !== 'string' ||
+        draft.identityId.length > 512 ||
+        typeof draft.revisionInstruction !== 'string' ||
+        draft.revisionInstruction.length > 64_000 ||
+        typeof draft.roughNotes !== 'string' ||
+        draft.roughNotes.length > 64_000 ||
+        typeof draft.subject !== 'string' ||
+        draft.subject.length > 998
+      ) {
+        return []
+      }
+      const clean: ReplyEditorState = {
+        bodyText: draft.bodyText,
+        cc: cleanAddresses(draft.cc),
+        identityId: draft.identityId,
+        revisionInstruction: draft.revisionInstruction,
+        roughNotes: draft.roughNotes,
+        subject: draft.subject,
+        to: cleanAddresses(draft.to),
+      }
+      if (typeof draft.draftRequestId === 'string' && UUID_PATTERN.test(draft.draftRequestId)) {
+        clean.draftRequestId = draft.draftRequestId
+      }
+      return [[emailId, clean]]
+    }),
+  )
+}
 
 export function loadCheckpoint(): LoadedReviewCheckpoint | null {
   try {
@@ -18,10 +75,6 @@ export function loadCheckpoint(): LoadedReviewCheckpoint | null {
       volatileLegacyCheckpoint = null
       return { version: 7, roundId: value.roundId }
     }
-    // Legacy checkpoints contain message IDs and, in some versions, full draft text.
-    // Keep the parsed value in memory just long enough to migrate it, but remove the
-    // durable browser copy immediately. A successful migration writes back only v7.
-    localStorage.removeItem(KEY)
     if (
       (value.version !== 1 &&
         value.version !== 2 &&
@@ -35,8 +88,10 @@ export function loadCheckpoint(): LoadedReviewCheckpoint | null {
       typeof value.index !== 'number'
     ) {
       volatileLegacyCheckpoint = null
+      localStorage.removeItem(KEY)
       return null
     }
+    const filters = value.filters as Record<string, unknown>
     volatileLegacyCheckpoint = {
       version: 6,
       bundleGroups: Array.isArray(value.bundleGroups)
@@ -47,10 +102,17 @@ export function loadCheckpoint(): LoadedReviewCheckpoint | null {
         : [],
       emailIds: value.emailIds.filter((id): id is string => typeof id === 'string'),
       filters: {
-        ...(value.filters as Omit<ReviewFilters, 'hideReviewed' | 'spam'>),
-        hideReviewed: (value.filters as Partial<ReviewFilters>).hideReviewed === true,
-        spam:
-          (value.filters as Partial<ReviewFilters>).spam === 'only' ? 'only' : ('exclude' as const),
+        hideReviewed: filters.hideReviewed === true,
+        mailboxId: typeof filters.mailboxId === 'string' ? filters.mailboxId : null,
+        newsletter:
+          filters.newsletter === 'exclude' || filters.newsletter === 'only'
+            ? filters.newsletter
+            : 'all',
+        spam: filters.spam === 'only' ? 'only' : 'exclude',
+        timeRange:
+          filters.timeRange === '24h' || filters.timeRange === '7d' || filters.timeRange === '30d'
+            ? filters.timeRange
+            : 'all',
       },
       index: value.version === 6 ? Math.max(0, Math.floor(value.index)) : 0,
       keptUnreadIds: value.keptUnreadIds.filter((id): id is string => typeof id === 'string'),
@@ -64,8 +126,16 @@ export function loadCheckpoint(): LoadedReviewCheckpoint | null {
               (id): id is string => typeof id === 'string',
             ) as string[])
           : [],
-      replyDrafts: (value.replyDrafts ?? {}) as Record<string, ReplyEditorState>,
+      replyDrafts: cleanReplyDrafts(value.replyDrafts),
     } satisfies LegacyReviewCheckpoint
+    // Keep a sanitized migration record until the server has accepted the round and
+    // saveCheckpoint replaces it with the opaque v7 pointer. This survives a reload
+    // or a transient migration failure without retaining unknown legacy fields.
+    try {
+      localStorage.setItem(KEY, JSON.stringify(volatileLegacyCheckpoint))
+    } catch {
+      // The original checkpoint remains available when storage is temporarily unwritable.
+    }
     return volatileLegacyCheckpoint
   } catch {
     volatileLegacyCheckpoint = null

@@ -73,13 +73,17 @@ describe('local review checkpoint', () => {
     const checkpoint = loadCheckpoint()
     expect(checkpoint?.version).toBe(6)
     if (checkpoint?.version === 6) expect(checkpoint.emailIds).toEqual(emailIds)
-    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBeNull()
+    expect(JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? '{}')).toMatchObject({
+      version: 6,
+      emailIds,
+    })
   })
 
-  it('keeps a parsed legacy checkpoint in memory across a StrictMode remount', () => {
+  it('keeps a sanitized legacy checkpoint across a fresh document load', async () => {
     localStorage.setItem(
       'inbox-walk:checkpoint:v1',
       JSON.stringify({
+        attachmentContent: 'must-not-survive',
         version: 6,
         bundleGroups: [['mail-1']],
         emailIds: ['mail-1'],
@@ -94,16 +98,34 @@ describe('local review checkpoint', () => {
         keptUnreadIds: [],
         processedIds: [],
         secondaryActionIds: [],
-        replyDrafts: {},
+        replyDrafts: {
+          'mail-1': {
+            bodyText: 'Eigener Entwurf',
+            cc: [],
+            identityId: 'identity-1',
+            injectedField: 'must-not-survive',
+            revisionInstruction: '',
+            roughNotes: '',
+            subject: 'Re: Test',
+            to: [{ email: 'partial@', name: '' }],
+          },
+        },
       }),
     )
 
     const firstMount = loadCheckpoint()
-    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBeNull()
-    expect(loadCheckpoint()).toEqual(firstMount)
+    const stored = localStorage.getItem('inbox-walk:checkpoint:v1') ?? ''
+    expect(stored).not.toContain('attachmentContent')
+    expect(stored).not.toContain('injectedField')
+    expect(stored).toContain('Eigener Entwurf')
+
+    vi.resetModules()
+    const freshDocument = await import('./checkpoint.ts')
+    expect(freshDocument.loadCheckpoint()).toEqual(firstMount)
 
     saveCheckpoint({ version: 7, roundId: 'migrated-round' })
     expect(loadCheckpoint()).toEqual({ version: 7, roundId: 'migrated-round' })
+    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).not.toContain('Eigener Entwurf')
   })
 
   it('removes invalid and explicitly cleared checkpoints', () => {
@@ -179,6 +201,9 @@ describe('local review checkpoint', () => {
       processedIds: [],
       secondaryActionIds: ['mail-1'],
     })
-    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBeNull()
+    expect(JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? '{}')).toMatchObject({
+      version: 6,
+      secondaryActionIds: ['mail-1'],
+    })
   })
 })
