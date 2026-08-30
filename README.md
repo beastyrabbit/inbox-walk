@@ -79,6 +79,10 @@ is never run again. `CODEX_BUNDLE_MAX_CALLS` limits provider calls per round and
 defaults to 64. The resolved limit is frozen with the round, so a configuration
 change during a restart cannot change an in-progress analysis. Reaching the
 limit falls back to the safe individual-message view.
+If a started Codex run later needs a new login, the saved round waits instead
+of silently changing engines. You can reconnect Codex or explicitly finish
+that round in the safe individual-message view; that choice is persisted and
+Codex will not restart for the round.
 
 `DATA_DIR/inbox-walk.sqlite` stores review rounds with their fixed IDs, filters,
 mail summaries, frozen hashed learning examples, bundle-analysis status, Codex

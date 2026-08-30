@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { api, blobUrl, ClientApiError } from './api.ts'
 import { clearCheckpoint, loadCheckpoint, saveCheckpoint } from './checkpoint.ts'
@@ -25,6 +25,7 @@ import {
   type ReviewEmail,
   type ReviewFilters,
   type ReviewOptions,
+  type ReviewRoundUserState,
   type ReviewSnapshot,
   type ThreadContext,
 } from './shared.ts'
@@ -32,6 +33,19 @@ import {
 export { emailDocument } from './email-document.ts'
 
 type View = 'review' | 'confirm' | 'done'
+
+const DRAFT_STATE_SAVE_DELAY_MS = 750
+
+type ReviewStateUpdate = Omit<ReviewRoundUserState, 'revision'>
+
+function reviewStateCore(state: ReviewRoundUserState | ReviewStateUpdate) {
+  const { replyDrafts: _replyDrafts, ...withRevision } = state
+  if ('revision' in withRevision) {
+    const { revision: _revision, ...core } = withRevision
+    return core
+  }
+  return withRevision
+}
 
 function addressLine(addresses: MailAddress[]) {
   if (addresses.length === 0) return 'Unbekannter Absender'
@@ -250,6 +264,7 @@ function App() {
   const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
   const [codexLoginBusy, setCodexLoginBusy] = useState(false)
   const [codexModelBusy, setCodexModelBusy] = useState(false)
+  const [codexFallbackBusy, setCodexFallbackBusy] = useState(false)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [replyLoading, setReplyLoading] = useState(false)
@@ -261,11 +276,16 @@ function App() {
   const [result, setResult] = useState<FinalizeResult | null>(null)
   const restoredRef = useRef(false)
   const activeRoundIdRef = useRef<string | null>(null)
+  const activeSnapshotRef = useRef<ReviewSnapshot | null>(null)
+  const codexFallbackRequestedRef = useRef(false)
   const stateRevisionRef = useRef(0)
   const persistedStateRef = useRef('')
+  const persistedCoreStateRef = useRef('')
   const desiredStateRef = useRef('')
-  const stateSaveRunningRef = useRef<string | null>(null)
+  const desiredCoreStateRef = useRef('')
   const stateSavePromiseRef = useRef<Promise<void> | null>(null)
+  const stateSaveTimerRef = useRef<number | null>(null)
+  const stateSaveFailedRef = useRef(false)
 
   const emails = snapshot?.emails ?? []
   const bundles = bundleRun?.bundles ?? []
@@ -286,7 +306,7 @@ function App() {
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
   const analysisPollTarget =
-    snapshot && !bundleRun && snapshot.analysis.status !== 'complete'
+    snapshot && !bundleRun && snapshot.analysis.status !== 'complete' && !codexFallbackBusy
       ? `${snapshot.snapshotId}\0${snapshot.csrfToken}\0${options?.codex.configured ? 'codex-ready' : 'codex-missing'}`
       : null
   const finalizedEmailIds = useMemo(
@@ -307,9 +327,18 @@ function App() {
   )
 
   const applySnapshot = useCallback((nextSnapshot: ReviewSnapshot) => {
+    if (stateSaveTimerRef.current !== null) {
+      window.clearTimeout(stateSaveTimerRef.current)
+      stateSaveTimerRef.current = null
+    }
     setStateConflict(false)
     setStatePersistenceFailed(false)
+    stateSaveFailedRef.current = false
+    if (activeRoundIdRef.current !== nextSnapshot.snapshotId) {
+      codexFallbackRequestedRef.current = false
+    }
     activeRoundIdRef.current = nextSnapshot.snapshotId
+    activeSnapshotRef.current = nextSnapshot
     const state = nextSnapshot.userState
     const nextBundleRun = nextSnapshot.bundleRun
       ? restoreBundleGroups(nextSnapshot.bundleRun, state.bundleGroups, nextSnapshot.emails)
@@ -339,8 +368,11 @@ function App() {
     )
     stateRevisionRef.current = state.revision
     const stateFingerprint = stableReviewStateJson({ ...state, revision: undefined })
+    const coreStateFingerprint = stableReviewStateJson(reviewStateCore(state))
     persistedStateRef.current = stateFingerprint
+    persistedCoreStateRef.current = coreStateFingerprint
     desiredStateRef.current = stateFingerprint
+    desiredCoreStateRef.current = coreStateFingerprint
     setCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
     saveCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
     restoredRef.current = true
@@ -354,6 +386,107 @@ function App() {
       setStatus(analysisStatus(nextSnapshot.analysis))
     }
   }, [])
+
+  const clearStateSaveTimer = useCallback(() => {
+    if (stateSaveTimerRef.current === null) return
+    window.clearTimeout(stateSaveTimerRef.current)
+    stateSaveTimerRef.current = null
+  }, [])
+
+  const triggerStateSave = useCallback(
+    (immediate: boolean) => {
+      clearStateSaveTimer()
+      const roundId = activeRoundIdRef.current
+      const currentSnapshot = activeSnapshotRef.current
+      if (
+        !roundId ||
+        currentSnapshot?.snapshotId !== roundId ||
+        stateSaveFailedRef.current ||
+        desiredStateRef.current === persistedStateRef.current
+      ) {
+        return
+      }
+      if (!immediate) {
+        stateSaveTimerRef.current = window.setTimeout(() => {
+          stateSaveTimerRef.current = null
+          triggerStateSave(true)
+        }, DRAFT_STATE_SAVE_DELAY_MS)
+        return
+      }
+      if (stateSavePromiseRef.current) return
+
+      const submittedFingerprint = desiredStateRef.current
+      const submitted = JSON.parse(submittedFingerprint) as ReviewStateUpdate
+      const saving = api
+        .updateReviewState(currentSnapshot, stateRevisionRef.current, submitted)
+        .then((saved) => {
+          if (activeRoundIdRef.current !== roundId) return
+          const savedFingerprint = stableReviewStateJson({ ...saved, revision: undefined })
+          if (savedFingerprint !== submittedFingerprint) {
+            throw new Error(
+              'Der gespeicherte Rundenstand weicht von der Anfrage ab. Bitte lade die Runde neu.',
+            )
+          }
+          stateRevisionRef.current = saved.revision
+          persistedStateRef.current = savedFingerprint
+          persistedCoreStateRef.current = stableReviewStateJson(reviewStateCore(saved))
+        })
+        .catch((cause) => {
+          if (activeRoundIdRef.current !== roundId) return
+          stateSaveFailedRef.current = true
+          restoredRef.current = false
+          if (cause instanceof ClientApiError && cause.code === 'ROUND_REVISION_CONFLICT') {
+            setStateConflict(true)
+          } else {
+            setStatePersistenceFailed(true)
+            setError(errorMessage(cause))
+          }
+        })
+        .finally(() => {
+          if (stateSavePromiseRef.current === saving) stateSavePromiseRef.current = null
+          if (
+            !stateSaveFailedRef.current &&
+            activeRoundIdRef.current === roundId &&
+            desiredStateRef.current !== persistedStateRef.current
+          ) {
+            const coreChanged = desiredCoreStateRef.current !== persistedCoreStateRef.current
+            triggerStateSave(coreChanged)
+          }
+        })
+      stateSavePromiseRef.current = saving
+    },
+    [clearStateSaveTimer],
+  )
+
+  const flushState = useCallback(async () => {
+    clearStateSaveTimer()
+    while (
+      activeRoundIdRef.current &&
+      !stateSaveFailedRef.current &&
+      desiredStateRef.current !== persistedStateRef.current
+    ) {
+      triggerStateSave(true)
+      const saving = stateSavePromiseRef.current
+      if (!saving) break
+      await saving
+    }
+    return !stateSaveFailedRef.current && desiredStateRef.current === persistedStateRef.current
+  }, [clearStateSaveTimer, triggerStateSave])
+
+  const applyAnalysisProgress = useCallback((nextSnapshot: ReviewSnapshot) => {
+    setSnapshot((current) => {
+      if (!current || current.snapshotId !== nextSnapshot.snapshotId) return current
+      const next = { ...current, analysis: nextSnapshot.analysis }
+      activeSnapshotRef.current = next
+      return next
+    })
+    setStatus(analysisStatus(nextSnapshot.analysis))
+  }, [])
+
+  const closeReply = useCallback(() => {
+    setReplyOpen(false)
+    void flushState()
+  }, [flushState])
 
   const startReview = useCallback(
     async (nextFilters: ReviewFilters, resume: LoadedReviewCheckpoint | null = null) => {
@@ -473,33 +606,39 @@ function App() {
       generation += 1
       const currentGeneration = generation
       const roundId = roundIdFromPath()
-      restoredRef.current = false
-      activeRoundIdRef.current = null
-      setError(null)
-      if (!roundId) {
-        setSnapshot(null)
-        setBundleRun(null)
-        setResult(null)
-        setView('review')
-        setCheckpoint(loadCheckpoint())
-        return
-      }
-      setLoading(true)
-      void api
-        .review(roundId)
-        .then((round) => {
+      void (async () => {
+        const previousRoundId = activeRoundIdRef.current
+        if (restoredRef.current && !(await flushState())) {
+          if (previousRoundId) setRoundUrl(previousRoundId, true)
+          return
+        }
+        if (generation !== currentGeneration) return
+        restoredRef.current = false
+        activeRoundIdRef.current = null
+        activeSnapshotRef.current = null
+        setError(null)
+        if (!roundId) {
+          setSnapshot(null)
+          setBundleRun(null)
+          setResult(null)
+          setView('review')
+          setCheckpoint(loadCheckpoint())
+          return
+        }
+        setLoading(true)
+        try {
+          const round = await api.review(roundId)
           if (generation === currentGeneration) applySnapshot(round)
-        })
-        .catch((cause) => {
+        } catch (cause) {
           if (generation === currentGeneration) setError(errorMessage(cause))
-        })
-        .finally(() => {
+        } finally {
           if (generation === currentGeneration) setLoading(false)
-        })
+        }
+      })()
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [applySnapshot])
+  }, [applySnapshot, flushState])
 
   useEffect(() => {
     if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
@@ -516,13 +655,15 @@ function App() {
           const auth = await api.codexStatus()
           if (!active) return
           setOptions((current) => (current ? { ...current, codex: auth } : current))
+          const resumableSnapshot = activeSnapshotRef.current
           if (
             auth.configured &&
-            snapshot?.analysis.phase === 'waiting_for_codex' &&
-            snapshot.analysis.status === 'pending'
+            !codexFallbackRequestedRef.current &&
+            resumableSnapshot?.analysis.phase === 'waiting_for_codex' &&
+            resumableSnapshot.analysis.status === 'pending'
           ) {
             try {
-              const resumed = await api.bundles(snapshot)
+              const resumed = await api.bundles(resumableSnapshot)
               if (!active) return
               applySnapshot(resumed)
             } catch (cause) {
@@ -557,23 +698,17 @@ function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [
-    applySnapshot,
-    codexLoginId,
-    codexLoginStatus,
-    snapshot?.analysis.phase,
-    snapshot?.analysis.status,
-    snapshot,
-  ])
+  }, [applySnapshot, codexLoginId, codexLoginStatus])
 
   useEffect(() => {
-    if (!analysisPollTarget) return
+    if (!analysisPollTarget || codexFallbackRequestedRef.current) return
     const [analysisRoundId, analysisCsrfToken] = analysisPollTarget.split('\0')
     if (!analysisRoundId || !analysisCsrfToken) return
     let active = true
     let timer = 0
     void (async () => {
       try {
+        if (codexFallbackRequestedRef.current) return
         let nextSnapshot = await api.bundles({
           csrfToken: analysisCsrfToken,
           snapshotId: analysisRoundId,
@@ -584,7 +719,7 @@ function App() {
           nextSnapshot.analysis.phase !== 'waiting_for_codex' &&
           !(nextSnapshot.analysis.status === 'pending' && nextSnapshot.analysis.error)
         ) {
-          applySnapshot(nextSnapshot)
+          applyAnalysisProgress(nextSnapshot)
           await new Promise<void>((resolve) => {
             timer = window.setTimeout(resolve, 500)
           })
@@ -603,9 +738,9 @@ function App() {
       active = false
       window.clearTimeout(timer)
     }
-  }, [analysisPollTarget, applySnapshot])
+  }, [analysisPollTarget, applyAnalysisProgress, applySnapshot])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (
       !snapshot ||
       !bundleRun ||
@@ -616,7 +751,7 @@ function App() {
       emails.length === 0
     )
       return
-    const state = {
+    const state: ReviewStateUpdate = {
       bundleGroups: bundles.map((bundle) => bundle.emailIds),
       index,
       keptUnreadIds: [...keptUnread],
@@ -626,56 +761,18 @@ function App() {
       selectedMemberId,
     }
     const fingerprint = stableReviewStateJson(state)
+    const coreFingerprint = stableReviewStateJson(reviewStateCore(state))
     desiredStateRef.current = fingerprint
-    if (fingerprint === persistedStateRef.current) return
-    const roundId = snapshot.snapshotId
-    const startDrain = () => {
-      if (stateSaveRunningRef.current === roundId || activeRoundIdRef.current !== roundId) return
-      stateSaveRunningRef.current = roundId
-      let saveFailed = false
-      const drain = async () => {
-        while (
-          activeRoundIdRef.current === roundId &&
-          desiredStateRef.current !== persistedStateRef.current
-        ) {
-          const desired = JSON.parse(desiredStateRef.current) as typeof state
-          const saved = await api.updateReviewState(snapshot, stateRevisionRef.current, desired)
-          if (activeRoundIdRef.current !== roundId) return
-          stateRevisionRef.current = saved.revision
-          persistedStateRef.current = stableReviewStateJson({ ...saved, revision: undefined })
-        }
-      }
-      const saving = drain()
-        .catch((cause) => {
-          saveFailed = true
-          if (activeRoundIdRef.current !== roundId) return
-          if (cause instanceof ClientApiError && cause.code === 'ROUND_REVISION_CONFLICT') {
-            restoredRef.current = false
-            setStateConflict(true)
-          } else {
-            restoredRef.current = false
-            setStatePersistenceFailed(true)
-            setError(errorMessage(cause))
-          }
-        })
-        .finally(() => {
-          if (stateSavePromiseRef.current === saving) stateSavePromiseRef.current = null
-          if (stateSaveRunningRef.current === roundId) stateSaveRunningRef.current = null
-          if (
-            !saveFailed &&
-            activeRoundIdRef.current === roundId &&
-            desiredStateRef.current !== persistedStateRef.current
-          ) {
-            queueMicrotask(startDrain)
-          }
-        })
-      stateSavePromiseRef.current = saving
-      void saving
+    desiredCoreStateRef.current = coreFingerprint
+    if (fingerprint === persistedStateRef.current) {
+      clearStateSaveTimer()
+      return
     }
-    startDrain()
+    triggerStateSave(coreFingerprint !== persistedCoreStateRef.current)
   }, [
     bundleRun,
     bundles,
+    clearStateSaveTimer,
     emails.length,
     index,
     keptUnread,
@@ -686,7 +783,24 @@ function App() {
     snapshot,
     stateConflict,
     statePersistenceFailed,
+    triggerStateSave,
   ])
+
+  useEffect(() => {
+    const saveBeforeLeaving = () => {
+      if (desiredStateRef.current !== persistedStateRef.current) triggerStateSave(true)
+    }
+    const saveWhenHidden = () => {
+      if (document.visibilityState === 'hidden') saveBeforeLeaving()
+    }
+    window.addEventListener('pagehide', saveBeforeLeaving)
+    document.addEventListener('visibilitychange', saveWhenHidden)
+    return () => {
+      window.removeEventListener('pagehide', saveBeforeLeaving)
+      document.removeEventListener('visibilitychange', saveWhenHidden)
+      clearStateSaveTimer()
+    }
+  }, [clearStateSaveTimer, triggerStateSave])
 
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
@@ -791,7 +905,7 @@ function App() {
       if (event.key === 'Escape') {
         if (helpOpen) setHelpOpen(false)
         else if (mergeOpen) setMergeOpen(false)
-        else if (replyOpen) setReplyOpen(false)
+        else if (replyOpen) closeReply()
         else if (overviewOpen) setOverviewOpen(false)
         else if (view === 'confirm' && !snapshot?.finalization.selectionLocked) setView('review')
         return
@@ -822,6 +936,7 @@ function App() {
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [
     helpOpen,
+    closeReply,
     mergeOpen,
     next,
     openReply,
@@ -919,10 +1034,7 @@ function App() {
     setSubmitting(true)
     setError(null)
     try {
-      while (stateSavePromiseRef.current) await stateSavePromiseRef.current
-      if (!restoredRef.current) {
-        return
-      }
+      if (!(await flushState()) || !restoredRef.current) return
       const nextResult = await api.finalize(
         snapshot,
         stateRevisionRef.current,
@@ -974,15 +1086,18 @@ function App() {
     setCheckpoint(null)
     restoredRef.current = false
     activeRoundIdRef.current = null
+    activeSnapshotRef.current = null
     setRoundUrl(null, true)
     await startReview(filters, null)
   }
 
   async function showSetup(discardCheckpoint = false) {
+    if (snapshot && restoredRef.current && !(await flushState())) return
     if (discardCheckpoint) clearCheckpoint()
     else if (snapshot) saveCheckpoint({ version: 7, roundId: snapshot.snapshotId })
     restoredRef.current = false
     activeRoundIdRef.current = null
+    activeSnapshotRef.current = null
     setCheckpoint(
       discardCheckpoint
         ? null
@@ -1034,6 +1149,24 @@ function App() {
       setError(errorMessage(cause))
     } finally {
       setCodexModelBusy(false)
+    }
+  }
+
+  async function continueWithoutCodex() {
+    if (!snapshot) return
+    if (codexFallbackRequestedRef.current) return
+    codexFallbackRequestedRef.current = true
+    setCodexFallbackBusy(true)
+    setError(null)
+    setStatus('Sichere Einzelansicht wird vorbereitet …')
+    try {
+      applySnapshot(await api.continueWithoutCodex(snapshot))
+    } catch (cause) {
+      codexFallbackRequestedRef.current = false
+      setError(errorMessage(cause))
+      setStatus('Die Runde wartet weiter auf Codex.')
+    } finally {
+      setCodexFallbackBusy(false)
     }
   }
 
@@ -1277,13 +1410,30 @@ function App() {
             {snapshot.analysis.callCount > 0 && ` · ${snapshot.analysis.callCount} Codex-Aufrufe`}
           </p>
           {waitingForCodex && (
-            <button
-              type="button"
-              className="button primary analysis-login"
-              onClick={() => setCodexLoginOpen(true)}
-            >
-              Codex wieder verbinden
-            </button>
+            <>
+              <div className="analysis-actions">
+                <button
+                  type="button"
+                  className="button primary analysis-login"
+                  disabled={codexFallbackBusy}
+                  onClick={() => setCodexLoginOpen(true)}
+                >
+                  Codex wieder verbinden
+                </button>
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={codexFallbackBusy}
+                  onClick={() => void continueWithoutCodex()}
+                >
+                  {codexFallbackBusy ? 'Wird vorbereitet …' : 'Ohne Codex fortsetzen'}
+                </button>
+              </div>
+              <p className="analysis-fallback-note">
+                Ohne Codex wird jede Nachricht einzeln angezeigt. Codex startet für diese Runde
+                später nicht erneut.
+              </p>
+            </>
           )}
           {(error ||
             (snapshot.analysis.error && !waitingForCodex) ||
@@ -1781,7 +1931,7 @@ function App() {
           loading={replyLoading}
           proposal={proposal}
           submitting={submitting}
-          onClose={() => setReplyOpen(false)}
+          onClose={closeReply}
           onGenerate={() => void generateReply()}
           onSave={() => void saveDraft()}
           onUpdate={updateEditor}

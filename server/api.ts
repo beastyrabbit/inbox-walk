@@ -1414,6 +1414,87 @@ async function bundles(
   )
 }
 
+async function continueWithoutCodex(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  requireMutableRoundState(snapshot)
+  const parsed = z
+    .object({})
+    .strict()
+    .safeParse(await readJson(req))
+  if (!parsed.success) {
+    throw new ApiHttpError(400, 'INVALID_FALLBACK_REQUEST', 'Ungültige Anfrage.')
+  }
+  // The request body can arrive slowly while another tab finalizes the round.
+  // Recheck before the synchronous state check and database write.
+  requireMutableRoundState(snapshot)
+  if (snapshot.bundleRun?.fallback && snapshot.analysis.status === 'complete') {
+    return json(res, 200, snapshotPayload(snapshotId, snapshot))
+  }
+  if (snapshot.bundleRun || snapshot.analysis.status === 'complete') {
+    throw new ApiHttpError(
+      409,
+      'ANALYSIS_ALREADY_COMPLETE',
+      'Die Analyse dieser Runde ist bereits abgeschlossen.',
+    )
+  }
+  if (
+    snapshot.analysis.engine !== 'codex' ||
+    snapshot.analysis.phase !== 'waiting_for_codex' ||
+    snapshot.analysis.status !== 'pending'
+  ) {
+    throw new ApiHttpError(
+      409,
+      'ANALYSIS_NOT_WAITING_FOR_CODEX',
+      'Diese Runde wartet nicht auf eine Codex-Anmeldung.',
+    )
+  }
+  const emails = snapshot.emailIds
+    .map((id) => snapshot.summaries.get(id))
+    .filter((email): email is ReviewEmailSummary => Boolean(email))
+  const run = singletonBundleRun(snapshotId, emails)
+  const { error: _previousError, ...previousAnalysis } = snapshot.analysis
+  const analysis: ReviewAnalysisState = {
+    ...previousAnalysis,
+    engine: 'fallback',
+    phase: 'complete',
+    processedEmailCount: snapshot.analysis.totalEmailCount,
+    progress: 1,
+    status: 'complete',
+  }
+  if (!apiOptions.roundStore) {
+    throw new ApiHttpError(
+      503,
+      'ROUND_PERSIST_FAILED',
+      'Die sichere Einzelansicht konnte nicht dauerhaft gespeichert werden.',
+      true,
+    )
+  }
+  try {
+    validateBundlePartition(snapshot.emailIds, run.bundles)
+    const saved = apiOptions.roundStore.saveBundleRun(snapshotId, run, {
+      ...analysis,
+      error: null,
+    })
+    if (!saved) throw new Error('The review round disappeared before fallback was saved.')
+  } catch {
+    throw new ApiHttpError(
+      503,
+      'ROUND_PERSIST_FAILED',
+      'Die sichere Einzelansicht konnte nicht dauerhaft gespeichert werden.',
+      true,
+    )
+  }
+  snapshot.bundleRun = run
+  snapshot.analysis = analysis
+  return json(res, 200, snapshotPayload(snapshotId, snapshot))
+}
+
 async function updateRoundState(
   req: IncomingMessage,
   res: ServerResponse,
@@ -2147,7 +2228,15 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
         if (req.method === 'POST' && parts[3] === 'finalize') {
           return await finalize(req, res, snapshotId, apiOptions)
         }
-        if (req.method === 'POST' && parts[3] === 'bundles') {
+        if (
+          req.method === 'POST' &&
+          parts[3] === 'bundles' &&
+          parts[4] === 'fallback' &&
+          !parts[5]
+        ) {
+          return await continueWithoutCodex(req, res, snapshotId, apiOptions)
+        }
+        if (req.method === 'POST' && parts[3] === 'bundles' && !parts[4]) {
           return await bundles(req, res, snapshotId, apiOptions)
         }
         if (req.method === 'POST' && parts[3] === 'state') {

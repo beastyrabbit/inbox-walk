@@ -29,7 +29,7 @@ If a body cannot be loaded, that message is protected as unread automatically.
 4. Save every completed Codex decision before moving to the next one. Resume from those decisions after a process restart.
 5. Never rerun a finished analysis. A browser reload only reads its stored status and result.
 6. Keep later incoming mail outside the round. Analyze it in a new round.
-7. Use the local analyzer when Codex is not connected before a new round starts. Do not silently downgrade a Codex run that was already in progress.
+7. Use the local analyzer when Codex is not connected before a new round starts. Do not silently downgrade a Codex run that was already in progress; only an explicit user choice may persist the safe individual-message view instead.
 8. Freeze the configured Codex call limit with the round. Stop at that limit and use the safe fallback view.
 
 ## Reply contract

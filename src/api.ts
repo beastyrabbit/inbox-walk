@@ -97,6 +97,13 @@ export const api = {
       snapshot.csrfToken,
     )
   },
+  async continueWithoutCodex(snapshot: Pick<ReviewSnapshot, 'csrfToken' | 'snapshotId'>) {
+    return post<ReviewSnapshot>(
+      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundles/fallback`,
+      {},
+      snapshot.csrfToken,
+    )
+  },
   async updateReviewState(
     snapshot: ReviewSnapshot,
     revision: number,

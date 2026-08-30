@@ -441,6 +441,50 @@ describe('demo API contract', () => {
     expect(restarted.response.status).toBe(200)
     expect(restarted.body.bundleRun).toEqual(completed.bundleRun)
     expect(bundleDecisionCalls).toBe(callsAfterCompletion)
+    const rejectedFallback = await json<{ error: { code: string } }>(
+      `/api/reviews/${created.body.snapshotId}/bundles/fallback`,
+      post({}, created.body.csrfToken),
+    )
+    expect(rejectedFallback.response.status).toBe(409)
+    expect(rejectedFallback.body.error.code).toBe('ANALYSIS_ALREADY_COMPLETE')
+  })
+
+  it('rejects the explicit fallback immediately while Codex analysis is running', async () => {
+    bundleDecisionGate = new Promise<void>((resolve) => {
+      releaseBundleDecision = resolve
+    })
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const started = await json<ReviewSnapshot>(
+      `/api/reviews/${created.body.snapshotId}/bundles`,
+      post({}, created.body.csrfToken),
+    )
+    expect(started.response.status).toBe(202)
+    expect(started.body.analysis.status).toBe('running')
+
+    const fallbackRequest = json<{ error: { code: string } }>(
+      `/api/reviews/${created.body.snapshotId}/bundles/fallback`,
+      post({}, created.body.csrfToken),
+    )
+    try {
+      const early = await Promise.race([
+        fallbackRequest.then((result) => ({ kind: 'response' as const, result })),
+        new Promise<{ kind: 'timeout' }>((resolve) =>
+          setTimeout(() => resolve({ kind: 'timeout' }), 100),
+        ),
+      ])
+      expect(early.kind).toBe('response')
+      if (early.kind === 'response') {
+        expect(early.result.response.status).toBe(409)
+        expect(early.result.body.error.code).toBe('ANALYSIS_NOT_WAITING_FOR_CODEX')
+      }
+    } finally {
+      releaseBundleDecision?.()
+      await fallbackRequest
+      await waitForApiJobs()
+    }
   })
 
   it('automatically resumes a persisted unfinished analysis when the round is opened', async () => {
@@ -549,6 +593,13 @@ describe('demo API contract', () => {
     const source = demoEmails[0]
     expect(source).toBeDefined()
     if (!source) return
+    const secondSource = {
+      ...source,
+      id: `${source.id}-second`,
+      receivedAt: new Date(Date.parse(source.receivedAt) + 1_000).toISOString(),
+      subject: `${source.subject} · zweite Nachricht`,
+      threadId: `${source.threadId}-second`,
+    }
     localStore.create({
       analysis: {
         callCount: 2,
@@ -558,23 +609,21 @@ describe('demo API contract', () => {
         processedEmailCount: 0,
         progress: 0.2,
         status: 'running',
-        totalEmailCount: 1,
+        totalEmailCount: 2,
       },
       csrfToken: 'restart-csrf',
-      emails: [
-        {
-          from: source.from,
-          hasAttachment: source.hasAttachment,
-          id: source.id,
-          isNewsletter: source.isNewsletter,
-          mailboxNames: source.mailboxNames,
-          preview: source.preview,
-          receivedAt: source.receivedAt,
-          subject: source.subject,
-          threadId: source.threadId,
-          to: source.to,
-        },
-      ],
+      emails: [source, secondSource].map((email) => ({
+        from: email.from,
+        hasAttachment: email.hasAttachment,
+        id: email.id,
+        isNewsletter: email.isNewsletter,
+        mailboxNames: email.mailboxNames,
+        preview: email.preview,
+        receivedAt: email.receivedAt,
+        subject: email.subject,
+        threadId: email.threadId,
+        to: email.to,
+      })),
       filters: {
         hideReviewed: false,
         mailboxId: null,
@@ -622,12 +671,166 @@ describe('demo API contract', () => {
       })
       expect(current.analysis.error).toContain('erneut verbunden')
       expect(current.bundleRun).toBeUndefined()
+
+      const forbiddenFallback = await fetch(
+        `${localBase}/api/reviews/live-restart-round/bundles/fallback`,
+        post({}, 'wrong-csrf'),
+      )
+      expect(forbiddenFallback.status).toBe(403)
+
+      const fallbackResponse = await fetch(
+        `${localBase}/api/reviews/live-restart-round/bundles/fallback`,
+        post({}, 'restart-csrf'),
+      )
+      const fallback = (await fallbackResponse.json()) as ReviewSnapshot
+      expect(fallbackResponse.status).toBe(200)
+      expect(fallback.analysis).toMatchObject({
+        callCount: 2,
+        engine: 'fallback',
+        model: 'gpt-5.6-sol',
+        phase: 'complete',
+        processedEmailCount: 2,
+        progress: 1,
+        status: 'complete',
+      })
+      expect(fallback.analysis).not.toHaveProperty('error')
+      expect(fallback.bundleRun?.fallback).toBe(true)
+      expect(fallback.bundleRun?.bundles.map((bundle) => bundle.emailIds)).toEqual([
+        [source.id],
+        [secondSource.id],
+      ])
+      expect(localStore.get('live-restart-round')?.analysis).toMatchObject({
+        callCount: 2,
+        engine: 'fallback',
+        phase: 'complete',
+        status: 'complete',
+      })
+
+      const repeatedResponse = await fetch(
+        `${localBase}/api/reviews/live-restart-round/bundles/fallback`,
+        post({}, 'restart-csrf'),
+      )
+      const repeated = (await repeatedResponse.json()) as ReviewSnapshot
+      expect(repeatedResponse.status).toBe(200)
+      expect(repeated.bundleRun).toEqual(fallback.bundleRun)
+
+      const extraSegmentResponse = await fetch(
+        `${localBase}/api/reviews/live-restart-round/bundles/fallback/extra`,
+        post({}, 'restart-csrf'),
+      )
+      expect(extraSegmentResponse.status).toBe(404)
+
+      clearApiStateForTests()
+      const reopened = (await (
+        await fetch(`${localBase}/api/reviews/live-restart-round`)
+      ).json()) as ReviewSnapshot
+      expect(reopened.analysis).toMatchObject({ engine: 'fallback', status: 'complete' })
+      expect(reopened.bundleRun).toEqual(fallback.bundleRun)
+      const normalBundleResponse = await fetch(
+        `${localBase}/api/reviews/live-restart-round/bundles`,
+        post({}, 'restart-csrf'),
+      )
+      expect(normalBundleResponse.status).toBe(200)
+      expect(((await normalBundleResponse.json()) as ReviewSnapshot).bundleRun).toEqual(
+        fallback.bundleRun,
+      )
     } finally {
       await new Promise<void>((resolve, reject) =>
         localServer.close((error) => (error ? reject(error) : resolve())),
       )
       localStore.close()
       clearApiStateForTests()
+    }
+  })
+
+  it('keeps the Codex waiting state in memory when fallback persistence fails', async () => {
+    for (const failureMode of ['null', 'throw'] as const) {
+      clearApiStateForTests()
+      const localStore = createRoundStore(':memory:')
+      const source = demoEmails[0]
+      expect(source).toBeDefined()
+      if (!source) return
+      localStore.create({
+        analysis: {
+          callCount: 1,
+          engine: 'codex',
+          model: 'gpt-5.6-sol',
+          phase: 'waiting_for_codex',
+          processedEmailCount: 0,
+          progress: 0.25,
+          status: 'pending',
+          totalEmailCount: 1,
+        },
+        csrfToken: `fallback-${failureMode}-csrf`,
+        emails: [source],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        id: `fallback-${failureMode}-round`,
+        imageToken: `fallback-${failureMode}-image`,
+        mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+        mode: 'live',
+      })
+      const failingStore = {
+        ...localStore,
+        saveBundleRun: () => {
+          if (failureMode === 'throw') throw new Error('Simulated persistence failure')
+          return null
+        },
+      }
+      const localMiddleware = createApiMiddleware({
+        autoStartBundles: false,
+        roundStore: failingStore,
+      })
+      const localServer = createServer((request, response) => {
+        void localMiddleware(request, response, () => {
+          response.statusCode = 404
+          response.end()
+        })
+      })
+      await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+      try {
+        const address = localServer.address()
+        if (!address || typeof address === 'string')
+          throw new Error('Local test server did not bind')
+        const localBase = `http://127.0.0.1:${address.port}`
+        const failedResponse = await fetch(
+          `${localBase}/api/reviews/fallback-${failureMode}-round/bundles/fallback`,
+          post({}, `fallback-${failureMode}-csrf`),
+        )
+        expect(failedResponse.status).toBe(503)
+        expect((await failedResponse.json()) as { error: { code: string } }).toMatchObject({
+          error: { code: 'ROUND_PERSIST_FAILED' },
+        })
+
+        const current = (await (
+          await fetch(`${localBase}/api/reviews/fallback-${failureMode}-round`)
+        ).json()) as ReviewSnapshot
+        expect(current.analysis).toMatchObject({
+          engine: 'codex',
+          phase: 'waiting_for_codex',
+          status: 'pending',
+        })
+        expect(current.bundleRun).toBeUndefined()
+        expect(localStore.get(`fallback-${failureMode}-round`)).toMatchObject({
+          analysis: {
+            engine: 'codex',
+            phase: 'waiting_for_codex',
+            status: 'pending',
+          },
+          bundleRun: null,
+        })
+      } finally {
+        await new Promise<void>((resolve, reject) =>
+          localServer.close((error) => (error ? reject(error) : resolve())),
+        )
+        localStore.close()
+        clearApiStateForTests()
+      }
     }
   })
 

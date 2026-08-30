@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import type { ReviewSnapshot } from '../src/shared.ts'
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/')
@@ -123,6 +124,33 @@ test('blocks the round after a state persistence failure without retrying foreve
   expect(stateWrites).toBeLessThanOrEqual(2)
 })
 
+test('fails closed when the server acknowledges a different round state', async ({ page }) => {
+  let stateWrites = 0
+  await page.route('**/api/reviews/*/state', async (route) => {
+    stateWrites += 1
+    const request = route.request().postDataJSON() as {
+      revision: number
+      state: Record<string, unknown> & { index: number }
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        ...request.state,
+        index: request.state.index + 1,
+        revision: request.revision + 1,
+      }),
+    })
+  })
+
+  await page.keyboard.press('ArrowUp')
+  await expect(
+    page.getByRole('heading', { name: 'Rundenstand konnte nicht gespeichert werden' }),
+  ).toBeVisible()
+  await page.waitForTimeout(600)
+  expect(stateWrites).toBe(1)
+})
+
 test('shows analysis provenance and never leaves a blank root on bundle failure', async ({
   page,
 }) => {
@@ -146,6 +174,112 @@ test('shows analysis provenance and never leaves a blank root on bundle failure'
   await expect(page.getByText('Die Runde bleibt gespeichert.')).toBeVisible()
   await expect(page.getByText('Die Analyse antwortet gerade nicht.')).toBeVisible()
   await expect(page.locator('#root')).not.toBeEmpty()
+})
+
+test('offers and applies the explicit safe view when Codex cannot resume', async ({ page }) => {
+  let waiting: ReviewSnapshot | null = null
+  let bundleRequests = 0
+  let loginPolls = 0
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await page.route(/\/api\/reviews\/[^/]+\/bundles$/, async (route) => {
+    bundleRequests += 1
+    const response = await route.fetch()
+    const body = (await response.json()) as ReviewSnapshot
+    waiting = {
+      ...body,
+      bundleRun: undefined,
+      analysis: {
+        ...body.analysis,
+        callCount: 1,
+        engine: 'codex',
+        error: 'Codex muss erneut verbunden werden.',
+        model: 'gpt-5.6-sol',
+        phase: 'waiting_for_codex',
+        status: 'pending',
+      },
+    }
+    await route.fulfill({ response, json: waiting })
+  })
+  await page.route(/\/api\/reviews\/[^/]+\/bundles\/fallback$/, async (route) => {
+    if (!waiting) throw new Error('Expected a waiting review snapshot')
+    await new Promise((resolve) => setTimeout(resolve, 2_200))
+    const fallback: ReviewSnapshot = {
+      ...waiting,
+      analysis: {
+        ...waiting.analysis,
+        engine: 'fallback',
+        phase: 'complete',
+        processedEmailCount: waiting.emails.length,
+        progress: 1,
+        status: 'complete',
+        error: undefined,
+      },
+      bundleRun: {
+        bundles: waiting.emails.map((email) => ({
+          bundleId: `fallback-${email.id}`,
+          currentState: 'Einzelne Nachricht',
+          emailIds: [email.id],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: email.preview,
+          timeline: [
+            {
+              emailId: email.id,
+              event: email.subject,
+              occurredAt: email.receivedAt,
+              source: email.from[0]?.name || 'E-Mail',
+            },
+          ],
+          title: email.subject,
+        })),
+        fallback: true,
+        snapshotId: waiting.snapshotId,
+      },
+    }
+    await route.fulfill({ status: 200, json: fallback })
+  })
+  await page.route('**/api/auth/codex/start', async (route) => {
+    await route.fulfill({ status: 202, json: { id: 'fallback-race-login' } })
+  })
+  await page.route(/\/api\/auth\/codex\/fallback-race-login$/, async (route) => {
+    loginPolls += 1
+    await route.fulfill({
+      json:
+        loginPolls === 1
+          ? {
+              id: 'fallback-race-login',
+              message: 'Warte auf Anmeldung.',
+              status: 'waiting',
+              url: 'https://auth.openai.com/codex/device',
+              userCode: 'TEST-CODE',
+            }
+          : {
+              id: 'fallback-race-login',
+              message: 'Codex ist verbunden.',
+              status: 'completed',
+            },
+    })
+  })
+  await page.route('**/api/auth/codex/status', async (route) => {
+    await route.fulfill({
+      json: { configured: true, model: 'gpt-5.6-sol', source: 'stored' },
+    })
+  })
+
+  await page.getByRole('button', { name: 'Review starten' }).click()
+  await expect(page.getByRole('heading', { name: 'Codex-Anmeldung erforderlich' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Codex wieder verbinden' })).toBeVisible()
+  await page.getByRole('button', { name: 'Codex wieder verbinden' }).click()
+  await page.getByRole('button', { name: 'Mit ChatGPT anmelden' }).click()
+  await expect.poll(() => loginPolls).toBeGreaterThan(0)
+  await page.getByRole('button', { name: 'Schließen' }).last().click()
+  const bundleRequestsBeforeFallback = bundleRequests
+  await page.getByRole('button', { name: 'Ohne Codex fortsetzen' }).click()
+  await expect.poll(() => loginPolls, { timeout: 4_000 }).toBeGreaterThan(1)
+  expect(bundleRequests).toBe(bundleRequestsBeforeFallback)
+  await expect(page.locator('.analysis-badge')).toContainText('Sichere Einzelansicht')
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
 })
 
 test('names the attempted Codex model on a safe fallback result', async ({ page }) => {
@@ -189,7 +323,7 @@ test('reviews mail with keyboard decisions and exact overview navigation', async
   await expect(page.getByRole('heading', { name: 'Samstagsbrief · Augustanfang' })).toBeVisible()
 })
 
-test('creates and verifies a draft without exposing a send action', async ({ page }) => {
+test('debounces typed reply state and creates a draft without a send action', async ({ page }) => {
   let stateWrites = 0
   page.on('request', (request) => {
     if (/\/api\/reviews\/[^/]+\/state$/.test(new URL(request.url()).pathname)) stateWrites += 1
@@ -201,13 +335,25 @@ test('creates and verifies a draft without exposing a send action', async ({ pag
 
   await page
     .getByLabel('Was soll die Antwort sagen?')
-    .fill('Bitte kurz bestätigen, dass ich das Ticket habe.')
+    .pressSequentially('Bitte kurz bestätigen, dass ich das Ticket habe.', { delay: 10 })
   await page.getByRole('button', { name: 'Entwurf erstellen' }).click()
   await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveValue(/Ticket/)
   await page.getByRole('button', { name: 'In Fastmail als Draft speichern' }).click()
   await expect(page.getByText(/Draft gespeichert und verifiziert/)).toBeVisible()
   await page.waitForTimeout(500)
-  expect(stateWrites).toBeLessThan(12)
+  expect(stateWrites).toBeLessThanOrEqual(3)
+})
+
+test('flushes pending reply notes before leaving and resuming the round', async ({ page }) => {
+  const notes = 'Diese noch ungespeicherten Stichpunkte müssen einen sofortigen Wechsel überleben.'
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await page.getByLabel('Was soll die Antwort sagen?').pressSequentially(notes)
+  await page.getByRole('button', { name: 'Antwort schließen' }).click()
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
+  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(page.getByLabel('Was soll die Antwort sagen?')).toHaveValue(notes)
 })
 
 test('requires confirmation before finalizing the fixed snapshot', async ({ page }) => {

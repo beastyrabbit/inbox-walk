@@ -659,6 +659,20 @@
   font-size: 12px;
 }
 
+.analysis-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 24px;
+}
+
+.analysis-page > .analysis-fallback-note {
+  max-width: 520px;
+  margin: 12px 0 0;
+  font-size: 12px;
+}
+
 .setup-page {
   width: min(920px, 100%);
   min-height: 100vh;
@@ -1598,6 +1612,13 @@
 }
 
 @media (max-width: 720px) {
+  .analysis-actions {
+    width: 100%;
+    flex-direction: column;
+  }
+  .analysis-actions .button {
+    width: 100%;
+  }
   .setup-page {
     padding: 30px 18px 48px;
   }
