@@ -95,6 +95,7 @@ describe('SQLite bundle learning store', () => {
       INSERT INTO relationship_labels(anchor_signals, candidate_signals, label, reason)
       VALUES (?, ?, 'merge', ?)
     `)
+    legacy.exec('BEGIN')
     insert.run(
       JSON.stringify([forgottenSignal]),
       JSON.stringify(['thread:forgotten']),
@@ -107,6 +108,7 @@ describe('SQLite bundle learning store', () => {
         `legacy reason ${index}`,
       )
     }
+    legacy.exec('COMMIT')
     legacy.close()
 
     const store = createBundleStore(directory)
