@@ -3,7 +3,12 @@ import './App.css'
 import { api, blobUrl, ClientApiError } from './api.ts'
 import { clearCheckpoint, loadCheckpoint, saveCheckpoint } from './checkpoint.ts'
 import { emailDocument } from './email-document.ts'
-import { clampIndex, idsToMarkRead, toggleKeptUnread } from './review-state.ts'
+import {
+  clampIndex,
+  idsToMarkRead,
+  stableReviewStateJson,
+  toggleKeptUnread,
+} from './review-state.ts'
 import {
   type CodexLoginState,
   type CodexModelId,
@@ -11,12 +16,12 @@ import {
   type DraftResult,
   defaultReviewFilters,
   type FinalizeResult,
+  type LoadedReviewCheckpoint,
   type MailAddress,
   type ReplyEditorState,
   type ReplyProposal,
   type ReviewBundle,
   type ReviewBundleRun,
-  type ReviewCheckpoint,
   type ReviewEmail,
   type ReviewFilters,
   type ReviewOptions,
@@ -148,6 +153,40 @@ function isTypingTarget(target: EventTarget | null) {
   )
 }
 
+function roundIdFromPath() {
+  const match = window.location.pathname.match(/^\/rounds\/([^/]+)\/?$/)
+  return match?.[1] ? decodeURIComponent(match[1]) : null
+}
+
+function setRoundUrl(roundId: string | null, replace = false) {
+  const next = roundId ? `/rounds/${encodeURIComponent(roundId)}` : '/'
+  window.history[replace ? 'replaceState' : 'pushState']({}, '', next)
+}
+
+function analysisStatus(analysis: ReviewSnapshot['analysis']) {
+  if (analysis.phase === 'waiting_for_codex') {
+    return 'Die angefangene Codex-Analyse wartet auf eine erneute Anmeldung.'
+  }
+  if (analysis.phase === 'indexing') return 'Nachrichten werden für die Analyse vorbereitet …'
+  if (analysis.phase === 'deciding') return 'Codex prüft mögliche Zusammenhänge …'
+  if (analysis.phase === 'reconciling') return 'Neue Zusammenhänge werden noch einmal abgeglichen …'
+  if (analysis.phase === 'finalizing') return 'Storys werden fertiggestellt …'
+  if (analysis.phase === 'fallback') return 'Sichere Einzelansicht wird vorbereitet …'
+  if (analysis.phase === 'grouping') return 'Zusammengehörige Nachrichten werden gebündelt …'
+  return 'Analyse wird gestartet …'
+}
+
+function analysisOrigin(analysis: ReviewSnapshot['analysis']) {
+  const label = codexModels.find((model) => model.id === analysis.model)?.label
+  if (analysis.engine === 'fallback') {
+    return analysis.callCount > 0 && label
+      ? `Sichere Einzelansicht · Codex-Versuch ${label}`
+      : 'Sichere Einzelansicht'
+  }
+  if (analysis.engine === 'heuristic') return 'Lokale Analyse'
+  return label ? `Codex · ${label}` : 'Codex'
+}
+
 function useFocusRegion<T extends HTMLElement>(trap: boolean) {
   const ref = useRef<T>(null)
   useEffect(() => {
@@ -188,7 +227,7 @@ function useFocusRegion<T extends HTMLElement>(trap: boolean) {
 function App() {
   const [options, setOptions] = useState<ReviewOptions | null>(null)
   const [filters, setFilters] = useState<ReviewFilters>(defaultReviewFilters)
-  const [checkpoint, setCheckpoint] = useState<ReviewCheckpoint | null>(null)
+  const [checkpoint, setCheckpoint] = useState<LoadedReviewCheckpoint | null>(null)
   const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null)
   const [bundleRun, setBundleRun] = useState<ReviewBundleRun | null>(null)
   const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
@@ -216,9 +255,17 @@ function App() {
   const [replyLoading, setReplyLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [status, setStatus] = useState('')
+  const [stateConflict, setStateConflict] = useState(false)
+  const [statePersistenceFailed, setStatePersistenceFailed] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [result, setResult] = useState<FinalizeResult | null>(null)
   const restoredRef = useRef(false)
+  const activeRoundIdRef = useRef<string | null>(null)
+  const stateRevisionRef = useRef(0)
+  const persistedStateRef = useRef('')
+  const desiredStateRef = useRef('')
+  const stateSaveRunningRef = useRef<string | null>(null)
+  const stateSavePromiseRef = useRef<Promise<void> | null>(null)
 
   const emails = snapshot?.emails ?? []
   const bundles = bundleRun?.bundles ?? []
@@ -238,6 +285,10 @@ function App() {
   const isSecondaryActionMarked = summary ? secondaryActionIds.has(summary.id) : false
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
+  const analysisPollTarget =
+    snapshot && !bundleRun && snapshot.analysis.status !== 'complete'
+      ? `${snapshot.snapshotId}\0${snapshot.csrfToken}\0${options?.codex.configured ? 'codex-ready' : 'codex-missing'}`
+      : null
   const finalizedEmailIds = useMemo(
     () => emails.map((item) => item.id).filter((id) => processedIds.has(id)),
     [emails, processedIds],
@@ -255,81 +306,122 @@ function App() {
     [finalizedEmailIds, finalizedKeptUnreadIds],
   )
 
-  const startReview = useCallback(async (nextFilters: ReviewFilters, resume = loadCheckpoint()) => {
-    setLoading(true)
-    setError(null)
-    setStatus('Postfach wird abgefragt …')
-    try {
-      const nextSnapshot =
-        resume && resume.emailIds.length > 0
-          ? await api.resumeReview(resume.emailIds, resume.filters)
-          : await api.createReview(nextFilters)
-      setSnapshot(nextSnapshot)
-      setBundleRun(null)
-      setConfirmedBundleIds(new Set())
-      setFilters(nextSnapshot.filters)
-      setDetails({})
-      setThreadContexts({})
-      setReplyProposals({})
-      setDraftResults({})
-      setView('review')
-      setOverviewOpen(false)
-      setReplyOpen(false)
-      if (resume) {
-        setIndex(resume.index)
-        const available = new Set(nextSnapshot.emails.map((item) => item.id))
-        setKeptUnread(new Set(resume.keptUnreadIds.filter((id) => available.has(id))))
-        setProcessedIds(new Set(resume.processedIds.filter((id) => available.has(id))))
-        setSecondaryActionIds(
-          new Set(
-            resume.secondaryActionIds.filter(
+  const applySnapshot = useCallback((nextSnapshot: ReviewSnapshot) => {
+    setStateConflict(false)
+    setStatePersistenceFailed(false)
+    activeRoundIdRef.current = nextSnapshot.snapshotId
+    const state = nextSnapshot.userState
+    const nextBundleRun = nextSnapshot.bundleRun
+      ? restoreBundleGroups(nextSnapshot.bundleRun, state.bundleGroups, nextSnapshot.emails)
+      : null
+    const nextIndex = clampIndex(state.index, nextBundleRun?.bundles.length ?? 0)
+    setSnapshot(nextSnapshot)
+    setBundleRun(nextBundleRun)
+    setFilters(nextSnapshot.filters)
+    setIndex(nextIndex)
+    setSelectedMemberId(
+      state.selectedMemberId &&
+        nextBundleRun?.bundles[nextIndex]?.emailIds.includes(state.selectedMemberId)
+        ? state.selectedMemberId
+        : (nextBundleRun?.bundles[nextIndex]?.emailIds[0] ?? null),
+    )
+    setKeptUnread(new Set(state.keptUnreadIds))
+    setProcessedIds(new Set(state.processedIds))
+    setSecondaryActionIds(new Set(state.secondaryActionIds))
+    setReplyDrafts(state.replyDrafts)
+    setResult(nextSnapshot.finalization.result)
+    setView(
+      nextSnapshot.finalization.status === 'finalized' && nextSnapshot.finalization.result
+        ? 'done'
+        : nextSnapshot.finalization.selectionLocked
+          ? 'confirm'
+          : 'review',
+    )
+    stateRevisionRef.current = state.revision
+    const stateFingerprint = stableReviewStateJson({ ...state, revision: undefined })
+    persistedStateRef.current = stateFingerprint
+    desiredStateRef.current = stateFingerprint
+    setCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
+    saveCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
+    restoredRef.current = true
+    if (nextBundleRun?.fallback) {
+      setStatus('Die Analyse nutzt eine sichere Einzelansicht.')
+    } else if (nextBundleRun) {
+      setStatus(
+        `${nextSnapshot.emails.length} Nachrichten in ${nextBundleRun.bundles.length} Storys gebündelt.`,
+      )
+    } else {
+      setStatus(analysisStatus(nextSnapshot.analysis))
+    }
+  }, [])
+
+  const startReview = useCallback(
+    async (nextFilters: ReviewFilters, resume: LoadedReviewCheckpoint | null = null) => {
+      setLoading(true)
+      setError(null)
+      setStatus(resume ? 'Offene Runde wird geladen …' : 'Postfach wird abgefragt …')
+      try {
+        let nextSnapshot: ReviewSnapshot
+        if (resume?.version === 7) {
+          nextSnapshot = await api.review(resume.roundId)
+        } else if (resume?.version === 6 && resume.emailIds.length > 0) {
+          nextSnapshot = await api.resumeReview(resume.emailIds, resume.filters)
+          const available = new Set(nextSnapshot.emails.map((item) => item.id))
+          const availableGroups = resume.bundleGroups.map((group) =>
+            group.filter((id) => available.has(id)),
+          )
+          const groupsCoverRound =
+            availableGroups.flat().length === available.size &&
+            new Set(availableGroups.flat()).size === available.size
+          const migrated = await api.updateReviewState(nextSnapshot, 0, {
+            bundleGroups: groupsCoverRound
+              ? availableGroups.filter((group) => group.length > 0)
+              : [],
+            index: resume.index,
+            keptUnreadIds: resume.keptUnreadIds.filter((id) => available.has(id)),
+            processedIds: resume.processedIds.filter((id) => available.has(id)),
+            replyDrafts: Object.fromEntries(
+              Object.entries(resume.replyDrafts).filter(([id]) => available.has(id)),
+            ),
+            secondaryActionIds: resume.secondaryActionIds.filter(
               (id) =>
                 available.has(id) &&
                 (nextSnapshot.filters.spam === 'only' ||
                   nextSnapshot.emails.some((item) => item.id === id && item.isNewsletter)),
             ),
-          ),
-        )
-        setReplyDrafts(resume.replyDrafts)
-        const missing = nextSnapshot.missingIds.length
-        setStatus(
-          missing > 0
-            ? `Checkpoint fortgesetzt; ${missing} Nachricht${missing === 1 ? '' : 'en'} nicht mehr verfügbar.`
-            : 'Checkpoint fortgesetzt.',
-        )
-      } else {
-        setIndex(0)
-        setKeptUnread(new Set())
-        setProcessedIds(new Set())
-        setSecondaryActionIds(new Set())
-        setReplyDrafts({})
-        setStatus(`${nextSnapshot.emails.length} ungelesene Nachrichten geladen.`)
+            selectedMemberId: null,
+          })
+          nextSnapshot = { ...nextSnapshot, userState: migrated }
+        } else {
+          nextSnapshot = await api.createReview(nextFilters)
+        }
+        setRoundUrl(nextSnapshot.snapshotId, resume?.version === 7)
+        setConfirmedBundleIds(new Set())
+        setDetails({})
+        setThreadContexts({})
+        setReplyProposals({})
+        setDraftResults({})
+        setOverviewOpen(false)
+        setReplyOpen(false)
+        applySnapshot(nextSnapshot)
+      } catch (cause) {
+        if (
+          resume?.version === 7 &&
+          cause instanceof ClientApiError &&
+          cause.code === 'REVIEW_EXPIRED'
+        ) {
+          clearCheckpoint()
+          setCheckpoint(null)
+          setRoundUrl(null, true)
+        }
+        setError(errorMessage(cause))
+        setStatus('Runde konnte nicht geladen werden.')
+      } finally {
+        setLoading(false)
       }
-      setStatus('Zusammengehörige Nachrichten werden gebündelt …')
-      const loadedBundleRun = await api.bundles(nextSnapshot)
-      const nextBundleRun = resume
-        ? restoreBundleGroups(loadedBundleRun, resume.bundleGroups, nextSnapshot.emails)
-        : loadedBundleRun
-      setBundleRun(nextBundleRun)
-      const nextIndex = clampIndex(resume?.index ?? 0, nextBundleRun.bundles.length)
-      setIndex(nextIndex)
-      setSelectedMemberId(nextBundleRun.bundles[nextIndex]?.emailIds[0] ?? null)
-      if (nextBundleRun.fallback) {
-        setStatus('Bundelung war nicht verfügbar; jede Nachricht bleibt einzeln prüfbar.')
-      } else if (!resume) {
-        setStatus(
-          `${nextSnapshot.emails.length} Nachrichten in ${nextBundleRun.bundles.length} Storys gebündelt.`,
-        )
-      }
-      setCheckpoint(resume)
-      restoredRef.current = true
-    } catch (cause) {
-      setError(errorMessage(cause))
-      setStatus('Postfach konnte nicht geladen werden.')
-    } finally {
-      setLoading(false)
-    }
-  }, [])
+    },
+    [applySnapshot],
+  )
 
   useEffect(() => {
     if (!currentBundle) return
@@ -341,23 +433,73 @@ function App() {
   useEffect(() => {
     let active = true
     void (async () => {
-      try {
-        const nextOptions = await api.options()
-        if (!active) return
-        setOptions(nextOptions)
-        const savedCheckpoint = loadCheckpoint()
-        setCheckpoint(savedCheckpoint)
-        setFilters(savedCheckpoint?.filters ?? defaultReviewFilters)
-        setLoading(false)
-      } catch (cause) {
-        if (active) setError(errorMessage(cause))
-        if (active) setLoading(false)
+      const savedCheckpoint = loadCheckpoint()
+      const pathRoundId = roundIdFromPath()
+      const [loadedOptions, loadedRound] = await Promise.allSettled([
+        api.options(),
+        pathRoundId ? api.review(pathRoundId) : Promise.resolve(null),
+      ])
+      if (!active) return
+      if (loadedOptions.status === 'fulfilled') setOptions(loadedOptions.value)
+      else setError(errorMessage(loadedOptions.reason))
+      setCheckpoint(savedCheckpoint)
+      if (savedCheckpoint?.version === 6) setFilters(savedCheckpoint.filters)
+      if (loadedRound.status === 'fulfilled' && loadedRound.value) {
+        applySnapshot(loadedRound.value)
+        setRoundUrl(loadedRound.value.snapshotId, true)
+      } else if (loadedRound.status === 'rejected') {
+        if (
+          loadedRound.reason instanceof ClientApiError &&
+          loadedRound.reason.code === 'REVIEW_EXPIRED'
+        ) {
+          if (savedCheckpoint?.version === 7 && savedCheckpoint.roundId === pathRoundId) {
+            clearCheckpoint()
+            setCheckpoint(null)
+          }
+          setRoundUrl(null, true)
+        }
+        setError(errorMessage(loadedRound.reason))
       }
+      setLoading(false)
     })()
     return () => {
       active = false
     }
-  }, [])
+  }, [applySnapshot])
+
+  useEffect(() => {
+    let generation = 0
+    const onPopState = () => {
+      generation += 1
+      const currentGeneration = generation
+      const roundId = roundIdFromPath()
+      restoredRef.current = false
+      activeRoundIdRef.current = null
+      setError(null)
+      if (!roundId) {
+        setSnapshot(null)
+        setBundleRun(null)
+        setResult(null)
+        setView('review')
+        setCheckpoint(loadCheckpoint())
+        return
+      }
+      setLoading(true)
+      void api
+        .review(roundId)
+        .then((round) => {
+          if (generation === currentGeneration) applySnapshot(round)
+        })
+        .catch((cause) => {
+          if (generation === currentGeneration) setError(errorMessage(cause))
+        })
+        .finally(() => {
+          if (generation === currentGeneration) setLoading(false)
+        })
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+  }, [applySnapshot])
 
   useEffect(() => {
     if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
@@ -372,7 +514,26 @@ function App() {
         if (!active) return
         if (next.status === 'completed') {
           const auth = await api.codexStatus()
-          if (active) setOptions((current) => (current ? { ...current, codex: auth } : current))
+          if (!active) return
+          setOptions((current) => (current ? { ...current, codex: auth } : current))
+          if (
+            auth.configured &&
+            snapshot?.analysis.phase === 'waiting_for_codex' &&
+            snapshot.analysis.status === 'pending'
+          ) {
+            try {
+              const resumed = await api.bundles(snapshot)
+              if (!active) return
+              applySnapshot(resumed)
+            } catch (cause) {
+              if (active) {
+                setError(errorMessage(cause))
+                setStatus('Codex ist verbunden, aber die Analyse konnte nicht fortgesetzt werden.')
+              }
+            }
+          }
+          if (active) setCodexLogin(next)
+          return
         }
         if (active) setCodexLogin(next)
       } catch (cause) {
@@ -396,26 +557,136 @@ function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [codexLoginId, codexLoginStatus])
+  }, [
+    applySnapshot,
+    codexLoginId,
+    codexLoginStatus,
+    snapshot?.analysis.phase,
+    snapshot?.analysis.status,
+    snapshot,
+  ])
 
   useEffect(() => {
-    if (!snapshot || !restoredRef.current || emails.length === 0) return
-    const saved = saveCheckpoint({
-      version: 6,
+    if (!analysisPollTarget) return
+    const [analysisRoundId, analysisCsrfToken] = analysisPollTarget.split('\0')
+    if (!analysisRoundId || !analysisCsrfToken) return
+    let active = true
+    let timer = 0
+    void (async () => {
+      try {
+        let nextSnapshot = await api.bundles({
+          csrfToken: analysisCsrfToken,
+          snapshotId: analysisRoundId,
+        })
+        while (
+          active &&
+          nextSnapshot.analysis.status !== 'complete' &&
+          nextSnapshot.analysis.phase !== 'waiting_for_codex' &&
+          !(nextSnapshot.analysis.status === 'pending' && nextSnapshot.analysis.error)
+        ) {
+          applySnapshot(nextSnapshot)
+          await new Promise<void>((resolve) => {
+            timer = window.setTimeout(resolve, 500)
+          })
+          if (!active) return
+          nextSnapshot = await api.review(analysisRoundId)
+        }
+        if (active) applySnapshot(nextSnapshot)
+      } catch (cause) {
+        if (active) {
+          setError(errorMessage(cause))
+          setStatus('Der Analysestatus konnte nicht geladen werden. Die Runde bleibt erhalten.')
+        }
+      }
+    })()
+    return () => {
+      active = false
+      window.clearTimeout(timer)
+    }
+  }, [analysisPollTarget, applySnapshot])
+
+  useEffect(() => {
+    if (
+      !snapshot ||
+      !bundleRun ||
+      !restoredRef.current ||
+      stateConflict ||
+      statePersistenceFailed ||
+      snapshot.finalization.selectionLocked ||
+      emails.length === 0
+    )
+      return
+    const state = {
       bundleGroups: bundles.map((bundle) => bundle.emailIds),
-      emailIds: emails.map((item) => item.id),
-      filters: snapshot.filters,
       index,
       keptUnreadIds: [...keptUnread],
       processedIds: [...processedIds],
-      secondaryActionIds: [...secondaryActionIds],
       replyDrafts,
-    })
-    if (!saved)
-      setError(
-        'Der lokale Checkpoint konnte nicht gespeichert werden. Dieses Fenster offen lassen.',
-      )
-  }, [bundles, emails, index, keptUnread, processedIds, replyDrafts, secondaryActionIds, snapshot])
+      secondaryActionIds: [...secondaryActionIds],
+      selectedMemberId,
+    }
+    const fingerprint = stableReviewStateJson(state)
+    desiredStateRef.current = fingerprint
+    if (fingerprint === persistedStateRef.current) return
+    const roundId = snapshot.snapshotId
+    const startDrain = () => {
+      if (stateSaveRunningRef.current === roundId || activeRoundIdRef.current !== roundId) return
+      stateSaveRunningRef.current = roundId
+      let saveFailed = false
+      const drain = async () => {
+        while (
+          activeRoundIdRef.current === roundId &&
+          desiredStateRef.current !== persistedStateRef.current
+        ) {
+          const desired = JSON.parse(desiredStateRef.current) as typeof state
+          const saved = await api.updateReviewState(snapshot, stateRevisionRef.current, desired)
+          if (activeRoundIdRef.current !== roundId) return
+          stateRevisionRef.current = saved.revision
+          persistedStateRef.current = stableReviewStateJson({ ...saved, revision: undefined })
+        }
+      }
+      const saving = drain()
+        .catch((cause) => {
+          saveFailed = true
+          if (activeRoundIdRef.current !== roundId) return
+          if (cause instanceof ClientApiError && cause.code === 'ROUND_REVISION_CONFLICT') {
+            restoredRef.current = false
+            setStateConflict(true)
+          } else {
+            restoredRef.current = false
+            setStatePersistenceFailed(true)
+            setError(errorMessage(cause))
+          }
+        })
+        .finally(() => {
+          if (stateSavePromiseRef.current === saving) stateSavePromiseRef.current = null
+          if (stateSaveRunningRef.current === roundId) stateSaveRunningRef.current = null
+          if (
+            !saveFailed &&
+            activeRoundIdRef.current === roundId &&
+            desiredStateRef.current !== persistedStateRef.current
+          ) {
+            queueMicrotask(startDrain)
+          }
+        })
+      stateSavePromiseRef.current = saving
+      void saving
+    }
+    startDrain()
+  }, [
+    bundleRun,
+    bundles,
+    emails.length,
+    index,
+    keptUnread,
+    processedIds,
+    replyDrafts,
+    secondaryActionIds,
+    selectedMemberId,
+    snapshot,
+    stateConflict,
+    statePersistenceFailed,
+  ])
 
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
@@ -443,12 +714,13 @@ function App() {
 
   const previous = useCallback(() => {
     if (view !== 'review') {
+      if (snapshot?.finalization.selectionLocked) return
       setView('review')
       return
     }
     setReplyOpen(false)
     setIndex((current) => Math.max(0, current - 1))
-  }, [view])
+  }, [snapshot?.finalization.selectionLocked, view])
 
   const next = useCallback(() => {
     if (view !== 'review' || !currentBundle) return
@@ -515,15 +787,16 @@ function App() {
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return
+      if (submitting) return
       if (event.key === 'Escape') {
         if (helpOpen) setHelpOpen(false)
         else if (mergeOpen) setMergeOpen(false)
         else if (replyOpen) setReplyOpen(false)
         else if (overviewOpen) setOverviewOpen(false)
-        else if (view === 'confirm') setView('review')
+        else if (view === 'confirm' && !snapshot?.finalization.selectionLocked) setView('review')
         return
       }
-      if (submitting || replyLoading) return
+      if (replyLoading) return
       if (isTypingTarget(event.target)) return
       if (event.key === '?') {
         event.preventDefault()
@@ -556,6 +829,7 @@ function App() {
     previous,
     replyLoading,
     replyOpen,
+    snapshot?.finalization.selectionLocked,
     submitting,
     toggleCurrent,
     toggleSecondaryAction,
@@ -645,25 +919,50 @@ function App() {
     setSubmitting(true)
     setError(null)
     try {
+      while (stateSavePromiseRef.current) await stateSavePromiseRef.current
+      if (!restoredRef.current) {
+        return
+      }
       const nextResult = await api.finalize(
         snapshot,
+        stateRevisionRef.current,
         finalizedEmailIds,
         finalizedKeptUnreadIds,
         finalizedSecondaryActionIds,
       )
       setResult(nextResult)
+      setSnapshot((current) =>
+        current
+          ? {
+              ...current,
+              finalization: {
+                result: nextResult,
+                selectionLocked: true,
+                status: nextResult.finalized ? 'finalized' : 'active',
+              },
+            }
+          : current,
+      )
       if (nextResult.finalized) {
         clearCheckpoint()
         restoredRef.current = false
+        activeRoundIdRef.current = null
         setView('done')
         setStatus('Review abgeschlossen.')
       } else {
+        setView('confirm')
         setError(
           `${nextResult.remaining} Änderungen sind fehlgeschlagen. Du kannst sie erneut versuchen.`,
         )
         setStatus('Review teilweise gespeichert.')
       }
     } catch (cause) {
+      try {
+        const latest = await api.review(snapshot.snapshotId)
+        if (latest.finalization.selectionLocked) applySnapshot(latest)
+      } catch {
+        // Keep the original finalization error. Reload remains available if recovery also fails.
+      }
       setError(errorMessage(cause))
     } finally {
       setSubmitting(false)
@@ -674,32 +973,36 @@ function App() {
     clearCheckpoint()
     setCheckpoint(null)
     restoredRef.current = false
+    activeRoundIdRef.current = null
+    setRoundUrl(null, true)
     await startReview(filters, null)
   }
 
   async function showSetup(discardCheckpoint = false) {
     if (discardCheckpoint) clearCheckpoint()
-    else if (snapshot && emails.length > 0) {
-      saveCheckpoint({
-        version: 6,
-        bundleGroups: bundles.map((bundle) => bundle.emailIds),
-        emailIds: emails.map((item) => item.id),
-        filters: snapshot.filters,
-        index,
-        keptUnreadIds: [...keptUnread],
-        processedIds: [...processedIds],
-        secondaryActionIds: [...secondaryActionIds],
-        replyDrafts,
-      })
-    }
+    else if (snapshot) saveCheckpoint({ version: 7, roundId: snapshot.snapshotId })
     restoredRef.current = false
-    setCheckpoint(discardCheckpoint ? null : loadCheckpoint())
+    activeRoundIdRef.current = null
+    setCheckpoint(
+      discardCheckpoint
+        ? null
+        : snapshot
+          ? { version: 7, roundId: snapshot.snapshotId }
+          : loadCheckpoint(),
+    )
     setSnapshot(null)
+    setBundleRun(null)
+    setDetails({})
+    setThreadContexts({})
+    setReplyProposals({})
+    setDraftResults({})
+    setReplyDrafts({})
     setResult(null)
     setView('review')
     setOverviewOpen(false)
     setReplyOpen(false)
     setError(null)
+    setRoundUrl(null)
     try {
       setOptions(await api.options())
     } catch (cause) {
@@ -839,6 +1142,20 @@ function App() {
     }
   }
 
+  const codexDialog =
+    codexLoginOpen && options ? (
+      <CodexLoginDialog
+        authConfigured={options.codex.configured}
+        busy={codexLoginBusy}
+        login={codexLogin}
+        model={options.codex.model}
+        modelBusy={codexModelBusy}
+        onClose={() => setCodexLoginOpen(false)}
+        onModelChange={(model) => void changeCodexModel(model)}
+        onStart={() => void startCodexLogin()}
+      />
+    ) : null
+
   if (loading) {
     return (
       <main className="state-page" aria-busy="true">
@@ -849,7 +1166,7 @@ function App() {
     )
   }
 
-  if (error && !options) {
+  if (error && !options && !snapshot && !checkpoint) {
     return (
       <main className="state-page">
         <h1>Postfach nicht erreichbar</h1>
@@ -863,15 +1180,25 @@ function App() {
 
   if (!snapshot) {
     return (
-      <ReviewSetup
-        checkpoint={checkpoint}
-        error={error}
-        filters={filters}
-        options={options}
-        onChange={setFilters}
-        onResume={() => checkpoint && void startReview(checkpoint.filters, checkpoint)}
-        onStart={() => void startNewReview()}
-      />
+      <>
+        <ReviewSetup
+          checkpoint={checkpoint}
+          error={error}
+          filters={filters}
+          options={options}
+          onChange={setFilters}
+          onCodex={() => setCodexLoginOpen(true)}
+          onResume={() =>
+            checkpoint &&
+            void startReview(
+              checkpoint.version === 6 ? checkpoint.filters : defaultReviewFilters,
+              checkpoint,
+            )
+          }
+          onStart={() => void startNewReview()}
+        />
+        {codexDialog}
+      </>
     )
   }
 
@@ -884,6 +1211,102 @@ function App() {
           Auswahl ändern
         </button>
       </main>
+    )
+  }
+
+  if (stateConflict) {
+    return (
+      <main className="state-page">
+        <h1>Runde wurde in einem anderen Tab geändert</h1>
+        <p>
+          Deine Ansicht ist veraltet. Lade die Runde neu, damit keine Entscheidung überschrieben
+          wird.
+        </p>
+        <button type="button" className="button primary" onClick={() => window.location.reload()}>
+          Runde neu laden
+        </button>
+      </main>
+    )
+  }
+
+  if (statePersistenceFailed) {
+    return (
+      <main className="state-page">
+        <h1>Rundenstand konnte nicht gespeichert werden</h1>
+        <p>
+          Die letzte Entscheidung wurde nicht bestätigt. Lade die Runde neu, bevor du
+          weiterarbeitest.
+        </p>
+        <button type="button" className="button primary" onClick={() => window.location.reload()}>
+          Runde neu laden
+        </button>
+      </main>
+    )
+  }
+
+  if (!bundleRun) {
+    const percent = Math.round(snapshot.analysis.progress * 100)
+    const waitingForCodex = snapshot.analysis.phase === 'waiting_for_codex'
+    return (
+      <>
+        <main
+          className="state-page analysis-page"
+          aria-busy={snapshot.analysis.status !== 'complete'}
+        >
+          {snapshot.analysis.status !== 'complete' && !waitingForCodex && (
+            <div className="spinner" aria-hidden="true" />
+          )}
+          <p className="analysis-origin">{analysisOrigin(snapshot.analysis)}</p>
+          <h1>
+            {waitingForCodex ? 'Codex-Anmeldung erforderlich' : 'Zusammenhänge werden analysiert'}
+          </h1>
+          <p>{analysisStatus(snapshot.analysis)}</p>
+          <div
+            className="analysis-progress"
+            role="progressbar"
+            aria-label="Analysefortschritt"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={percent}
+          >
+            <span style={{ width: `${percent}%` }} />
+          </div>
+          <p className="analysis-detail">
+            {snapshot.analysis.processedEmailCount} von {snapshot.analysis.totalEmailCount}{' '}
+            Nachrichten · Runde {snapshot.snapshotId.slice(0, 8)}
+            {snapshot.analysis.callCount > 0 && ` · ${snapshot.analysis.callCount} Codex-Aufrufe`}
+          </p>
+          {waitingForCodex && (
+            <button
+              type="button"
+              className="button primary analysis-login"
+              onClick={() => setCodexLoginOpen(true)}
+            >
+              Codex wieder verbinden
+            </button>
+          )}
+          {(error ||
+            (snapshot.analysis.error && !waitingForCodex) ||
+            snapshot.analysis.status === 'complete') && (
+            <div className="inline-error" role="alert">
+              <strong>Die Runde bleibt gespeichert.</strong>
+              <p>
+                {error ||
+                  snapshot.analysis.error ||
+                  'Das Analyseergebnis ist unvollständig. Lade dieselbe Runde erneut.'}
+              </p>
+              <button
+                type="button"
+                className="button secondary"
+                onClick={() => window.location.reload()}
+              >
+                Dieselbe Runde neu laden
+              </button>
+            </div>
+          )}
+        </main>
+        {codexDialog}
+      </>
     )
   }
 
@@ -913,7 +1336,7 @@ function App() {
             </ul>
           </div>
         )}
-        <button type="button" className="button primary" onClick={() => void showSetup()}>
+        <button type="button" className="button primary" onClick={() => void showSetup(true)}>
           Neue Runde auswählen
         </button>
       </main>
@@ -987,7 +1410,7 @@ function App() {
             type="button"
             className="button secondary"
             onClick={() => setView('review')}
-            disabled={submitting}
+            disabled={submitting || Boolean(result) || snapshot.finalization.selectionLocked}
           >
             Zurück
           </button>
@@ -1008,14 +1431,27 @@ function App() {
     )
   }
 
-  if (!summary) return null
-
-  if (!currentBundle) return null
+  if (!summary || !currentBundle) {
+    return (
+      <main className="state-page">
+        <h1>Storys nicht verfügbar</h1>
+        <p>Die Runde ist gespeichert, aber das Analyseergebnis ist unvollständig.</p>
+        <button type="button" className="button secondary" onClick={() => window.location.reload()}>
+          Dieselbe Runde neu laden
+        </button>
+      </main>
+    )
+  }
 
   const progress = ((index + 1) / bundles.length) * 100
 
   return (
     <div className={`app-shell ${replyOpen ? 'with-reply' : ''}`}>
+      {snapshot.analysis.error && (
+        <p className="snapshot-warning" role="status">
+          {snapshot.analysis.error}
+        </p>
+      )}
       <header className="topbar">
         <button
           type="button"
@@ -1030,6 +1466,14 @@ function App() {
         </button>
         <div className="top-actions">
           {snapshot.mode === 'demo' && <span className="mode-label">Demo</span>}
+          <span
+            className={`analysis-badge ${snapshot.analysis.engine}`}
+            title={analysisOrigin(snapshot.analysis)}
+          >
+            {analysisOrigin(snapshot.analysis)}
+            {snapshot.analysis.callCount > 0 &&
+              ` · ${snapshot.analysis.callCount} ${snapshot.analysis.callCount === 1 ? 'Aufruf' : 'Aufrufe'}`}
+          </span>
           {snapshot.mode === 'live' && (
             <button
               type="button"
@@ -1328,18 +1772,7 @@ function App() {
           onSelect={(targetIndex) => void mergeCurrentBundle(targetIndex)}
         />
       )}
-      {codexLoginOpen && options && (
-        <CodexLoginDialog
-          authConfigured={options.codex.configured}
-          busy={codexLoginBusy}
-          login={codexLogin}
-          model={options.codex.model}
-          modelBusy={codexModelBusy}
-          onClose={() => setCodexLoginOpen(false)}
-          onModelChange={(model) => void changeCodexModel(model)}
-          onStart={() => void startCodexLogin()}
-        />
-      )}
+      {codexDialog}
       {replyOpen && (
         <ReplyPanel
           context={thread}
@@ -1410,14 +1843,16 @@ function ReviewSetup({
   filters,
   options,
   onChange,
+  onCodex,
   onResume,
   onStart,
 }: {
-  checkpoint: ReviewCheckpoint | null
+  checkpoint: LoadedReviewCheckpoint | null
   error: string | null
   filters: ReviewFilters
   options: ReviewOptions | null
   onChange: (filters: ReviewFilters) => void
+  onCodex: () => void
   onResume: () => void
   onStart: () => void
 }) {
@@ -1450,16 +1885,34 @@ function ReviewSetup({
         <p>Stell die Runde zusammen, bevor eine einzige Nachricht geladen wird.</p>
       </header>
 
-      {checkpoint && checkpoint.emailIds.length > 0 && (
+      {checkpoint && (checkpoint.version === 7 || checkpoint.emailIds.length > 0) && (
         <section className="resume-review" aria-labelledby="resume-title">
           <div>
             <h2 id="resume-title">Offene Runde</h2>
             <p>
-              {checkpoint.emailIds.length} Nachrichten · {checkpoint.processedIds.length} bearbeitet
+              {checkpoint.version === 7
+                ? `Runde ${checkpoint.roundId.slice(0, 8)} · serverseitig gespeichert`
+                : `${checkpoint.emailIds.length} Nachrichten · ${checkpoint.processedIds.length} bearbeitet`}
             </p>
           </div>
           <button type="button" className="button secondary" onClick={onResume}>
             Runde fortsetzen
+          </button>
+        </section>
+      )}
+
+      {options?.mode === 'live' && (
+        <section className="setup-integration" aria-labelledby="setup-codex-title">
+          <div>
+            <h2 id="setup-codex-title">Zusammenhänge mit Codex</h2>
+            <p>
+              {options.codex.configured
+                ? `Verbunden mit ${codexModels.find((model) => model.id === options.codex.model)?.label}. Codex prüft die Kandidaten einmal beim Start einer neuen Runde.`
+                : 'Nicht verbunden. Eine neue Runde nutzt sonst nur die lokale Analyse.'}
+            </p>
+          </div>
+          <button type="button" className="button secondary" onClick={onCodex}>
+            {options.codex.configured ? 'Codex einstellen' : 'Codex verbinden'}
           </button>
         </section>
       )}

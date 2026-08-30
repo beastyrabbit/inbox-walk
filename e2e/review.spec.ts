@@ -19,6 +19,161 @@ test('configures every new round on a dedicated direct-selection screen', async 
   await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
 })
 
+test('keeps a stable round URL across reload and the real resume action', async ({ page }) => {
+  const roundUrl = page.url()
+  expect(new URL(roundUrl).pathname).toMatch(/^\/rounds\/[0-9a-f-]+$/)
+
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  expect(page.url()).toBe(roundUrl)
+
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
+  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  expect(page.url()).toBe(roundUrl)
+})
+
+test('clears an expired resume pointer instead of offering it forever', async ({ page }) => {
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await page.evaluate(() => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({ version: 7, roundId: '00000000-0000-4000-8000-000000000000' }),
+    )
+  })
+  await page.reload()
+  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+
+  await expect(page.getByText('Diese Sitzung ist abgelaufen.')).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toHaveCount(0)
+  expect(new URL(page.url()).pathname).toBe('/')
+  expect(await page.evaluate(() => localStorage.getItem('inbox-walk:checkpoint:v1'))).toBeNull()
+})
+
+test('restores persisted review decisions after reload', async ({ page }) => {
+  await page.keyboard.press('ArrowUp')
+  await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await page.waitForTimeout(400)
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+})
+
+test('stops a stale tab instead of silently losing later decisions', async ({ page }) => {
+  let stateWrites = 0
+  await page.route('**/api/reviews/*/state', async (route) => {
+    stateWrites += 1
+    await route.fulfill({
+      status: 409,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: {
+          code: 'ROUND_REVISION_CONFLICT',
+          message: 'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
+          retryable: false,
+        },
+      }),
+    })
+  })
+  await page.keyboard.press('ArrowUp')
+  await expect(
+    page.getByRole('heading', { name: 'Runde wurde in einem anderen Tab geändert' }),
+  ).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Runde neu laden' })).toBeVisible()
+  const writesAfterConflict = stateWrites
+  await page.waitForTimeout(600)
+  expect(stateWrites).toBe(writesAfterConflict)
+})
+
+test('blocks the round after a state persistence failure without retrying forever', async ({
+  page,
+}) => {
+  let stateWrites = 0
+  await page.route('**/api/reviews/*/state', async (route) => {
+    stateWrites += 1
+    await route.fulfill({
+      status: 503,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: {
+          code: 'ROUND_PERSIST_FAILED',
+          message: 'Der Rundenstand konnte nicht dauerhaft gespeichert werden.',
+          retryable: true,
+        },
+      }),
+    })
+  })
+  await page.keyboard.press('ArrowUp')
+  await expect(
+    page.getByRole('heading', { name: 'Rundenstand konnte nicht gespeichert werden' }),
+  ).toBeVisible()
+  await expect(
+    page.getByRole('heading', { name: 'Runde wurde in einem anderen Tab geändert' }),
+  ).toHaveCount(0)
+  const writesAfterFailure = stateWrites
+  await page.waitForTimeout(600)
+  expect(stateWrites).toBe(writesAfterFailure)
+  expect(stateWrites).toBeLessThanOrEqual(2)
+})
+
+test('shows analysis provenance and never leaves a blank root on bundle failure', async ({
+  page,
+}) => {
+  await expect(page.getByText('Lokale Analyse', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await page.route('**/api/reviews/*/bundles', async (route) => {
+    await route.fulfill({
+      status: 504,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        error: {
+          code: 'BUNDLE_TIMEOUT',
+          message: 'Die Analyse antwortet gerade nicht.',
+          retryable: true,
+        },
+      }),
+    })
+  })
+  await page.getByRole('button', { name: 'Review starten' }).click()
+  await expect(page.getByRole('heading', { name: 'Zusammenhänge werden analysiert' })).toBeVisible()
+  await expect(page.getByText('Die Runde bleibt gespeichert.')).toBeVisible()
+  await expect(page.getByText('Die Analyse antwortet gerade nicht.')).toBeVisible()
+  await expect(page.locator('#root')).not.toBeEmpty()
+})
+
+test('names the attempted Codex model on a safe fallback result', async ({ page }) => {
+  await page.route(/\/api\/reviews\/[^/]+$/, async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        analysis: {
+          ...body.analysis,
+          callCount: 2,
+          engine: 'fallback',
+          model: 'gpt-5.6-sol',
+          phase: 'complete',
+          progress: 1,
+          status: 'complete',
+        },
+      },
+    })
+  })
+  await page.reload()
+  await expect(page.locator('.analysis-badge')).toHaveText(
+    'Sichere Einzelansicht · Codex-Versuch Sol · 2 Aufrufe',
+  )
+})
+
 test('reviews mail with keyboard decisions and exact overview navigation', async ({ page }) => {
   await page.keyboard.press('ArrowUp')
   await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
@@ -35,6 +190,10 @@ test('reviews mail with keyboard decisions and exact overview navigation', async
 })
 
 test('creates and verifies a draft without exposing a send action', async ({ page }) => {
+  let stateWrites = 0
+  page.on('request', (request) => {
+    if (/\/api\/reviews\/[^/]+\/state$/.test(new URL(request.url()).pathname)) stateWrites += 1
+  })
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await expect(page.getByRole('heading', { name: 'Antwortentwurf' })).toBeVisible()
   await expect(page.getByText(/Alle 1 Thread-Nachrichten/)).toBeVisible()
@@ -47,6 +206,8 @@ test('creates and verifies a draft without exposing a send action', async ({ pag
   await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveValue(/Ticket/)
   await page.getByRole('button', { name: 'In Fastmail als Draft speichern' }).click()
   await expect(page.getByText(/Draft gespeichert und verifiziert/)).toBeVisible()
+  await page.waitForTimeout(500)
+  expect(stateWrites).toBeLessThan(12)
 })
 
 test('requires confirmation before finalizing the fixed snapshot', async ({ page }) => {
@@ -71,6 +232,148 @@ test('can finalize only messages already confirmed with Weiter', async ({ page }
   await page.getByRole('button', { name: 'Änderungen speichern' }).click()
   await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
   await expect(page.getByText(/8 noch nicht bearbeitete Nachrichten/)).toBeVisible()
+})
+
+test('restores a partial finalization in the locked retry view after reload', async ({ page }) => {
+  let lockedSelection:
+    | {
+        finalizeIds: string[]
+        keepUnreadIds: string[]
+        secondaryActionIds?: string[]
+      }
+    | undefined
+  const partialResult = {
+    actionFailed: [],
+    failed: [{ id: 'temporary', reason: 'Fastmail hat die Änderung nicht bestätigt.' }],
+    finalized: false,
+    keptUnread: 0,
+    markedRead: 0,
+    mode: 'live',
+    processed: 1,
+    remaining: 1,
+    rescuedFromSpam: 0,
+    taggedForUnsubscribe: 0,
+    untouched: 8,
+  }
+  await page.route(/\/api\/reviews\/[^/]+$/, async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    if (!lockedSelection) {
+      await route.fulfill({ response, json: body })
+      return
+    }
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        finalization: { result: partialResult, selectionLocked: true, status: 'active' },
+        userState: {
+          ...body.userState,
+          keptUnreadIds: lockedSelection.keepUnreadIds,
+          processedIds: lockedSelection.finalizeIds,
+          secondaryActionIds: lockedSelection.secondaryActionIds ?? [],
+        },
+      },
+    })
+  })
+  await page.route('**/api/reviews/*/finalize', async (route) => {
+    lockedSelection = route.request().postDataJSON() as typeof lockedSelection
+    partialResult.failed[0].id = lockedSelection?.finalizeIds[0] ?? 'temporary'
+    await route.fulfill({ status: 207, json: partialResult })
+  })
+
+  await page.keyboard.press('ArrowRight')
+  await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
+  await page.getByRole('button', { name: 'Änderungen speichern' }).click()
+  await expect(page.getByRole('button', { name: 'Fehlgeschlagene erneut versuchen' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Zurück' })).toBeDisabled()
+
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Fehlgeschlagene erneut versuchen' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Zurück' })).toBeDisabled()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+})
+
+test('refreshes the durable lock after a post-lock finalization error', async ({ page }) => {
+  let locked = false
+  await page.route(/\/api\/reviews\/[^/]+$/, async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({
+      response,
+      json: locked
+        ? {
+            ...body,
+            finalization: { result: null, selectionLocked: true, status: 'active' },
+          }
+        : body,
+    })
+  })
+  await page.route('**/api/reviews/*/finalize', async (route) => {
+    locked = true
+    await route.fulfill({
+      status: 502,
+      json: {
+        error: {
+          code: 'FASTMAIL_TEMPORARY_FAILURE',
+          message: 'Fastmail hat nach dem Lock nicht geantwortet.',
+          retryable: true,
+        },
+      },
+    })
+  })
+
+  await page.keyboard.press('ArrowRight')
+  await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
+  await page.getByRole('button', { name: 'Änderungen speichern' }).click()
+  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Zurück' })).toBeDisabled()
+  await expect(page.getByText('Fastmail hat nach dem Lock nicht geantwortet.')).toBeVisible()
+})
+
+test('does not leave confirmation with Escape while finalization is in flight', async ({
+  page,
+}) => {
+  let releaseFinalize: (() => void) | undefined
+  const finalizeGate = new Promise<void>((resolve) => {
+    releaseFinalize = resolve
+  })
+  await page.route('**/api/reviews/*/finalize', async (route) => {
+    await finalizeGate
+    const selection = route.request().postDataJSON() as { finalizeIds: string[] }
+    await route.fulfill({
+      status: 207,
+      json: {
+        actionFailed: [],
+        failed: [
+          {
+            id: selection.finalizeIds[0],
+            reason: 'Fastmail hat die Änderung nicht bestätigt.',
+          },
+        ],
+        finalized: false,
+        keptUnread: 0,
+        markedRead: 0,
+        mode: 'live',
+        processed: selection.finalizeIds.length,
+        remaining: 1,
+        rescuedFromSpam: 0,
+        taggedForUnsubscribe: 0,
+        untouched: 8,
+      },
+    })
+  })
+
+  await page.keyboard.press('ArrowRight')
+  await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
+  await page.getByRole('button', { name: 'Änderungen speichern' }).click()
+  await expect(page.getByRole('button', { name: 'Wird gespeichert …' })).toBeDisabled()
+  await page.keyboard.press('Escape')
+  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+  releaseFinalize?.()
+  await expect(page.getByRole('button', { name: 'Fehlgeschlagene erneut versuchen' })).toBeVisible()
 })
 
 test('bundles connected GitHub and Railway notifications and keeps originals inspectable', async ({
@@ -134,6 +437,11 @@ test('selects the Codex model from the connection dialog', async ({ page }) => {
     const body = await response.json()
     await route.fulfill({ json: { ...body, mode: 'live' } })
   })
+  await page.route(/\/api\/reviews\/[^/]+$/, async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({ json: { ...body, mode: 'live' } })
+  })
   await page.route('**/api/auth/codex/model', async (route) => {
     const request = route.request().postDataJSON() as { model: string }
     await route.fulfill({
@@ -143,8 +451,7 @@ test('selects the Codex model from the connection dialog', async ({ page }) => {
 
   await page.evaluate(() => localStorage.clear())
   await page.goto('/')
-  await page.getByRole('button', { name: 'Review starten' }).click()
-  await page.getByRole('button', { name: 'Codex verbunden' }).click()
+  await page.getByRole('button', { name: 'Codex einstellen' }).click()
 
   await expect(page.getByRole('heading', { name: 'Codex einrichten' })).toBeVisible()
   await expect(page.getByLabel('Sol')).toBeChecked()

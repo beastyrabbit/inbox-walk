@@ -33,87 +33,53 @@ class MemoryStorage implements Storage {
 const storage = new MemoryStorage()
 Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage })
 
-beforeEach(() => storage.clear())
+beforeEach(() => {
+  storage.clear()
+  clearCheckpoint()
+})
 
 describe('local review checkpoint', () => {
-  it('stores IDs and decisions without message bodies', () => {
+  it('stores only the opaque round pointer', () => {
     saveCheckpoint({
-      version: 6,
-      bundleGroups: [['mail-1']],
-      emailIds: ['mail-1'],
-      filters: {
-        hideReviewed: false,
-        mailboxId: null,
-        newsletter: 'all',
-        spam: 'exclude',
-        timeRange: '7d',
-      },
-      index: 0,
-      keptUnreadIds: ['mail-1'],
-      processedIds: ['mail-1'],
-      secondaryActionIds: [],
-      replyDrafts: {},
+      version: 7,
+      roundId: 'round-123',
     })
-    expect(loadCheckpoint()).toMatchObject({
-      emailIds: ['mail-1'],
-      keptUnreadIds: ['mail-1'],
-      processedIds: ['mail-1'],
-    })
+    expect(loadCheckpoint()).toEqual({ version: 7, roundId: 'round-123' })
     expect(JSON.stringify(localStorage)).not.toContain('message body')
   })
 
-  it('restores more than 250 stable snapshot IDs', () => {
+  it('still reads a legacy checkpoint with more than 250 stable snapshot IDs', () => {
     const emailIds = Array.from({ length: 301 }, (_, index) => `mail-${index}`)
-    saveCheckpoint({
-      version: 6,
-      bundleGroups: [emailIds],
-      emailIds,
-      filters: {
-        hideReviewed: false,
-        mailboxId: null,
-        newsletter: 'all',
-        spam: 'exclude',
-        timeRange: 'all',
-      },
-      index: 0,
-      keptUnreadIds: [],
-      processedIds: [],
-      secondaryActionIds: [],
-      replyDrafts: {},
-    })
-    expect(loadCheckpoint()?.emailIds).toEqual(emailIds)
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [emailIds],
+        emailIds,
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: [],
+        processedIds: [],
+        secondaryActionIds: [],
+        replyDrafts: {},
+      }),
+    )
+    const checkpoint = loadCheckpoint()
+    expect(checkpoint?.version).toBe(6)
+    if (checkpoint?.version === 6) expect(checkpoint.emailIds).toEqual(emailIds)
+    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBeNull()
   })
 
-  it('removes invalid and explicitly cleared checkpoints', () => {
-    localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
-    expect(loadCheckpoint()).toBeNull()
-    saveCheckpoint({
-      version: 6,
-      bundleGroups: [],
-      emailIds: [],
-      filters: {
-        hideReviewed: false,
-        mailboxId: null,
-        newsletter: 'all',
-        spam: 'exclude',
-        timeRange: 'all',
-      },
-      index: 0,
-      keptUnreadIds: [],
-      processedIds: [],
-      secondaryActionIds: [],
-      replyDrafts: {},
-    })
-    clearCheckpoint()
-    expect(loadCheckpoint()).toBeNull()
-  })
-
-  it('reports storage quota failures without throwing', () => {
-    vi.spyOn(storage, 'setItem').mockImplementationOnce(() => {
-      throw new DOMException('Quota exceeded', 'QuotaExceededError')
-    })
-    expect(
-      saveCheckpoint({
+  it('keeps a parsed legacy checkpoint in memory across a StrictMode remount', () => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
         version: 6,
         bundleGroups: [['mail-1']],
         emailIds: ['mail-1'],
@@ -130,7 +96,67 @@ describe('local review checkpoint', () => {
         secondaryActionIds: [],
         replyDrafts: {},
       }),
+    )
+
+    const firstMount = loadCheckpoint()
+    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBeNull()
+    expect(loadCheckpoint()).toEqual(firstMount)
+
+    saveCheckpoint({ version: 7, roundId: 'migrated-round' })
+    expect(loadCheckpoint()).toEqual({ version: 7, roundId: 'migrated-round' })
+  })
+
+  it('removes invalid and explicitly cleared checkpoints', () => {
+    localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
+    expect(loadCheckpoint()).toBeNull()
+    saveCheckpoint({
+      version: 7,
+      roundId: 'round-123',
+    })
+    clearCheckpoint()
+    expect(loadCheckpoint()).toBeNull()
+  })
+
+  it('reports storage quota failures without throwing', () => {
+    vi.spyOn(storage, 'setItem').mockImplementationOnce(() => {
+      throw new DOMException('Quota exceeded', 'QuotaExceededError')
+    })
+    expect(
+      saveCheckpoint({
+        version: 7,
+        roundId: 'round-123',
+      }),
     ).toBe(false)
+  })
+
+  it('keeps a volatile legacy checkpoint when writing its v7 pointer fails', () => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [['mail-1']],
+        emailIds: ['mail-1'],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: ['mail-1'],
+        processedIds: ['mail-1'],
+        secondaryActionIds: [],
+        replyDrafts: {},
+      }),
+    )
+    const legacy = loadCheckpoint()
+    vi.spyOn(storage, 'setItem').mockImplementationOnce(() => {
+      throw new DOMException('Quota exceeded', 'QuotaExceededError')
+    })
+
+    expect(saveCheckpoint({ version: 7, roundId: 'migrated-round' })).toBe(false)
+    expect(loadCheckpoint()).toEqual(legacy)
   })
 
   it('migrates old checkpoints without assuming messages were processed', () => {
@@ -153,5 +179,6 @@ describe('local review checkpoint', () => {
       processedIds: [],
       secondaryActionIds: ['mail-1'],
     })
+    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBeNull()
   })
 })

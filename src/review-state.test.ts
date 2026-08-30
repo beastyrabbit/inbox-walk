@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { clampIndex, idsToMarkRead, toggleKeptUnread } from './review-state.ts'
+import {
+  clampIndex,
+  idsToMarkRead,
+  stableReviewStateJson,
+  toggleKeptUnread,
+} from './review-state.ts'
 
 describe('review decisions', () => {
   it('keeps protected messages out of the final read set', () => {
@@ -19,5 +24,28 @@ describe('review decisions', () => {
     expect(clampIndex(-2, 3)).toBe(0)
     expect(clampIndex(9, 3)).toBe(2)
     expect(clampIndex(2, 0)).toBe(0)
+  })
+
+  it('compares server-normalized drafts without depending on object key order', () => {
+    const client = {
+      replyDrafts: {
+        mail: {
+          bodyText: 'Draft',
+          to: [{ name: 'Alex', email: 'alex@example.com' }],
+          draftRequestId: 'request-id',
+        },
+      },
+    }
+    const server = {
+      replyDrafts: {
+        mail: {
+          bodyText: 'Draft',
+          draftRequestId: 'request-id',
+          to: [{ email: 'alex@example.com', name: 'Alex' }],
+        },
+      },
+    }
+
+    expect(stableReviewStateJson(client)).toBe(stableReviewStateJson(server))
   })
 })

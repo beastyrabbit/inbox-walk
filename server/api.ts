@@ -1,4 +1,4 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -14,22 +14,30 @@ import type {
   MailIdentity,
   MailResource,
   ReplyProposal,
+  ReviewAnalysisState,
   ReviewBundleRun,
   ReviewEmail,
   ReviewEmailSummary,
   ReviewFilters,
+  ReviewFinalizationState,
+  ReviewRoundUserState,
   ReviewSnapshot,
   ThreadMessage,
 } from '../src/shared.ts'
-import { defaultReviewFilters } from '../src/shared.ts'
+import { defaultReviewFilters, isCodexModelId } from '../src/shared.ts'
+import { createCheckpointedBundleDecider } from './bundle-checkpoint.ts'
 import type { BundleStore } from './bundle-store.ts'
 import {
+  type BundleBuildProgress,
+  type BundleExample,
   buildReviewBundles,
   type DecideBundle,
   learningSignalsFor,
   singletonBundleRun,
+  validateBundlePartition,
 } from './bundles.ts'
 import {
+  CodexAuthenticationError,
   codexAuthStatus,
   getCodexAuthStorage,
   runCodexBundleDecision,
@@ -62,14 +70,24 @@ import {
   type ReplyRequest,
 } from './reply.ts'
 import type { ReviewHistory } from './review-history.ts'
+import {
+  cleanBundleExamples,
+  type RoundFinalizationUpdate,
+  RoundNotFoundError,
+  RoundRevisionConflictError,
+  type RoundStore,
+  type StoredReviewRound,
+} from './round-store.ts'
 import { fetchRemoteImage, SafeHttpError } from './safe-http.ts'
 
 const MAX_JSON_BYTES = 256 * 1024
 const MAX_SELECTION_JSON_BYTES = 16 * 1024 * 1024
 const MAX_SNAPSHOTS = 20
 const SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000
+const SNAPSHOT_PRUNE_INTERVAL_MS = 60 * 1000
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 const INLINE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp'])
+const REVIEW_CONFIRMED_BUNDLE_REASON = 'Vom Nutzer im Review bestätigt.'
 
 const filtersSchema = z.object({
   hideReviewed: z.boolean().default(false),
@@ -79,31 +97,46 @@ const filtersSchema = z.object({
   timeRange: z.enum(['all', '24h', '7d', '30d']),
 })
 
-const codexModelSchema = z.object({
-  model: z.enum(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna']),
-})
+const codexModelSchema = z.object({ model: z.custom<CodexModelId>(isCodexModelId) })
 
 const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
 
+const replyEditorSchema = z.object({
+  bodyText: z.string().max(256_000),
+  cc: z.array(addressSchema).max(100),
+  draftRequestId: z.string().uuid().optional(),
+  identityId: z.string().max(512),
+  revisionInstruction: z.string().max(64_000),
+  roughNotes: z.string().max(64_000),
+  subject: z.string().max(998),
+  to: z.array(addressSchema).max(100),
+})
+
 interface StoredSnapshot {
+  analysis: ReviewAnalysisState
   blobMetadata: Map<string, MailResource>
+  bundleCallLimit: number
+  bundleExamples: BundleExample[]
   bundleRun?: ReviewBundleRun
-  bundleWork?: Promise<ReviewBundleRun>
   context?: MailAccountContext
   createdAt: number
   csrfToken: string
   detailCache: Map<string, ReviewEmail>
+  draftRequestFingerprints: Map<string, string>
   draftResults: Map<string, DraftResult>
+  draftWork: Map<string, Promise<DraftResult>>
   emailIds: string[]
   filters: ReviewFilters
   finalEmailIds?: Set<string>
   finalKeepIds?: Set<string>
   finalSecondaryActionIds?: Set<string>
   finalizationState: 'active' | 'finalized' | 'finalizing'
+  finalizationResult: FinalizeResult | null
   identities?: MailIdentity[]
   imageToken: string
   lastAccessedAt: number
   mailboxes: MailboxOption[]
+  missingIds: string[]
   mode: 'demo' | 'live'
   replyCache: Map<string, Promise<ReplyProposal>>
   replyInFlight: Set<string>
@@ -114,9 +147,14 @@ interface StoredSnapshot {
   secondaryActionSucceededIds: Set<string>
   succeededIds: Set<string>
   threadCache: Map<string, ThreadMessage[]>
+  totalBeforeLimit: number
+  truncated: boolean
+  userState: ReviewRoundUserState
 }
 
 export interface ApiOptions {
+  autoStartBundles?: boolean
+  bundleCallLimit?: number
   bundleDecider?: DecideBundle
   bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
@@ -125,15 +163,25 @@ export interface ApiOptions {
   demoMessages?: ReviewEmail[]
   fastmailToken?: string
   forceDemo?: boolean
+  markRead?: typeof markEmailsRead
+  moveOutOfSpam?: typeof moveEmailsOutOfSpam
   reviewHistory?: ReviewHistory
+  resumeMailSnapshot?: typeof resumeSnapshot
+  roundStore?: RoundStore
+  tagForLaterUnsubscribe?: typeof tagEmailsForLaterUnsubscribe
 }
 
 const snapshots = new Map<string, StoredSnapshot>()
+const bundleJobs = new Map<string, Promise<void>>()
 interface CodexLoginRecord extends CodexLoginState {
   controller: AbortController
   createdAt: number
 }
 const codexLogins = new Map<string, CodexLoginRecord>()
+
+function autoStartBundles(options: ApiOptions) {
+  return options.autoStartBundles ?? !process.env.VITEST
+}
 
 function securityHeaders(res: ServerResponse) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
@@ -223,14 +271,29 @@ function validateOrigin(req: IncomingMessage) {
 function pruneSnapshots() {
   const cutoff = Date.now() - SNAPSHOT_TTL_MS
   for (const [id, snapshot] of snapshots) {
-    if (snapshot.lastAccessedAt < cutoff) snapshots.delete(id)
+    if (
+      snapshot.lastAccessedAt < cutoff &&
+      !bundleJobs.has(id) &&
+      snapshot.finalizationState !== 'finalizing'
+    )
+      snapshots.delete(id)
   }
   if (snapshots.size <= MAX_SNAPSHOTS) return
   const oldest = [...snapshots.entries()].sort(
     ([, left], [, right]) => left.lastAccessedAt - right.lastAccessedAt,
   )
-  for (const [id] of oldest.slice(0, snapshots.size - MAX_SNAPSHOTS)) snapshots.delete(id)
+  let remaining = snapshots.size - MAX_SNAPSHOTS
+  for (const [id] of oldest) {
+    if (remaining <= 0) break
+    const snapshot = snapshots.get(id)
+    if (bundleJobs.has(id) || snapshot?.finalizationState === 'finalizing') continue
+    snapshots.delete(id)
+    remaining -= 1
+  }
 }
+
+const snapshotPruneTimer = setInterval(pruneSnapshots, SNAPSHOT_PRUNE_INTERVAL_MS)
+snapshotPruneTimer.unref()
 
 function filterDemoEmails(
   filters: ReviewFilters,
@@ -270,11 +333,51 @@ function summariesFor(emails: ReviewEmail[]) {
   )
 }
 
+function initialAnalysis(
+  mode: 'demo' | 'live',
+  totalEmailCount: number,
+  options: ApiOptions,
+): ReviewAnalysisState {
+  const auth =
+    mode === 'live' ? (options.codexAuthStatus ?? codexAuthStatus)() : { configured: false }
+  const usesCodex = Boolean(options.bundleDecider) || (mode === 'live' && auth.configured)
+  return {
+    callCount: 0,
+    engine: usesCodex ? 'codex' : 'heuristic',
+    ...(usesCodex && 'model' in auth && auth.model ? { model: auth.model } : {}),
+    phase: 'waiting',
+    processedEmailCount: 0,
+    progress: 0,
+    status: 'pending',
+    totalEmailCount,
+  }
+}
+
+function bundleExamplesForNewRound(options: ApiOptions) {
+  try {
+    return cleanBundleExamples(options.bundleStore?.examples() ?? [])
+  } catch (error) {
+    process.stderr.write(
+      `${JSON.stringify({
+        event: 'bundle_examples_snapshot_failed',
+        message: error instanceof Error ? error.message : 'unknown',
+      })}\n`,
+    )
+    return []
+  }
+}
+
 function storeSnapshot(
   data: Pick<LiveSnapshotData, 'emails' | 'filters' | 'mailboxes'> & {
+    analysis: ReviewAnalysisState
+    bundleCallLimit: number
+    bundleExamples: BundleExample[]
     context?: MailAccountContext
     mode: 'demo' | 'live'
     details?: ReviewEmail[]
+    missingIds?: string[]
+    totalBeforeLimit?: number
+    truncated?: boolean
   },
 ) {
   pruneSnapshots()
@@ -283,18 +386,25 @@ function storeSnapshot(
   const imageToken = randomBytes(24).toString('base64url')
   const details = new Map((data.details ?? []).map((email) => [email.id, email]))
   const snapshot: StoredSnapshot = {
+    analysis: data.analysis,
     blobMetadata: new Map(),
+    bundleCallLimit: data.bundleCallLimit,
+    bundleExamples: data.bundleExamples,
     context: data.context,
     createdAt: Date.now(),
     csrfToken,
     detailCache: details,
+    draftRequestFingerprints: new Map(),
     draftResults: new Map(),
+    draftWork: new Map(),
     emailIds: data.emails.map((email) => email.id),
     filters: data.filters,
     finalizationState: 'active',
+    finalizationResult: null,
     imageToken,
     lastAccessedAt: Date.now(),
     mailboxes: data.mailboxes,
+    missingIds: data.missingIds ?? [],
     mode: data.mode,
     replyCache: new Map(),
     replyInFlight: new Set(),
@@ -305,10 +415,154 @@ function storeSnapshot(
     succeededIds: new Set(),
     summaries: new Map(data.emails.map((email) => [email.id, email])),
     threadCache: new Map(),
+    totalBeforeLimit: data.totalBeforeLimit ?? data.emails.length,
+    truncated: data.truncated ?? false,
+    userState: {
+      bundleGroups: [],
+      index: 0,
+      keptUnreadIds: [],
+      processedIds: [],
+      replyDrafts: {},
+      revision: 0,
+      secondaryActionIds: [],
+      selectedMemberId: null,
+    },
   }
   for (const email of details.values()) registerResources(snapshot, email)
   snapshots.set(snapshotId, snapshot)
   return { snapshotId, csrfToken, snapshot }
+}
+
+function persistNewRound(
+  id: string,
+  snapshot: StoredSnapshot,
+  roundStore: RoundStore | undefined,
+  metadata: { missingIds?: string[]; totalBeforeLimit?: number; truncated?: boolean } = {},
+) {
+  roundStore?.create({
+    analysis: snapshot.analysis,
+    bundleCallLimit: snapshot.bundleCallLimit,
+    bundleExamples: snapshot.bundleExamples,
+    csrfToken: snapshot.csrfToken,
+    emails: snapshot.emailIds
+      .map((emailId) => snapshot.summaries.get(emailId))
+      .filter((email): email is ReviewEmailSummary => Boolean(email)),
+    filters: snapshot.filters,
+    id,
+    imageToken: snapshot.imageToken,
+    mailboxes: snapshot.mailboxes,
+    missingIds: metadata.missingIds ?? snapshot.missingIds,
+    mode: snapshot.mode,
+    totalBeforeLimit: metadata.totalBeforeLimit ?? snapshot.totalBeforeLimit,
+    truncated: metadata.truncated ?? snapshot.truncated,
+  })
+}
+
+function storedSnapshot(round: StoredReviewRound, details: ReviewEmail[]) {
+  const detailCache = new Map(details.map((email) => [email.id, email]))
+  const hasFinalizationSelection =
+    round.finalization.state !== 'active' ||
+    round.finalization.finalizeIds.length > 0 ||
+    round.finalization.keepUnreadIds.length > 0 ||
+    round.finalization.secondaryActionIds.length > 0
+  const snapshot: StoredSnapshot = {
+    analysis: {
+      callCount: round.analysis.callCount,
+      engine: round.analysis.engine,
+      ...(round.analysis.error ? { error: round.analysis.error } : {}),
+      ...(round.analysis.model ? { model: round.analysis.model } : {}),
+      phase: round.analysis.phase,
+      processedEmailCount: round.analysis.processedEmailCount,
+      progress: round.analysis.progress,
+      status: round.analysis.status,
+      totalEmailCount: round.analysis.totalEmailCount,
+    },
+    blobMetadata: new Map(),
+    bundleCallLimit: round.bundleCallLimit,
+    bundleExamples: round.bundleExamples,
+    ...(round.bundleRun ? { bundleRun: round.bundleRun } : {}),
+    createdAt: Date.parse(round.createdAt),
+    csrfToken: round.csrfToken,
+    detailCache,
+    draftRequestFingerprints: new Map(),
+    draftResults: new Map(),
+    draftWork: new Map(),
+    emailIds: round.emails.map((email) => email.id),
+    filters: round.filters,
+    finalEmailIds: hasFinalizationSelection ? new Set(round.finalization.finalizeIds) : undefined,
+    finalKeepIds: hasFinalizationSelection ? new Set(round.finalization.keepUnreadIds) : undefined,
+    finalSecondaryActionIds: hasFinalizationSelection
+      ? new Set(round.finalization.secondaryActionIds)
+      : undefined,
+    finalizationResult: round.finalization.result,
+    finalizationState:
+      round.finalization.state === 'finalizing' ? 'active' : round.finalization.state,
+    imageToken: round.imageToken,
+    lastAccessedAt: Date.now(),
+    mailboxes: round.mailboxes,
+    missingIds: round.missingIds,
+    mode: round.mode,
+    replyCache: new Map(),
+    replyInFlight: new Set(),
+    remoteImageIds: new Map(),
+    remoteImageSources: new Map(),
+    secondaryActionFailures: new Map(
+      round.finalization.actionFailed.map((failure) => [failure.id, failure.reason]),
+    ),
+    secondaryActionSucceededIds: new Set(round.finalization.secondaryActionSucceededIds),
+    succeededIds: new Set(round.finalization.succeededIds),
+    summaries: new Map(round.emails.map((email) => [email.id, email])),
+    threadCache: new Map(),
+    totalBeforeLimit: round.totalBeforeLimit,
+    truncated: round.truncated,
+    userState: round.userState,
+  }
+  for (const email of details) registerResources(snapshot, email)
+  return snapshot
+}
+
+async function ensureSnapshot(id: string, apiOptions: ApiOptions) {
+  const existing = snapshots.get(id)
+  if (existing) {
+    existing.lastAccessedAt = Date.now()
+    return
+  }
+  const round = apiOptions.roundStore?.get(id)
+  if (!round) return
+  let details: ReviewEmail[] = []
+  if (round.mode === 'demo') {
+    const byId = new Map((apiOptions.demoMessages ?? demoEmails).map((email) => [email.id, email]))
+    details = round.emails
+      .map((email) => byId.get(email.id))
+      .filter((email): email is ReviewEmail => Boolean(email))
+  }
+  if (round.analysis.status === 'running') {
+    round.analysis.status = 'pending'
+    round.analysis.phase = 'waiting'
+    apiOptions.roundStore?.updateAnalysis(id, { phase: 'waiting', status: 'pending' })
+  }
+  if (round.finalization.state === 'finalizing') {
+    apiOptions.roundStore?.saveFinalization(id, { state: 'active' })
+  }
+  const snapshot = storedSnapshot(round, details)
+  snapshots.set(id, snapshot)
+  if (snapshot.analysis.status !== 'complete' && autoStartBundles(apiOptions)) {
+    startBundleJob(id, snapshot, apiOptions)
+  }
+}
+
+async function ensureMailContext(snapshot: StoredSnapshot, apiOptions: ApiOptions) {
+  if (snapshot.mode === 'demo' || snapshot.context) return
+  const token = apiOptions.fastmailToken?.trim()
+  if (!token)
+    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+  const resumed = await (apiOptions.resumeMailSnapshot ?? resumeSnapshot)(
+    token,
+    snapshot.emailIds,
+    snapshot.filters,
+  )
+  snapshot.context = resumed.context
+  snapshot.mailboxes = resumed.mailboxes
 }
 
 function snapshotPayload(
@@ -316,18 +570,34 @@ function snapshotPayload(
   snapshot: StoredSnapshot,
   metadata: { missingIds?: string[]; totalBeforeLimit?: number; truncated?: boolean } = {},
 ): ReviewSnapshot {
+  const userState: ReviewRoundUserState = snapshot.finalEmailIds
+    ? {
+        ...snapshot.userState,
+        keptUnreadIds: [...(snapshot.finalKeepIds ?? [])],
+        processedIds: [...snapshot.finalEmailIds],
+        secondaryActionIds: [...(snapshot.finalSecondaryActionIds ?? [])],
+      }
+    : snapshot.userState
   return {
+    analysis: snapshot.analysis,
+    ...(snapshot.bundleRun ? { bundleRun: snapshot.bundleRun } : {}),
     csrfToken: snapshot.csrfToken,
     imageToken: snapshot.imageToken,
     emails: snapshot.emailIds
       .map((emailId) => snapshot.summaries.get(emailId))
       .filter((email): email is ReviewEmailSummary => Boolean(email)),
     filters: snapshot.filters,
-    missingIds: metadata.missingIds ?? [],
+    finalization: {
+      result: snapshot.finalizationResult,
+      selectionLocked: Boolean(snapshot.finalEmailIds),
+      status: snapshot.finalizationState,
+    } satisfies ReviewFinalizationState,
+    missingIds: metadata.missingIds ?? snapshot.missingIds,
     mode: snapshot.mode,
     snapshotId: id,
-    totalBeforeLimit: metadata.totalBeforeLimit ?? snapshot.emailIds.length,
-    truncated: metadata.truncated ?? false,
+    totalBeforeLimit: metadata.totalBeforeLimit ?? snapshot.totalBeforeLimit,
+    truncated: metadata.truncated ?? snapshot.truncated,
+    userState,
   }
 }
 
@@ -367,6 +637,23 @@ function requireCsrf(req: IncomingMessage, snapshot: StoredSnapshot) {
   }
 }
 
+function requireMutableRoundState(snapshot: StoredSnapshot) {
+  if (snapshot.finalizationState === 'active' && !snapshot.finalEmailIds) return
+  throw new ApiHttpError(
+    409,
+    snapshot.finalizationState === 'finalized'
+      ? 'ROUND_FINALIZED'
+      : snapshot.finalEmailIds
+        ? 'FINALIZE_SELECTION_LOCKED'
+        : 'FINALIZE_IN_PROGRESS',
+    snapshot.finalizationState === 'finalized'
+      ? 'Diese Runde ist bereits abgeschlossen.'
+      : snapshot.finalEmailIds
+        ? 'Die Abschlussauswahl ist bereits festgeschrieben.'
+        : 'Der Review wird bereits abgeschlossen.',
+  )
+}
+
 function parseFilters(value: unknown) {
   const parsed = filtersSchema.safeParse(value ?? defaultReviewFilters)
   if (!parsed.success) throw new ApiHttpError(400, 'INVALID_FILTERS', 'Ungültige Filter.')
@@ -403,6 +690,9 @@ async function createReview(
     const details = filterDemoEmails(filters, retainedIds, options.demoMessages)
     const emails = summariesFor(details)
     const stored = storeSnapshot({
+      analysis: initialAnalysis('demo', emails.length, options),
+      bundleCallLimit: codexBundleCallLimit(options.bundleCallLimit),
+      bundleExamples: bundleExamplesForNewRound(options),
       emails,
       filters,
       mailboxes: [
@@ -414,13 +704,27 @@ async function createReview(
       mode: 'demo',
       details,
     })
+    persistNewRound(stored.snapshotId, stored.snapshot, options.roundStore)
+    if (autoStartBundles(options)) startBundleJob(stored.snapshotId, stored.snapshot, options)
     return json(res, 201, snapshotPayload(stored.snapshotId, stored.snapshot))
   }
   const token = options.fastmailToken?.trim()
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
   const data = await fetchUnreadSnapshot(token, filters, retainedIds)
-  const stored = storeSnapshot({ ...data, mode: 'live' })
+  const stored = storeSnapshot({
+    ...data,
+    analysis: initialAnalysis('live', data.emails.length, options),
+    bundleCallLimit: codexBundleCallLimit(options.bundleCallLimit),
+    bundleExamples: bundleExamplesForNewRound(options),
+    mode: 'live',
+  })
+  persistNewRound(stored.snapshotId, stored.snapshot, options.roundStore, {
+    missingIds: data.missingIds,
+    totalBeforeLimit: data.totalBeforeLimit,
+    truncated: data.truncated,
+  })
+  if (autoStartBundles(options)) startBundleJob(stored.snapshotId, stored.snapshot, options)
   return json(
     res,
     201,
@@ -448,6 +752,9 @@ async function resumeReview(
       .map((id) => details.find((email) => email.id === id))
       .filter((email): email is ReviewEmail => Boolean(email))
     const stored = storeSnapshot({
+      analysis: initialAnalysis('demo', ordered.length, options),
+      bundleCallLimit: codexBundleCallLimit(options.bundleCallLimit),
+      bundleExamples: bundleExamplesForNewRound(options),
       emails: summariesFor(ordered),
       filters,
       mailboxes: [
@@ -456,14 +763,30 @@ async function resumeReview(
       ],
       mode: 'demo',
       details: ordered,
+      missingIds,
+      totalBeforeLimit: emailIds.data.length,
     })
+    persistNewRound(stored.snapshotId, stored.snapshot, options.roundStore, { missingIds })
+    if (autoStartBundles(options)) startBundleJob(stored.snapshotId, stored.snapshot, options)
     return json(res, 201, snapshotPayload(stored.snapshotId, stored.snapshot, { missingIds }))
   }
   const token = options.fastmailToken?.trim()
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
   const data = await resumeSnapshot(token, emailIds.data, filters)
-  const stored = storeSnapshot({ ...data, mode: 'live' })
+  const stored = storeSnapshot({
+    ...data,
+    analysis: initialAnalysis('live', data.emails.length, options),
+    bundleCallLimit: codexBundleCallLimit(options.bundleCallLimit),
+    bundleExamples: bundleExamplesForNewRound(options),
+    mode: 'live',
+  })
+  persistNewRound(stored.snapshotId, stored.snapshot, options.roundStore, {
+    missingIds: data.missingIds,
+    totalBeforeLimit: data.totalBeforeLimit,
+    truncated: data.truncated,
+  })
+  if (autoStartBundles(options)) startBundleJob(stored.snapshotId, stored.snapshot, options)
   return json(
     res,
     201,
@@ -638,6 +961,7 @@ async function emailDetail(
     throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
   let email = snapshot.detailCache.get(emailId)
   if (!email) {
+    await ensureMailContext(snapshot, apiOptions)
     const token = apiOptions.fastmailToken?.trim()
     if (!token || !snapshot.context)
       throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
@@ -708,7 +1032,7 @@ async function remoteImage(
     res.statusCode = 200
     res.setHeader('Content-Type', image.contentType)
     res.setHeader('Content-Length', image.body.length)
-    res.setHeader('Cache-Control', 'private, max-age=3600')
+    res.setHeader('Cache-Control', 'private, no-store')
     res.setHeader('Content-Security-Policy', "default-src 'none'; sandbox")
     res.end(image.body)
   } catch (error) {
@@ -723,12 +1047,13 @@ async function loadThread(snapshot: StoredSnapshot, threadId: string, apiOptions
   const cached = snapshot.threadCache.get(threadId)
   if (cached) return cached
   if (snapshot.mode === 'demo') {
-    const messages = demoEmails
+    const messages = (apiOptions.demoMessages ?? demoEmails)
       .filter((email) => email.threadId === threadId)
       .map((email) => ({ ...email, sentAt: null }))
     snapshot.threadCache.set(threadId, messages)
     return messages
   }
+  await ensureMailContext(snapshot, apiOptions)
   const token = apiOptions.fastmailToken?.trim()
   if (!token || !snapshot.context)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
@@ -752,6 +1077,7 @@ async function loadIdentities(snapshot: StoredSnapshot, apiOptions: ApiOptions) 
     ]
     return snapshot.identities
   }
+  await ensureMailContext(snapshot, apiOptions)
   const token = apiOptions.fastmailToken?.trim()
   if (!token || !snapshot.context)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
@@ -785,6 +1111,292 @@ async function threadContext(
   })
 }
 
+function publicBundleFailure(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error)
+  if (/call budget exhausted/i.test(message)) {
+    return 'Das Codex-Aufruflimit dieser Runde wurde erreicht. Die Nachrichten werden sicher einzeln angezeigt.'
+  }
+  if (/timeout|timed out|abort/i.test(message)) {
+    return 'Codex hat nicht rechtzeitig geantwortet. Die Nachrichten werden einzeln angezeigt.'
+  }
+  if (/network|fetch|connect|econn|dns/i.test(message)) {
+    return 'Codex war nicht erreichbar. Die Nachrichten werden einzeln angezeigt.'
+  }
+  return 'Die Zusammenhänge konnten nicht sicher bestimmt werden. Die Nachrichten werden einzeln angezeigt.'
+}
+
+export function codexBundleCallLimit(override: number | undefined) {
+  const raw = override ?? process.env.CODEX_BUNDLE_MAX_CALLS
+  if (raw === undefined || (typeof raw === 'string' && raw.trim() === '')) return 64
+  const configured = Number(raw)
+  return Number.isFinite(configured) ? Math.min(512, Math.max(1, Math.floor(configured))) : 64
+}
+
+function persistAnalysisUpdate(event: string, action: () => unknown) {
+  try {
+    const result = action()
+    if (result === null || result === false) throw new Error('The round store rejected the update.')
+    return true
+  } catch (error) {
+    process.stderr.write(
+      `${JSON.stringify({
+        event,
+        message: error instanceof Error ? error.message : 'unknown',
+      })}\n`,
+    )
+    return false
+  }
+}
+
+function markAnalysisPersistenceFailure(snapshot: StoredSnapshot) {
+  snapshot.analysis = {
+    ...snapshot.analysis,
+    error:
+      'Das Analyseergebnis konnte nicht dauerhaft gespeichert werden. Lass diese Ansicht geöffnet und prüfe den App-Speicher.',
+  }
+}
+
+function persistFinalizationOrThrow(
+  store: RoundStore | undefined,
+  roundId: string,
+  update: RoundFinalizationUpdate,
+) {
+  if (!store) return
+  try {
+    const saved = store.saveFinalization(roundId, update)
+    if (!saved) throw new Error('The review round disappeared before finalization.')
+  } catch {
+    throw new ApiHttpError(
+      503,
+      'ROUND_PERSIST_FAILED',
+      'Der Abschluss konnte nicht dauerhaft gespeichert werden. Bitte versuche dieselbe Auswahl erneut.',
+      true,
+    )
+  }
+}
+
+function applyBundleProgress(
+  snapshotId: string,
+  snapshot: StoredSnapshot,
+  progress: BundleBuildProgress,
+  roundStore: RoundStore | undefined,
+) {
+  snapshot.analysis = {
+    callCount: progress.codexCallCount,
+    engine: progress.engine,
+    ...(progress.model ? { model: progress.model } : {}),
+    phase: progress.phase,
+    processedEmailCount: progress.processedEmailCount,
+    progress: progress.progress,
+    status: 'running',
+    totalEmailCount: progress.totalEmailCount,
+    ...(snapshot.analysis.error ? { error: snapshot.analysis.error } : {}),
+  }
+  if (roundStore) {
+    persistAnalysisUpdate('bundle_progress_persist_failed', () =>
+      roundStore.updateAnalysis(snapshotId, snapshot.analysis),
+    )
+  }
+}
+
+function startBundleJob(snapshotId: string, snapshot: StoredSnapshot, apiOptions: ApiOptions) {
+  if (snapshot.bundleRun || bundleJobs.has(snapshotId)) return
+  const emails = snapshot.emailIds
+    .map((id) => snapshot.summaries.get(id))
+    .filter((email): email is ReviewEmailSummary => Boolean(email))
+  const auth =
+    snapshot.mode === 'demo'
+      ? { configured: false as const }
+      : (apiOptions.codexAuthStatus ?? codexAuthStatus)()
+  const mustResumeWithCodex =
+    snapshot.mode === 'live' && snapshot.analysis.engine === 'codex' && !apiOptions.bundleDecider
+  if (mustResumeWithCodex && !auth.configured) {
+    snapshot.analysis = {
+      ...snapshot.analysis,
+      error: 'Codex muss erneut verbunden werden, bevor diese Analyse fortgesetzt werden kann.',
+      phase: 'waiting_for_codex',
+      status: 'pending',
+    }
+    if (apiOptions.roundStore) {
+      persistAnalysisUpdate('bundle_waiting_for_codex_persist_failed', () =>
+        apiOptions.roundStore?.updateAnalysis(snapshotId, snapshot.analysis),
+      )
+    }
+    return
+  }
+  const configuredModel = 'model' in auth ? auth.model : undefined
+  const persistedModel = snapshot.analysis.model
+  const frozenModel = isCodexModelId(persistedModel) ? persistedModel : configuredModel
+  const providerDecide =
+    apiOptions.bundleDecider ??
+    (snapshot.mode === 'live' && snapshot.analysis.engine === 'codex' && auth.configured
+      ? (input: Parameters<typeof runCodexBundleDecision>[0]) =>
+          runCodexBundleDecision(input, frozenModel ?? auth.model)
+      : undefined)
+  const checkpointed =
+    providerDecide && apiOptions.roundStore
+      ? createCheckpointedBundleDecider({
+          decide: providerDecide,
+          initialCallCount: snapshot.analysis.callCount,
+          maxCallCount: snapshot.bundleCallLimit,
+          ...(frozenModel ? { model: frozenModel } : {}),
+          onCallStarted: (callCount) => {
+            snapshot.analysis = { ...snapshot.analysis, callCount }
+            const updated = apiOptions.roundStore?.updateAnalysis(snapshotId, snapshot.analysis)
+            if (!updated) throw new Error('The review round disappeared before a Codex decision.')
+          },
+          onCallRolledBack: (callCount) => {
+            snapshot.analysis = { ...snapshot.analysis, callCount }
+            const updated = apiOptions.roundStore?.updateAnalysis(snapshotId, snapshot.analysis)
+            if (!updated) throw new Error('The review round disappeared after Codex auth failed.')
+          },
+          roundId: snapshotId,
+          shouldRollbackCall: (error) => error instanceof CodexAuthenticationError,
+          store: apiOptions.roundStore,
+        })
+      : undefined
+  const decide = checkpointed?.decide ?? providerDecide
+  const codexCallCount = () => checkpointed?.callCount() ?? snapshot.analysis.callCount
+  const engine = decide ? ('codex' as const) : ('heuristic' as const)
+  const model = frozenModel
+  const { error: _previousAnalysisError, ...previousAnalysis } = snapshot.analysis
+  snapshot.analysis = {
+    ...previousAnalysis,
+    engine,
+    ...(model ? { model } : {}),
+    phase: 'indexing',
+    status: 'running',
+  }
+  if (apiOptions.roundStore) {
+    const persisted = persistAnalysisUpdate('bundle_start_persist_failed', () =>
+      apiOptions.roundStore?.updateAnalysis(snapshotId, { ...snapshot.analysis, error: null }),
+    )
+    if (!persisted) {
+      snapshot.analysis = {
+        ...snapshot.analysis,
+        error: 'Die Analyse konnte nicht sicher gestartet werden. Prüfe den App-Speicher.',
+        phase: 'waiting',
+        status: 'pending',
+      }
+      return
+    }
+  }
+  const work = (async () => {
+    await new Promise<void>((resolve) => setImmediate(resolve))
+    try {
+      const run = await buildReviewBundles(snapshotId, emails, decide, snapshot.bundleExamples, {
+        codexCallCount: codexCallCount(),
+        engine,
+        ...(checkpointed ? { getCodexCallCount: checkpointed.callCount } : {}),
+        ...(model ? { model } : {}),
+        onProgress: (progress) =>
+          applyBundleProgress(snapshotId, snapshot, progress, apiOptions.roundStore),
+      })
+      snapshot.bundleRun = run
+      snapshot.analysis = {
+        ...snapshot.analysis,
+        engine:
+          engine === 'codex' && snapshot.analysis.callCount === 0
+            ? 'heuristic'
+            : snapshot.analysis.engine,
+        phase: 'complete',
+        progress: 1,
+        status: 'complete',
+      }
+      if (apiOptions.roundStore) {
+        const persisted = persistAnalysisUpdate('bundle_result_persist_failed', () =>
+          apiOptions.roundStore?.saveBundleRun(snapshotId, run, {
+            ...snapshot.analysis,
+            error: null,
+          }),
+        )
+        if (!persisted) markAnalysisPersistenceFailure(snapshot)
+      }
+    } catch (error) {
+      if (
+        error instanceof CodexAuthenticationError &&
+        engine === 'codex' &&
+        snapshot.mode === 'live'
+      ) {
+        snapshot.bundleRun = undefined
+        snapshot.analysis = {
+          ...snapshot.analysis,
+          callCount: codexCallCount(),
+          engine: 'codex',
+          error: 'Codex muss erneut verbunden werden, bevor diese Analyse fortgesetzt werden kann.',
+          phase: 'waiting_for_codex',
+          status: 'pending',
+        }
+        if (apiOptions.roundStore) {
+          const persisted = persistAnalysisUpdate('bundle_auth_wait_persist_failed', () =>
+            apiOptions.roundStore?.updateAnalysis(snapshotId, snapshot.analysis),
+          )
+          if (!persisted) markAnalysisPersistenceFailure(snapshot)
+        }
+        return
+      }
+      process.stderr.write(
+        `${JSON.stringify({
+          event: 'bundle_fallback',
+          message: error instanceof Error ? error.message : 'unknown',
+        })}\n`,
+      )
+      snapshot.analysis = { ...snapshot.analysis, error: publicBundleFailure(error) }
+      snapshot.bundleRun = singletonBundleRun(snapshotId, emails, {
+        codexCallCount: snapshot.analysis.callCount,
+        ...(model ? { model } : {}),
+        onProgress: (progress) =>
+          applyBundleProgress(snapshotId, snapshot, progress, apiOptions.roundStore),
+      })
+      snapshot.analysis = {
+        ...snapshot.analysis,
+        phase: 'complete',
+        progress: 1,
+        status: 'complete',
+      }
+      if (apiOptions.roundStore) {
+        const persisted = persistAnalysisUpdate('bundle_fallback_persist_failed', () =>
+          apiOptions.roundStore?.saveBundleRun(
+            snapshotId,
+            snapshot.bundleRun as ReviewBundleRun,
+            snapshot.analysis,
+          ),
+        )
+        if (!persisted) markAnalysisPersistenceFailure(snapshot)
+      }
+    }
+  })()
+    .catch((error) => {
+      process.stderr.write(
+        `${JSON.stringify({
+          event: 'bundle_job_failed',
+          message: error instanceof Error ? error.message : 'unknown',
+        })}\n`,
+      )
+      snapshot.analysis = {
+        ...snapshot.analysis,
+        engine: 'fallback',
+        error: publicBundleFailure(error),
+        phase: 'complete',
+        progress: 1,
+        status: 'complete',
+      }
+      snapshot.bundleRun = singletonBundleRun(snapshotId, emails)
+      if (apiOptions.roundStore) {
+        const persisted = persistAnalysisUpdate('bundle_emergency_fallback_persist_failed', () =>
+          apiOptions.roundStore?.saveBundleRun(
+            snapshotId,
+            snapshot.bundleRun as ReviewBundleRun,
+            snapshot.analysis,
+          ),
+        )
+        if (!persisted) markAnalysisPersistenceFailure(snapshot)
+      }
+    })
+    .finally(() => bundleJobs.delete(snapshotId))
+  bundleJobs.set(snapshotId, work)
+}
+
 async function bundles(
   req: IncomingMessage,
   res: ServerResponse,
@@ -794,43 +1406,123 @@ async function bundles(
   const snapshot = getSnapshot(snapshotId)
   requireCsrf(req, snapshot)
   await readJson(req)
-  if (snapshot.bundleRun) return json(res, 200, snapshot.bundleRun)
-  if (!snapshot.bundleWork) {
-    const emails = snapshot.emailIds
-      .map((id) => snapshot.summaries.get(id))
-      .filter((email): email is ReviewEmailSummary => Boolean(email))
-    snapshot.bundleWork = (async () => {
-      try {
-        const auth =
-          snapshot.mode === 'demo'
-            ? { configured: false }
-            : (apiOptions.codexAuthStatus ?? codexAuthStatus)()
-        const decide =
-          apiOptions.bundleDecider ??
-          (snapshot.mode === 'live' && auth.configured ? runCodexBundleDecision : undefined)
-        return await buildReviewBundles(
-          snapshotId,
-          emails,
-          decide,
-          apiOptions.bundleStore?.examples() ?? [],
+  startBundleJob(snapshotId, snapshot, apiOptions)
+  return json(
+    res,
+    snapshot.analysis.status === 'complete' ? 200 : 202,
+    snapshotPayload(snapshotId, snapshot),
+  )
+}
+
+async function updateRoundState(
+  req: IncomingMessage,
+  res: ServerResponse,
+  snapshotId: string,
+  apiOptions: ApiOptions,
+) {
+  const snapshot = getSnapshot(snapshotId)
+  requireCsrf(req, snapshot)
+  requireMutableRoundState(snapshot)
+  const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
+  const parsed = z
+    .object({
+      revision: z.number().int().nonnegative(),
+      state: z.object({
+        bundleGroups: z.array(z.array(z.string().min(1)).min(1)),
+        index: z.number().int().nonnegative(),
+        keptUnreadIds: z.array(z.string().min(1)),
+        processedIds: z.array(z.string().min(1)),
+        replyDrafts: z.record(z.string(), replyEditorSchema),
+        secondaryActionIds: z.array(z.string().min(1)),
+        selectedMemberId: z.string().min(1).nullable(),
+      }),
+    })
+    .safeParse(body)
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_ROUND_STATE', 'Ungültiger Rundenstand.')
+  if (!apiOptions.roundStore && parsed.data.revision !== snapshot.userState.revision) {
+    throw new ApiHttpError(
+      409,
+      'ROUND_REVISION_CONFLICT',
+      'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
+    )
+  }
+  const known = new Set(snapshot.emailIds)
+  const state = parsed.data.state
+  const referencedIds = [
+    ...state.keptUnreadIds,
+    ...state.processedIds,
+    ...state.secondaryActionIds,
+    ...Object.keys(state.replyDrafts),
+    ...(state.selectedMemberId ? [state.selectedMemberId] : []),
+  ]
+  if (referencedIds.some((id) => !known.has(id))) {
+    throw new ApiHttpError(
+      400,
+      'UNKNOWN_EMAIL',
+      'Der Rundenstand enthält eine unbekannte Nachricht.',
+    )
+  }
+  for (const ids of [state.keptUnreadIds, state.processedIds, state.secondaryActionIds]) {
+    if (new Set(ids).size !== ids.length) {
+      throw new ApiHttpError(400, 'INVALID_ROUND_STATE', 'Der Rundenstand enthält doppelte IDs.')
+    }
+  }
+  if (state.bundleGroups.length > 0) {
+    try {
+      validateBundlePartition(
+        snapshot.emailIds,
+        state.bundleGroups.map((emailIds) => ({ emailIds })),
+      )
+    } catch {
+      throw new ApiHttpError(
+        400,
+        'INVALID_BUNDLE_GROUPS',
+        'Die gespeicherten Storys bilden die Runde nicht vollständig ab.',
+      )
+    }
+  }
+  if (
+    snapshot.filters.spam === 'exclude' &&
+    state.secondaryActionIds.some((id) => !snapshot.summaries.get(id)?.isNewsletter)
+  ) {
+    throw new ApiHttpError(
+      400,
+      'UNSUBSCRIBE_UNAVAILABLE',
+      'Nur erkannte Newsletter können für eine spätere Abmeldung markiert werden.',
+    )
+  }
+  // The request body can arrive slowly while another tab finalizes the round.
+  // Recheck immediately before the synchronous revision-guarded write.
+  requireMutableRoundState(snapshot)
+  if (apiOptions.roundStore) {
+    try {
+      snapshot.userState = apiOptions.roundStore.updateUserState(
+        snapshotId,
+        parsed.data.revision,
+        state,
+      ).userState
+    } catch (error) {
+      if (error instanceof RoundRevisionConflictError) {
+        throw new ApiHttpError(
+          409,
+          'ROUND_REVISION_CONFLICT',
+          'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
+          false,
+          { actualRevision: error.actualRevision },
         )
-      } catch (error) {
-        process.stderr.write(
-          `${JSON.stringify({
-            event: 'bundle_fallback',
-            message: error instanceof Error ? error.message : 'unknown',
-          })}\n`,
-        )
-        return singletonBundleRun(snapshotId, emails)
       }
-    })()
+      if (error instanceof RoundNotFoundError) {
+        throw new ApiHttpError(404, 'ROUND_NOT_FOUND', 'Diese Runde wurde nicht gefunden.')
+      }
+      throw error
+    }
+  } else {
+    snapshot.userState = {
+      ...state,
+      revision: snapshot.userState.revision + 1,
+    }
   }
-  try {
-    snapshot.bundleRun = await snapshot.bundleWork
-    return json(res, 200, snapshot.bundleRun)
-  } finally {
-    snapshot.bundleWork = undefined
-  }
+  return json(res, 200, snapshot.userState)
 }
 
 async function bundleLabel(
@@ -847,7 +1539,7 @@ async function bundleLabel(
       anchorEmailIds: z.array(z.string().min(1)).min(1),
       candidateEmailIds: z.array(z.string().min(1)).min(1),
       label: z.enum(['merge', 'split']),
-      reason: z.string().max(2_000).default('Vom Nutzer im Review bestätigt.'),
+      reason: z.string().max(2_000).optional(),
     })
     .safeParse(body)
   if (!parsed.success) throw new ApiHttpError(400, 'INVALID_BUNDLE_LABEL', 'Ungültige Korrektur.')
@@ -864,7 +1556,7 @@ async function bundleLabel(
     anchorSignals: learningSignalsFor(summaries(parsed.data.anchorEmailIds)),
     candidateSignals: learningSignalsFor(summaries(parsed.data.candidateEmailIds)),
     label: parsed.data.label,
-    reason: parsed.data.reason,
+    reason: REVIEW_CONFIRMED_BUNDLE_REASON,
   })
   return json(res, 201, { recorded: Boolean(apiOptions.bundleStore) })
 }
@@ -878,21 +1570,39 @@ async function finalize(
   const snapshot = getSnapshot(snapshotId)
   requireCsrf(req, snapshot)
   const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
+  const revision = z.number().int().nonnegative().safeParse(body.revision)
   const finalized = z.array(z.string().min(1)).min(1).safeParse(body.finalizeIds)
   const kept = z.array(z.string().min(1)).safeParse(body.keepUnreadIds)
   const secondaryAction = z
     .array(z.string().min(1))
     .safeParse(body.secondaryActionIds ?? body.unsubscribeIds ?? [])
-  if (!finalized.success || !kept.success || !secondaryAction.success)
+  if (!revision.success || !finalized.success || !kept.success || !secondaryAction.success)
     throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
-  if (snapshot.finalizationState === 'finalizing') {
-    throw new ApiHttpError(
-      409,
-      'FINALIZE_IN_PROGRESS',
-      'Der Review wird bereits abgeschlossen.',
-      true,
-    )
+  const requireCurrentRevision = () => {
+    const actualRevision =
+      apiOptions.roundStore?.get(snapshotId)?.userState.revision ?? snapshot.userState.revision
+    if (revision.data !== actualRevision) {
+      throw new ApiHttpError(
+        409,
+        'ROUND_REVISION_CONFLICT',
+        'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
+        false,
+        { actualRevision },
+      )
+    }
   }
+  const requireFinalizeAvailable = () => {
+    if (snapshot.finalizationState === 'finalizing') {
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_IN_PROGRESS',
+        'Der Review wird bereits abgeschlossen.',
+        true,
+      )
+    }
+  }
+  requireCurrentRevision()
+  requireFinalizeAvailable()
   const known = new Set(snapshot.emailIds)
   if (finalized.data.some((id) => !known.has(id))) {
     throw new ApiHttpError(
@@ -924,6 +1634,32 @@ async function finalize(
   const requestedFinalize = new Set(finalized.data)
   const requestedKeep = new Set(kept.data)
   const requestedSecondaryAction = new Set(secondaryAction.data)
+  let selectionWasLocked = Boolean(snapshot.finalEmailIds)
+  const requireSameLockedSelection = () => {
+    const same = (requested: ReadonlySet<string>, locked: ReadonlySet<string> | undefined) =>
+      !locked || (requested.size === locked.size && [...requested].every((id) => locked.has(id)))
+    if (!same(requestedFinalize, snapshot.finalEmailIds)) {
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_SELECTION_LOCKED',
+        'Die Abschlussauswahl ist bereits festgeschrieben.',
+      )
+    }
+    if (!same(requestedKeep, snapshot.finalKeepIds)) {
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_SELECTION_LOCKED',
+        'Die Auswahl ist bereits festgeschrieben.',
+      )
+    }
+    if (!same(requestedSecondaryAction, snapshot.finalSecondaryActionIds)) {
+      throw new ApiHttpError(
+        409,
+        'FINALIZE_SELECTION_LOCKED',
+        'Die Aktionsauswahl ist bereits festgeschrieben.',
+      )
+    }
+  }
   if ([...requestedKeep].some((id) => !requestedFinalize.has(id))) {
     throw new ApiHttpError(
       400,
@@ -938,45 +1674,49 @@ async function finalize(
       'Zusatzaktionen müssen zu bereits bearbeiteten Nachrichten gehören.',
     )
   }
-  if (snapshot.finalEmailIds) {
-    const unchanged =
-      requestedFinalize.size === snapshot.finalEmailIds.size &&
-      [...requestedFinalize].every((id) => snapshot.finalEmailIds?.has(id))
-    if (!unchanged)
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_SELECTION_LOCKED',
-        'Die Abschlussauswahl ist bereits festgeschrieben.',
-      )
-  } else snapshot.finalEmailIds = requestedFinalize
-  if (snapshot.finalKeepIds) {
-    const unchanged =
-      requestedKeep.size === snapshot.finalKeepIds.size &&
-      [...requestedKeep].every((id) => snapshot.finalKeepIds?.has(id))
-    if (!unchanged)
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_SELECTION_LOCKED',
-        'Die Auswahl ist bereits festgeschrieben.',
-      )
-  } else snapshot.finalKeepIds = requestedKeep
-  if (snapshot.finalSecondaryActionIds) {
-    const unchanged =
-      requestedSecondaryAction.size === snapshot.finalSecondaryActionIds.size &&
-      [...requestedSecondaryAction].every((id) => snapshot.finalSecondaryActionIds?.has(id))
-    if (!unchanged)
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_SELECTION_LOCKED',
-        'Die Aktionsauswahl ist bereits festgeschrieben.',
-      )
-  } else snapshot.finalSecondaryActionIds = requestedSecondaryAction
+  requireSameLockedSelection()
+
+  if (snapshot.mode === 'live') {
+    await ensureMailContext(snapshot, apiOptions)
+    const token = apiOptions.fastmailToken?.trim()
+    if (!token || !snapshot.context)
+      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+  }
+  // Loading the live mailbox context can yield long enough for another tab to save
+  // a newer revision or lock a different final selection. Recheck immediately before
+  // the synchronous durable lock, which then runs without another await.
+  requireCurrentRevision()
+  requireFinalizeAvailable()
+  requireSameLockedSelection()
+  selectionWasLocked ||= Boolean(snapshot.finalEmailIds)
+  snapshot.finalEmailIds ??= requestedFinalize
+  snapshot.finalKeepIds ??= requestedKeep
+  snapshot.finalSecondaryActionIds ??= requestedSecondaryAction
 
   const toMark = [...requestedFinalize].filter(
     (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
   )
   const untouched = snapshot.emailIds.length - requestedFinalize.size
   snapshot.finalizationState = 'finalizing'
+  try {
+    persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
+      actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({ id, reason })),
+      finalizeIds: [...requestedFinalize],
+      keepUnreadIds: [...requestedKeep],
+      secondaryActionIds: [...requestedSecondaryAction],
+      secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
+      state: 'finalizing',
+      succeededIds: [...snapshot.succeededIds],
+    })
+  } catch (error) {
+    snapshot.finalizationState = 'active'
+    if (!selectionWasLocked) {
+      snapshot.finalEmailIds = undefined
+      snapshot.finalKeepIds = undefined
+      snapshot.finalSecondaryActionIds = undefined
+    }
+    throw error
+  }
   try {
     if (snapshot.mode === 'demo') {
       for (const id of toMark) snapshot.succeededIds.add(id)
@@ -998,6 +1738,15 @@ async function finalize(
           snapshot.filters.spam === 'exclude' ? snapshot.secondaryActionSucceededIds.size : 0,
         untouched,
       }
+      snapshot.finalizationResult = result
+      persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
+        actionFailed: result.actionFailed,
+        failed: result.failed,
+        result,
+        secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
+        state: 'finalized',
+        succeededIds: [...snapshot.succeededIds],
+      })
       return json(res, 200, result)
     }
     const token = apiOptions.fastmailToken?.trim()
@@ -1009,8 +1758,16 @@ async function finalize(
     if (pendingSecondaryActions.length > 0) {
       const action =
         snapshot.filters.spam === 'only'
-          ? await moveEmailsOutOfSpam(snapshot.context, token, pendingSecondaryActions)
-          : await tagEmailsForLaterUnsubscribe(snapshot.context, token, pendingSecondaryActions)
+          ? await (apiOptions.moveOutOfSpam ?? moveEmailsOutOfSpam)(
+              snapshot.context,
+              token,
+              pendingSecondaryActions,
+            )
+          : await (apiOptions.tagForLaterUnsubscribe ?? tagEmailsForLaterUnsubscribe)(
+              snapshot.context,
+              token,
+              pendingSecondaryActions,
+            )
       for (const id of action.succeededIds) {
         snapshot.secondaryActionSucceededIds.add(id)
         snapshot.secondaryActionFailures.delete(id)
@@ -1019,7 +1776,7 @@ async function finalize(
         snapshot.secondaryActionFailures.set(failure.id, failure.reason)
       }
     }
-    const update = await markEmailsRead(snapshot.context, token, toMark)
+    const update = await (apiOptions.markRead ?? markEmailsRead)(snapshot.context, token, toMark)
     for (const id of update.markedIds) snapshot.succeededIds.add(id)
     updateReviewHistory(apiOptions.reviewHistory, requestedKeep, update.markedIds)
     const remainingRead = [...requestedFinalize].filter(
@@ -1045,9 +1802,31 @@ async function finalize(
         snapshot.filters.spam === 'exclude' ? snapshot.secondaryActionSucceededIds.size : 0,
       untouched,
     }
+    snapshot.finalizationResult = result
+    persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
+      actionFailed: result.actionFailed,
+      failed: result.failed,
+      result,
+      secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
+      state: snapshot.finalizationState,
+      succeededIds: [...snapshot.succeededIds],
+    })
     return json(res, remaining > 0 ? 207 : 200, result)
   } catch (error) {
     snapshot.finalizationState = 'active'
+    if (apiOptions.roundStore) {
+      persistAnalysisUpdate('finalization_rollback_persist_failed', () =>
+        apiOptions.roundStore?.saveFinalization(snapshotId, {
+          actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({
+            id,
+            reason,
+          })),
+          secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
+          state: 'active',
+          succeededIds: [...snapshot.succeededIds],
+        }),
+      )
+    }
     throw error
   }
 }
@@ -1077,7 +1856,7 @@ async function blob(
   securityHeaders(res)
   res.statusCode = 200
   res.setHeader('Content-Type', inline ? resource.type : 'application/octet-stream')
-  res.setHeader('Cache-Control', 'private, max-age=300')
+  res.setHeader('Cache-Control', 'private, no-store')
   res.setHeader(
     'Content-Disposition',
     `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(resource.name.slice(0, 240))}`,
@@ -1189,48 +1968,70 @@ async function draft(
     })
     .safeParse(body)
   if (!parsed.success) throw new ApiHttpError(400, 'INVALID_DRAFT', 'Ungültige Draft-Daten.')
+  const { requestId, ...draftPayload } = parsed.data
+  const fingerprint = createHash('sha256').update(JSON.stringify(draftPayload)).digest('hex')
+  const existingFingerprint = snapshot.draftRequestFingerprints.get(requestId)
+  if (existingFingerprint && existingFingerprint !== fingerprint) {
+    throw new ApiHttpError(
+      409,
+      'DRAFT_REQUEST_CONFLICT',
+      'Diese Draft-Anfrage wurde bereits mit anderem Inhalt verwendet. Bitte versuche es erneut.',
+    )
+  }
+  snapshot.draftRequestFingerprints.set(requestId, fingerprint)
   const cached = snapshot.draftResults.get(parsed.data.requestId)
   if (cached) return json(res, 200, cached)
-  const summary = snapshot.summaries.get(parsed.data.emailId)
-  if (!summary) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-  const messages = await loadThread(snapshot, summary.threadId, apiOptions)
-  const identities = await loadIdentities(snapshot, apiOptions)
-  const identity = identities.find((item) => item.id === parsed.data.identityId)
-  if (!identity) throw new ApiHttpError(400, 'INVALID_IDENTITY', 'Unbekannte Absenderidentität.')
-  const latest = messages.at(-1)
-  if (!latest) throw new ApiHttpError(409, 'THREAD_EMPTY', 'Der Thread enthält keine Nachricht.')
-  const bodyText = appendSignature(parsed.data.bodyText, identity)
-  const htmlSignature = identity.htmlSignature.trim()
-    ? identity.htmlSignature
-    : escapeDraftHtml(identity.textSignature.trim())
-  const bodyHtml = `${escapeDraftHtml(parsed.data.bodyText.trim())}${htmlSignature ? `<br><br>${htmlSignature}` : ''}`
-  if (snapshot.mode === 'demo') {
-    const result: DraftResult = {
-      draftId: `demo-draft-${parsed.data.requestId}`,
-      recovered: false,
-      threadId: summary.threadId,
-      verified: true,
+  const inFlight = snapshot.draftWork.get(parsed.data.requestId)
+  if (inFlight) return json(res, 200, await inFlight)
+  const work = (async (): Promise<DraftResult> => {
+    const summary = snapshot.summaries.get(parsed.data.emailId)
+    if (!summary) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+    const messages = await loadThread(snapshot, summary.threadId, apiOptions)
+    const identities = await loadIdentities(snapshot, apiOptions)
+    const identity = identities.find((item) => item.id === parsed.data.identityId)
+    if (!identity) throw new ApiHttpError(400, 'INVALID_IDENTITY', 'Unbekannte Absenderidentität.')
+    const latest = messages.at(-1)
+    if (!latest) throw new ApiHttpError(409, 'THREAD_EMPTY', 'Der Thread enthält keine Nachricht.')
+    const bodyText = appendSignature(parsed.data.bodyText, identity)
+    const htmlSignature = identity.htmlSignature.trim()
+      ? identity.htmlSignature
+      : escapeDraftHtml(identity.textSignature.trim())
+    const bodyHtml = `${escapeDraftHtml(parsed.data.bodyText.trim())}${htmlSignature ? `<br><br>${htmlSignature}` : ''}`
+    if (snapshot.mode === 'demo') {
+      return {
+        draftId: `demo-draft-${parsed.data.requestId}`,
+        recovered: false,
+        threadId: summary.threadId,
+        verified: true,
+      }
     }
+    const token = apiOptions.fastmailToken?.trim()
+    if (!token || !snapshot.context)
+      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
+    const references = [...new Set([...latest.references, ...latest.messageId])]
+    return await createAndVerifyDraft(snapshot.context, token, {
+      bodyHtml,
+      bodyText,
+      cc: parsed.data.cc,
+      from: { name: identity.name, email: identity.email },
+      inReplyTo: latest.messageId.slice(0, 1),
+      references,
+      subject: parsed.data.subject,
+      threadId: summary.threadId,
+      to: parsed.data.to,
+    })
+  })()
+  snapshot.draftWork.set(parsed.data.requestId, work)
+  try {
+    const result = await work
     snapshot.draftResults.set(parsed.data.requestId, result)
     return json(res, 201, result)
+  } catch (error) {
+    snapshot.draftRequestFingerprints.delete(requestId)
+    throw error
+  } finally {
+    snapshot.draftWork.delete(parsed.data.requestId)
   }
-  const token = apiOptions.fastmailToken?.trim()
-  if (!token || !snapshot.context)
-    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-  const references = [...new Set([...latest.references, ...latest.messageId])]
-  const result = await createAndVerifyDraft(snapshot.context, token, {
-    bodyHtml,
-    bodyText,
-    cc: parsed.data.cc,
-    from: { name: identity.name, email: identity.email },
-    inReplyTo: latest.messageId.slice(0, 1),
-    references,
-    subject: parsed.data.subject,
-    threadId: summary.threadId,
-    to: parsed.data.to,
-  })
-  snapshot.draftResults.set(parsed.data.requestId, result)
-  return json(res, 201, result)
 }
 
 function logApiError(error: unknown) {
@@ -1313,6 +2114,12 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
       }
       if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
         const snapshotId = parts[2]
+        await ensureSnapshot(snapshotId, apiOptions)
+        if (req.method === 'GET' && !parts[3]) {
+          validateOrigin(req)
+          const snapshot = getSnapshot(snapshotId)
+          return json(res, 200, snapshotPayload(snapshotId, snapshot))
+        }
         if (
           req.method === 'GET' &&
           parts[3] === 'emails' &&
@@ -1343,6 +2150,9 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
         if (req.method === 'POST' && parts[3] === 'bundles') {
           return await bundles(req, res, snapshotId, apiOptions)
         }
+        if (req.method === 'POST' && parts[3] === 'state') {
+          return await updateRoundState(req, res, snapshotId, apiOptions)
+        }
         if (req.method === 'POST' && parts[3] === 'bundle-labels') {
           return await bundleLabel(req, res, snapshotId, apiOptions)
         }
@@ -1362,6 +2172,11 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
 
 export function clearApiStateForTests() {
   snapshots.clear()
+  bundleJobs.clear()
   for (const state of codexLogins.values()) state.controller.abort()
   codexLogins.clear()
+}
+
+export async function waitForApiJobs() {
+  await Promise.allSettled([...bundleJobs.values()])
 }

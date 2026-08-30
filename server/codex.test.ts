@@ -3,8 +3,10 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  CodexAuthenticationError,
   codexAuthStoragePath,
   ensureCodexStorageReady,
+  isCodexAuthenticationFailure,
   runCodexReply,
   selectCodexModel,
   selectedCodexModel,
@@ -38,6 +40,27 @@ describe('Codex provider boundary', () => {
     await expect(
       runCodexReply({ images: [], prompt: 'untrusted test data', systemPrompt: 'test' }),
     ).rejects.toThrow('Live AI inference is disabled')
+  })
+
+  it('classifies only conservative Codex authentication failures', () => {
+    for (const failure of [
+      new CodexAuthenticationError(),
+      new Error('OpenAI Codex token refresh failed (401): invalid_grant'),
+      new Error('No API key found for "openai-codex"'),
+      new Error('OAuth token expired'),
+      new Error('Request failed: 401 Unauthorized'),
+    ]) {
+      expect(isCodexAuthenticationFailure(failure)).toBe(true)
+    }
+    for (const failure of [
+      new Error('Request failed: 403 Forbidden'),
+      new Error('Request failed: 429 rate limit exceeded'),
+      new Error('fetch failed: ECONNRESET'),
+      new Error('Codex inference timed out after 30000 ms.'),
+      new Error('Codex returned malformed output'),
+    ]) {
+      expect(isCodexAuthenticationFailure(failure)).toBe(false)
+    }
   })
 
   it('persists a supported model below DATA_DIR and prefers it over the deployment default', () => {

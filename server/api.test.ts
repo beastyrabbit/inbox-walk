@@ -1,26 +1,70 @@
-import { createServer, type Server } from 'node:http'
+import { createServer, request as httpRequest, type Server } from 'node:http'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
 import type {
   DraftResult,
   FinalizeResult,
   ReplyProposal,
-  ReviewBundleRun,
   ReviewEmail,
   ReviewOptions,
   ReviewSnapshot,
   ThreadContext,
 } from '../src/shared.ts'
-import { clearApiStateForTests, createApiMiddleware, safeCodexLoginUrl } from './api.ts'
+import {
+  clearApiStateForTests,
+  codexBundleCallLimit,
+  createApiMiddleware,
+  safeCodexLoginUrl,
+  waitForApiJobs,
+} from './api.ts'
+import type { BundleRelationshipLabel } from './bundle-store.ts'
+import { type BundleExample, hashLearningSignal } from './bundles.ts'
+import { CodexAuthenticationError } from './codex.ts'
 import { demoEmails } from './demo.ts'
+import { createRoundStore } from './round-store.ts'
 
 let server: Server
 let baseUrl = ''
 const retainedIds = new Set<string>()
 let injectUnknownBundleId = false
+let bundleDecisionCalls = 0
+let bundleDecisionGate: Promise<void> | null = null
+let releaseBundleDecision: (() => void) | null = null
+const recordedBundleLabels: BundleRelationshipLabel[] = []
+let availableBundleExamples: BundleExample[] = []
+const roundStore = createRoundStore(':memory:')
+const partialFinalizeResult: FinalizeResult = {
+  actionFailed: [],
+  failed: [{ id: 'demo-human', reason: 'Temporärer Fastmail-Fehler' }],
+  finalized: false,
+  keptUnread: 1,
+  markedRead: 0,
+  mode: 'demo',
+  processed: 1,
+  remaining: 1,
+  rescuedFromSpam: 0,
+  taggedForUnsubscribe: 0,
+  untouched: demoEmails.length - 1,
+}
 
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
   return { response, body: (await response.json()) as T }
+}
+
+async function waitForBundles(review: ReviewSnapshot) {
+  const started = await json<ReviewSnapshot>(
+    `/api/reviews/${review.snapshotId}/bundles`,
+    post({}, review.csrfToken),
+  )
+  expect([200, 202]).toContain(started.response.status)
+  let current = started.body
+  for (let attempt = 0; attempt < 50 && current.analysis.status !== 'complete'; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5))
+    current = (await json<ReviewSnapshot>(`/api/reviews/${review.snapshotId}`)).body
+  }
+  expect(current.analysis.status).toBe('complete')
+  expect(current.bundleRun).toBeDefined()
+  return current
 }
 
 function post(body: unknown, csrfToken?: string): RequestInit {
@@ -34,9 +78,25 @@ function post(body: unknown, csrfToken?: string): RequestInit {
   }
 }
 
+function finalizationBody(
+  review: ReviewSnapshot,
+  selection: {
+    finalizeIds: Array<string | undefined>
+    keepUnreadIds: Array<string | undefined>
+    secondaryActionIds?: Array<string | undefined>
+  },
+) {
+  return { ...selection, revision: review.userState.revision }
+}
+
 beforeAll(async () => {
   const middleware = createApiMiddleware({
     forceDemo: true,
+    roundStore,
+    bundleStore: {
+      examples: () => availableBundleExamples,
+      record: (label) => recordedBundleLabels.push(label),
+    },
     reviewHistory: {
       close() {},
       count: () => retainedIds.size,
@@ -78,15 +138,19 @@ beforeAll(async () => {
         })
       },
     }),
-    bundleDecider: async () => ({
-      includedEmailIds: injectUnknownBundleId ? ['outside-frozen-snapshot'] : [],
-      kind: 'standalone',
-      title: 'Demo bundle',
-      currentState: 'Demo',
-      summary: 'Deterministic test decision.',
-      linkEvidence: [],
-      membershipConfidence: 1,
-    }),
+    bundleDecider: async () => {
+      bundleDecisionCalls += 1
+      if (bundleDecisionGate) await bundleDecisionGate
+      return {
+        includedEmailIds: injectUnknownBundleId ? ['outside-frozen-snapshot'] : [],
+        kind: 'standalone',
+        title: 'Demo bundle',
+        currentState: 'Demo',
+        summary: 'Deterministic test decision.',
+        linkEvidence: [],
+        membershipConfidence: 1,
+      }
+    },
   })
   server = createServer((request, response) => {
     void middleware(request, response, () => {
@@ -104,15 +168,41 @@ afterAll(async () => {
   await new Promise<void>((resolve, reject) =>
     server.close((error) => (error ? reject(error) : resolve())),
   )
+  roundStore.close()
 })
 
 beforeEach(() => {
   clearApiStateForTests()
   retainedIds.clear()
   injectUnknownBundleId = false
+  bundleDecisionCalls = 0
+  bundleDecisionGate = null
+  releaseBundleDecision = null
+  recordedBundleLabels.length = 0
+  availableBundleExamples = []
 })
 
 describe('demo API contract', () => {
+  it('uses the documented Codex call limit default for empty configuration', () => {
+    const previous = process.env.CODEX_BUNDLE_MAX_CALLS
+    try {
+      delete process.env.CODEX_BUNDLE_MAX_CALLS
+      expect(codexBundleCallLimit(undefined)).toBe(64)
+      process.env.CODEX_BUNDLE_MAX_CALLS = ''
+      expect(codexBundleCallLimit(undefined)).toBe(64)
+      process.env.CODEX_BUNDLE_MAX_CALLS = '   '
+      expect(codexBundleCallLimit(undefined)).toBe(64)
+      process.env.CODEX_BUNDLE_MAX_CALLS = 'invalid'
+      expect(codexBundleCallLimit(undefined)).toBe(64)
+      expect(codexBundleCallLimit(0)).toBe(1)
+      expect(codexBundleCallLimit(2.9)).toBe(2)
+      expect(codexBundleCallLimit(1_000)).toBe(512)
+    } finally {
+      if (previous === undefined) delete process.env.CODEX_BUNDLE_MAX_CALLS
+      else process.env.CODEX_BUNDLE_MAX_CALLS = previous
+    }
+  })
+
   it('allows only the official OpenAI host for login links', () => {
     expect(safeCodexLoginUrl('https://auth.openai.com/codex/device')).toBe(
       'https://auth.openai.com/codex/device',
@@ -164,6 +254,11 @@ describe('demo API contract', () => {
     expect(review.response.status).toBe(201)
     expect(review.body.emails).toHaveLength(9)
     expect(review.body.emails[0]).not.toHaveProperty('html')
+    expect(review.body.finalization).toEqual({
+      result: null,
+      selectionLocked: false,
+      status: 'active',
+    })
 
     const detail = await json<ReviewEmail>(
       `/api/reviews/${review.body.snapshotId}/emails/${review.body.emails[0]?.id}`,
@@ -203,7 +298,13 @@ describe('demo API contract', () => {
     expect(beforeFinalize.body.reviewedCount).toBe(0)
     await json<FinalizeResult>(
       `/api/reviews/${first.body.snapshotId}/finalize`,
-      post({ finalizeIds: [viewed.id], keepUnreadIds: [viewed.id] }, first.body.csrfToken),
+      post(
+        finalizationBody(first.body, {
+          finalizeIds: [viewed.id],
+          keepUnreadIds: [viewed.id],
+        }),
+        first.body.csrfToken,
+      ),
     )
 
     const afterKeep = await json<ReviewOptions>('/api/review/options')
@@ -229,7 +330,10 @@ describe('demo API contract', () => {
     )
     await json<FinalizeResult>(
       `/api/reviews/${unfiltered.body.snapshotId}/finalize`,
-      post({ finalizeIds: [viewed.id], keepUnreadIds: [] }, unfiltered.body.csrfToken),
+      post(
+        finalizationBody(unfiltered.body, { finalizeIds: [viewed.id], keepUnreadIds: [] }),
+        unfiltered.body.csrfToken,
+      ),
     )
     const afterRead = await json<ReviewOptions>('/api/review/options')
     expect(afterRead.body.reviewedCount).toBe(0)
@@ -247,6 +351,603 @@ describe('demo API contract', () => {
     expect(resumed.body.missingIds).toEqual(['missing-id'])
   })
 
+  it('loads the same persisted round ID and tokens after the RAM cache is cleared', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+
+    expect(restored.response.status).toBe(200)
+    expect(restored.body).toMatchObject({
+      csrfToken: created.body.csrfToken,
+      imageToken: created.body.imageToken,
+      snapshotId: created.body.snapshotId,
+    })
+    expect(restored.body.emails.map((email) => email.id)).toEqual(
+      created.body.emails.map((email) => email.id),
+    )
+  })
+
+  it('freezes cleaned learning examples when the API creates a round', async () => {
+    const privateSignal = 'provider:private-api-signal'
+    availableBundleExamples = [
+      {
+        anchorSignals: [privateSignal],
+        candidateSignals: ['thread:private-api-thread'],
+        correct: true,
+        reason: 'Private API reason.',
+      },
+    ]
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const frozen = roundStore.get(created.body.snapshotId)?.bundleExamples
+
+    expect(frozen).toEqual([
+      {
+        anchorSignals: [hashLearningSignal(privateSignal)],
+        candidateSignals: [hashLearningSignal('thread:private-api-thread')],
+        correct: true,
+        reason: 'Vom Nutzer im Review bestätigt.',
+      },
+    ])
+    availableBundleExamples = [
+      {
+        anchorSignals: ['provider:later-signal'],
+        candidateSignals: ['thread:later-thread'],
+        correct: false,
+        reason: 'Later reason.',
+      },
+    ]
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+
+    expect(restored.response.status).toBe(200)
+    expect(roundStore.get(created.body.snapshotId)?.bundleExamples).toEqual(frozen)
+  })
+
+  it('starts bundle analysis without blocking and never reruns a persisted result', async () => {
+    bundleDecisionGate = new Promise<void>((resolve) => {
+      releaseBundleDecision = resolve
+    })
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const started = await json<ReviewSnapshot>(
+      `/api/reviews/${created.body.snapshotId}/bundles`,
+      post({}, created.body.csrfToken),
+    )
+
+    expect(started.response.status).toBe(202)
+    expect(started.body.analysis).toMatchObject({ engine: 'codex', status: 'running' })
+    expect(started.body.bundleRun).toBeUndefined()
+    releaseBundleDecision?.()
+    const completed = await waitForBundles(created.body)
+    const callsAfterCompletion = bundleDecisionCalls
+    expect(callsAfterCompletion).toBeGreaterThan(0)
+
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(restored.body.analysis.status).toBe('complete')
+    const restarted = await json<ReviewSnapshot>(
+      `/api/reviews/${created.body.snapshotId}/bundles`,
+      post({}, created.body.csrfToken),
+    )
+    expect(restarted.response.status).toBe(200)
+    expect(restarted.body.bundleRun).toEqual(completed.bundleRun)
+    expect(bundleDecisionCalls).toBe(callsAfterCompletion)
+  })
+
+  it('automatically resumes a persisted unfinished analysis when the round is opened', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'waiting',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+        totalEmailCount: demoEmails.length,
+      },
+      csrfToken: 'recovery-csrf',
+      emails: demoEmails,
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      id: 'pending-recovery-round',
+      imageToken: 'recovery-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'demo',
+    })
+    let releaseDecision: (() => void) | undefined
+    const decisionGate = new Promise<void>((resolve) => {
+      releaseDecision = resolve
+    })
+    let decisionCalls = 0
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: true,
+      bundleDecider: async () => {
+        decisionCalls += 1
+        await decisionGate
+        return {
+          currentState: 'Geprüft',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Persistierte Recovery-Entscheidung.',
+          title: 'Recovery',
+        }
+      },
+      demoMessages: demoEmails,
+      forceDemo: true,
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const openedResponse = await fetch(`${localBase}/api/reviews/pending-recovery-round`)
+      const opened = (await openedResponse.json()) as ReviewSnapshot
+
+      expect(openedResponse.status).toBe(200)
+      expect(opened.analysis).toMatchObject({ engine: 'codex', status: 'running' })
+      expect(opened.bundleRun).toBeUndefined()
+      for (let attempt = 0; attempt < 50 && decisionCalls === 0; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 5))
+      }
+      expect(decisionCalls).toBeGreaterThan(0)
+
+      releaseDecision?.()
+      await waitForApiJobs()
+      const completed = (await (
+        await fetch(`${localBase}/api/reviews/pending-recovery-round`)
+      ).json()) as ReviewSnapshot
+      expect(completed.analysis.status).toBe('complete')
+      expect(completed.bundleRun).toBeDefined()
+      const callsAfterCompletion = decisionCalls
+
+      clearApiStateForTests()
+      const reopened = (await (
+        await fetch(`${localBase}/api/reviews/pending-recovery-round`)
+      ).json()) as ReviewSnapshot
+      expect(reopened.analysis.status).toBe('complete')
+      expect(decisionCalls).toBe(callsAfterCompletion)
+    } finally {
+      releaseDecision?.()
+      await waitForApiJobs()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('keeps an unfinished Codex analysis pending when its login is unavailable', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    localStore.create({
+      analysis: {
+        callCount: 2,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'deciding',
+        processedEmailCount: 0,
+        progress: 0.2,
+        status: 'running',
+        totalEmailCount: 1,
+      },
+      csrfToken: 'restart-csrf',
+      emails: [
+        {
+          from: source.from,
+          hasAttachment: source.hasAttachment,
+          id: source.id,
+          isNewsletter: source.isNewsletter,
+          mailboxNames: source.mailboxNames,
+          preview: source.preview,
+          receivedAt: source.receivedAt,
+          subject: source.subject,
+          threadId: source.threadId,
+          to: source.to,
+        },
+      ],
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      id: 'live-restart-round',
+      imageToken: 'restart-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    const localMiddleware = createApiMiddleware({
+      codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const restoredResponse = await fetch(`${localBase}/api/reviews/live-restart-round`)
+      const restored = (await restoredResponse.json()) as ReviewSnapshot
+      expect(restoredResponse.status).toBe(200)
+      expect(restored.snapshotId).toBe('live-restart-round')
+      const started = await fetch(
+        `${localBase}/api/reviews/live-restart-round/bundles`,
+        post({}, 'restart-csrf'),
+      )
+      expect(started.status).toBe(202)
+      const current = (await started.json()) as ReviewSnapshot
+      expect(current).toMatchObject({
+        analysis: {
+          callCount: 2,
+          engine: 'codex',
+          phase: 'waiting_for_codex',
+          status: 'pending',
+        },
+      })
+      expect(current.analysis.error).toContain('erneut verbunden')
+      expect(current.bundleRun).toBeUndefined()
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('reuses the frozen Codex inputs and call limit after restart', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const summaries = [
+      { id: 'auth-a-1', threadId: 'auth-thread-a', subject: 'alphaquartz', preview: 'alphaquartz' },
+      { id: 'auth-a-2', threadId: 'auth-thread-a', subject: 'alphaquartz', preview: 'alphaquartz' },
+      { id: 'auth-b-1', threadId: 'auth-thread-b', subject: 'betajuniper', preview: 'betajuniper' },
+      { id: 'auth-b-2', threadId: 'auth-thread-b', subject: 'betajuniper', preview: 'betajuniper' },
+    ].map((item, index) => ({
+      from: source.from,
+      hasAttachment: false,
+      isNewsletter: false,
+      mailboxNames: ['Inbox'],
+      receivedAt: `2026-08-30T10:0${index}:00.000Z`,
+      to: source.to,
+      ...item,
+    }))
+    let globalExamples: BundleExample[] = [
+      {
+        anchorSignals: ['provider:initial-anchor'],
+        candidateSignals: ['provider:initial-candidate'],
+        correct: false,
+        reason: 'Initial private reason.',
+      },
+    ]
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'waiting',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+        totalEmailCount: summaries.length,
+      },
+      bundleCallLimit: 2,
+      bundleExamples: globalExamples,
+      csrfToken: 'auth-resume-csrf',
+      emails: summaries,
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      id: 'auth-resume-round',
+      imageToken: 'auth-resume-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    let providerCalls = 0
+    let globalExampleReads = 0
+    let failAuthentication = true
+    const observedExamples: BundleExample[][] = []
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      bundleCallLimit: 1,
+      bundleDecider: async (input) => {
+        providerCalls += 1
+        observedExamples.push(input.examples)
+        if (failAuthentication && providerCalls === 2) throw new CodexAuthenticationError()
+        return {
+          currentState: 'Geprüft',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Getrennte Story.',
+          title: 'Getrennt',
+        }
+      },
+      bundleStore: {
+        examples: () => {
+          globalExampleReads += 1
+          return globalExamples
+        },
+        record: () => {},
+      },
+      codexAuthStatus: () => ({ configured: true, model: 'gpt-5.6-sol' }),
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const start = await fetch(
+        `${localBase}/api/reviews/auth-resume-round/bundles`,
+        post({}, 'auth-resume-csrf'),
+      )
+      expect(start.status).toBe(202)
+      await waitForApiJobs()
+
+      const waiting = (await (
+        await fetch(`${localBase}/api/reviews/auth-resume-round`)
+      ).json()) as ReviewSnapshot
+      expect(waiting).toMatchObject({
+        analysis: {
+          callCount: 1,
+          engine: 'codex',
+          model: 'gpt-5.6-sol',
+          phase: 'waiting_for_codex',
+          status: 'pending',
+        },
+        snapshotId: 'auth-resume-round',
+      })
+      expect(waiting.bundleRun).toBeUndefined()
+
+      const frozenExamples = localStore.get('auth-resume-round')?.bundleExamples ?? []
+      expect(frozenExamples).toHaveLength(1)
+      expect(observedExamples).toEqual([frozenExamples, frozenExamples])
+      globalExamples = [
+        {
+          anchorSignals: ['provider:changed-anchor'],
+          candidateSignals: ['provider:changed-candidate'],
+          correct: true,
+          reason: 'Changed private reason.',
+        },
+      ]
+      failAuthentication = false
+      clearApiStateForTests()
+      const resumed = await fetch(
+        `${localBase}/api/reviews/auth-resume-round/bundles`,
+        post({}, 'auth-resume-csrf'),
+      )
+      expect(resumed.status).toBe(202)
+      await waitForApiJobs()
+      expect(providerCalls).toBe(3)
+      expect(globalExampleReads).toBe(0)
+      expect(observedExamples).toEqual([frozenExamples, frozenExamples, frozenExamples])
+      expect(observedExamples.flat()).not.toEqual(expect.arrayContaining(globalExamples))
+
+      clearApiStateForTests()
+      const completed = (await (
+        await fetch(`${localBase}/api/reviews/auth-resume-round`)
+      ).json()) as ReviewSnapshot
+      expect(completed.analysis).toMatchObject({
+        callCount: 2,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'complete',
+        status: 'complete',
+      })
+      expect(completed.analysis).not.toHaveProperty('error')
+      expect(completed.bundleRun).toBeDefined()
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('persists decisions with an optimistic revision and rejects a stale tab', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const emailId = created.body.emails[0]?.id
+    expect(emailId).toBeDefined()
+    if (!emailId) return
+    const state = {
+      bundleGroups: [],
+      index: 0,
+      keptUnreadIds: [emailId],
+      processedIds: [emailId],
+      replyDrafts: {},
+      secondaryActionIds: [],
+      selectedMemberId: emailId,
+    }
+    const first = await json<ReviewSnapshot['userState']>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post({ revision: 0, state }, created.body.csrfToken),
+    )
+    expect(first.body.revision).toBe(1)
+    const stale = await json<{ error: { code: string; details: { actualRevision: number } } }>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post({ revision: 0, state: { ...state, keptUnreadIds: [] } }, created.body.csrfToken),
+    )
+    expect(stale.response.status).toBe(409)
+    expect(stale.body.error).toMatchObject({
+      code: 'ROUND_REVISION_CONFLICT',
+      details: { actualRevision: 1 },
+    })
+
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(restored.body.userState).toMatchObject({
+      keptUnreadIds: [emailId],
+      processedIds: [emailId],
+      revision: 1,
+    })
+  })
+
+  it('does not let a stale tab finalize over newer persisted decisions', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const [firstId, secondId] = created.body.emails.map((email) => email.id)
+    expect(firstId).toBeDefined()
+    expect(secondId).toBeDefined()
+    if (!firstId || !secondId) return
+    const winnerState = {
+      bundleGroups: [],
+      index: 0,
+      keptUnreadIds: [firstId],
+      processedIds: [firstId],
+      replyDrafts: {},
+      secondaryActionIds: [],
+      selectedMemberId: firstId,
+    }
+    const winner = await json<ReviewSnapshot['userState']>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post({ revision: 0, state: winnerState }, created.body.csrfToken),
+    )
+    expect(winner.body.revision).toBe(1)
+
+    const staleFinalize = await json<{ error: { code: string; details: unknown } }>(
+      `/api/reviews/${created.body.snapshotId}/finalize`,
+      post(
+        {
+          finalizeIds: [secondId],
+          keepUnreadIds: [],
+          revision: 0,
+          secondaryActionIds: [],
+        },
+        created.body.csrfToken,
+      ),
+    )
+    expect(staleFinalize.response.status).toBe(409)
+    expect(staleFinalize.body.error.code).toBe('ROUND_REVISION_CONFLICT')
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(restored.body.finalization.status).toBe('active')
+    expect(restored.body.userState).toMatchObject(winner.body)
+  })
+
+  it('rejects a slow state upload when another request finalizes before its write', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const emailId = created.body.emails[0]?.id
+    expect(emailId).toBeDefined()
+    if (!emailId) return
+    const payload = JSON.stringify({
+      revision: created.body.userState.revision,
+      state: {
+        bundleGroups: [],
+        index: 0,
+        keptUnreadIds: [emailId],
+        processedIds: [emailId],
+        replyDrafts: {},
+        secondaryActionIds: [],
+        selectedMemberId: emailId,
+      },
+    })
+    let slowRequest: ReturnType<typeof httpRequest> | undefined
+    const slowResponse = new Promise<{ body: { error: { code: string } }; status: number }>(
+      (resolve, reject) => {
+        slowRequest = httpRequest(
+          `${baseUrl}/api/reviews/${created.body.snapshotId}/state`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Length': Buffer.byteLength(payload),
+              'Content-Type': 'application/json',
+              'X-Inbox-Walk-CSRF': created.body.csrfToken,
+            },
+          },
+          (response) => {
+            const chunks: Buffer[] = []
+            response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+            response.on('end', () =>
+              resolve({
+                body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+                  error: { code: string }
+                },
+                status: response.statusCode ?? 0,
+              }),
+            )
+          },
+        )
+        slowRequest.on('error', reject)
+      },
+    )
+    slowRequest?.write(payload.slice(0, 1))
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const finalized = await json<FinalizeResult>(
+      `/api/reviews/${created.body.snapshotId}/finalize`,
+      post(
+        finalizationBody(created.body, { finalizeIds: [emailId], keepUnreadIds: [] }),
+        created.body.csrfToken,
+      ),
+    )
+    expect(finalized.response.status).toBe(200)
+    slowRequest?.end(payload.slice(1))
+
+    await expect(slowResponse).resolves.toMatchObject({
+      body: { error: { code: 'ROUND_FINALIZED' } },
+      status: 409,
+    })
+  })
+
   it('requires the snapshot CSRF token for mutations', async () => {
     const review = await json<ReviewSnapshot>(
       '/api/reviews',
@@ -254,7 +955,12 @@ describe('demo API contract', () => {
     )
     const rejected = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
-      post({ finalizeIds: [review.body.emails[0]?.id], keepUnreadIds: [] }),
+      post(
+        finalizationBody(review.body, {
+          finalizeIds: [review.body.emails[0]?.id],
+          keepUnreadIds: [],
+        }),
+      ),
     )
     expect(rejected.response.status).toBe(403)
     expect(rejected.body.error.code).toBe('INVALID_CSRF')
@@ -265,16 +971,14 @@ describe('demo API contract', () => {
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
     )
-    const run = await json<ReviewBundleRun>(
-      `/api/reviews/${review.body.snapshotId}/bundles`,
-      post({}, review.body.csrfToken),
-    )
-    expect(run.response.status).toBe(200)
-    const bundledIds = run.body.bundles.flatMap((bundle) => bundle.emailIds)
+    const completed = await waitForBundles(review.body)
+    const run = completed.bundleRun
+    if (!run) return
+    const bundledIds = run.bundles.flatMap((bundle) => bundle.emailIds)
     expect(new Set(bundledIds)).toEqual(new Set(review.body.emails.map((email) => email.id)))
     expect(bundledIds).toHaveLength(review.body.emails.length)
     expect(
-      run.body.bundles.find((bundle) => bundle.emailIds.includes('demo-github-merged'))?.emailIds,
+      run.bundles.find((bundle) => bundle.emailIds.includes('demo-github-merged'))?.emailIds,
     ).toEqual(
       expect.arrayContaining([
         'demo-github-opened',
@@ -298,19 +1002,52 @@ describe('demo API contract', () => {
     expect(rejected.body.error.code).toBe('UNKNOWN_EMAIL')
   })
 
+  it('accepts a bundle-label reason without persisting its free-form text', async () => {
+    const review = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const [anchor, candidate] = review.body.emails
+    expect(anchor).toBeDefined()
+    expect(candidate).toBeDefined()
+    if (!anchor || !candidate) return
+
+    const recorded = await json<{ recorded: boolean }>(
+      `/api/reviews/${review.body.snapshotId}/bundle-labels`,
+      post(
+        {
+          anchorEmailIds: [anchor.id],
+          candidateEmailIds: [candidate.id],
+          label: 'split',
+          reason: 'Untrusted free-form reason that must not reach SQLite.',
+        },
+        review.body.csrfToken,
+      ),
+    )
+
+    expect(recorded.response.status).toBe(201)
+    expect(recorded.body.recorded).toBe(true)
+    expect(recordedBundleLabels).toHaveLength(1)
+    expect(recordedBundleLabels[0]).toMatchObject({
+      label: 'split',
+      reason: 'Vom Nutzer im Review bestätigt.',
+    })
+  })
+
   it('falls back to safe singletons when a bundle decision injects an unknown ID', async () => {
     injectUnknownBundleId = true
     const review = await json<ReviewSnapshot>(
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
     )
-    const run = await json<ReviewBundleRun>(
-      `/api/reviews/${review.body.snapshotId}/bundles`,
-      post({}, review.body.csrfToken),
-    )
-    expect(run.body.fallback).toBe(true)
-    expect(run.body.bundles).toHaveLength(review.body.emails.length)
-    expect(run.body.bundles.flatMap((bundle) => bundle.emailIds)).not.toContain(
+    const completed = await waitForBundles(review.body)
+    const run = completed.bundleRun
+    if (!run) return
+    expect(run.fallback).toBe(true)
+    expect(completed.analysis).toMatchObject({ engine: 'fallback', status: 'complete' })
+    expect(completed.analysis.error).toContain('nicht sicher bestimmt')
+    expect(run.bundles).toHaveLength(review.body.emails.length)
+    expect(run.bundles.flatMap((bundle) => bundle.emailIds)).not.toContain(
       'outside-frozen-snapshot',
     )
   })
@@ -343,23 +1080,45 @@ describe('demo API contract', () => {
     expect(proposal.response.status).toBe(200)
     expect(proposal.body.bodyText).toContain('Donnerstag')
 
-    const draft = await json<DraftResult>(
+    const requestId = crypto.randomUUID()
+    const draftRequest = () =>
+      json<DraftResult>(
+        `/api/reviews/${review.body.snapshotId}/drafts`,
+        post(
+          {
+            requestId,
+            emailId: email.id,
+            identityId: context.body.recipients.identityId,
+            to: context.body.recipients.to,
+            cc: context.body.recipients.cc,
+            subject: context.body.recipients.subject,
+            bodyText: proposal.body.bodyText,
+          },
+          review.body.csrfToken,
+        ),
+      )
+    const drafts = await Promise.all([draftRequest(), draftRequest()])
+    expect(drafts.map((draft) => draft.response.status).sort()).toEqual([200, 201])
+    expect(drafts[0]?.body).toEqual(drafts[1]?.body)
+    expect(drafts[0]?.body.verified).toBe(true)
+
+    const conflictingDraft = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/drafts`,
       post(
         {
-          requestId: crypto.randomUUID(),
+          requestId,
           emailId: email.id,
           identityId: context.body.recipients.identityId,
           to: context.body.recipients.to,
           cc: context.body.recipients.cc,
           subject: context.body.recipients.subject,
-          bodyText: proposal.body.bodyText,
+          bodyText: `${proposal.body.bodyText}\nVeränderter Inhalt`,
         },
         review.body.csrfToken,
       ),
     )
-    expect(draft.response.status).toBe(201)
-    expect(draft.body.verified).toBe(true)
+    expect(conflictingDraft.response.status).toBe(409)
+    expect(conflictingDraft.body.error.code).toBe('DRAFT_REQUEST_CONFLICT')
 
     const send = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/send`,
@@ -379,7 +1138,10 @@ describe('demo API contract', () => {
     if (!keptId) return
     const finalized = await json<FinalizeResult>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
-      post({ finalizeIds: [keptId], keepUnreadIds: [keptId] }, review.body.csrfToken),
+      post(
+        finalizationBody(review.body, { finalizeIds: [keptId], keepUnreadIds: [keptId] }),
+        review.body.csrfToken,
+      ),
     )
     expect(finalized.response.status).toBe(200)
     expect(finalized.body).toMatchObject({
@@ -393,8 +1155,679 @@ describe('demo API contract', () => {
     const changed = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
       post(
-        { finalizeIds: review.body.emails.map((email) => email.id), keepUnreadIds: [] },
+        finalizationBody(review.body, {
+          finalizeIds: review.body.emails.map((email) => email.id),
+          keepUnreadIds: [],
+        }),
         review.body.csrfToken,
+      ),
+    )
+    expect(changed.response.status).toBe(409)
+    expect(changed.body.error.code).toBe('FINALIZE_SELECTION_LOCKED')
+  })
+
+  it('does not finalize when the durable selection lock cannot be stored', async () => {
+    const localStore = createRoundStore(':memory:')
+    const failingStore = {
+      ...localStore,
+      saveFinalization: () => null,
+    }
+    const localMiddleware = createApiMiddleware({
+      forceDemo: true,
+      roundStore: failingStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const createdResponse = await fetch(
+        `${localBase}/api/reviews`,
+        post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+      )
+      const created = (await createdResponse.json()) as ReviewSnapshot
+      const emailId = created.emails[0]?.id
+      expect(emailId).toBeDefined()
+      if (!emailId) return
+      const failedResponse = await fetch(
+        `${localBase}/api/reviews/${created.snapshotId}/finalize`,
+        post(
+          finalizationBody(created, { finalizeIds: [emailId], keepUnreadIds: [] }),
+          created.csrfToken,
+        ),
+      )
+      expect(failedResponse.status).toBe(503)
+      expect((await failedResponse.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_PERSIST_FAILED' },
+      })
+      const restored = (await (
+        await fetch(`${localBase}/api/reviews/${created.snapshotId}`)
+      ).json()) as ReviewSnapshot
+      expect(restored.finalization.status).toBe('active')
+      expect(restored.userState.processedIds).toEqual([])
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('leaves no selection lock when live mailbox context fails before the first mutation', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    localStore.create({
+      csrfToken: 'context-failure-csrf',
+      emails: [source],
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      id: 'context-failure-round',
+      imageToken: 'context-failure-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
+      fastmailToken: 'test-fastmail-token',
+      resumeMailSnapshot: async () => {
+        throw new Error('Fastmail context unavailable')
+      },
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const failed = await fetch(
+        `${localBase}/api/reviews/context-failure-round/finalize`,
+        post({ finalizeIds: [source.id], keepUnreadIds: [], revision: 0 }, 'context-failure-csrf'),
+      )
+      expect(failed.status).toBe(500)
+
+      clearApiStateForTests()
+      const restored = (await (
+        await fetch(`${localBase}/api/reviews/context-failure-round`)
+      ).json()) as ReviewSnapshot
+      expect(restored.finalization).toEqual({
+        result: null,
+        selectionLocked: false,
+        status: 'active',
+      })
+      expect(localStore.get('context-failure-round')?.finalization).toMatchObject({
+        finalizeIds: [],
+        keepUnreadIds: [],
+        secondaryActionIds: [],
+        state: 'active',
+      })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('rechecks the revision after live context loading before locking finalization', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    localStore.create({
+      csrfToken: 'context-race-csrf',
+      emails: [source],
+      filters,
+      id: 'context-race-round',
+      imageToken: 'context-race-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    let releaseContext: (() => void) | undefined
+    const contextGate = new Promise<void>((resolve) => {
+      releaseContext = resolve
+    })
+    let contextStarted: (() => void) | undefined
+    const contextStart = new Promise<void>((resolve) => {
+      contextStarted = resolve
+    })
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
+      fastmailToken: 'test-fastmail-token',
+      markRead: async (_context, _token, ids) => ({ failed: [], markedIds: [...ids] }),
+      resumeMailSnapshot: async () => {
+        contextStarted?.()
+        await contextGate
+        return {
+          context: {
+            accountId: 'account',
+            apiUrl: 'https://jmap.invalid.test',
+            downloadUrl: 'https://jmap.invalid.test/{blobId}',
+            maxObjectsInGet: 100,
+            maxObjectsInSet: 100,
+            username: 'test@example.test',
+          },
+          emails: [source],
+          filters,
+          mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+          missingIds: [],
+          totalBeforeLimit: 1,
+          truncated: false,
+        }
+      },
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const finalizing = fetch(
+        `${localBase}/api/reviews/context-race-round/finalize`,
+        post({ finalizeIds: [source.id], keepUnreadIds: [], revision: 0 }, 'context-race-csrf'),
+      )
+      await contextStart
+      const newerState = await fetch(
+        `${localBase}/api/reviews/context-race-round/state`,
+        post(
+          {
+            revision: 0,
+            state: {
+              bundleGroups: [],
+              index: 0,
+              keptUnreadIds: [source.id],
+              processedIds: [source.id],
+              replyDrafts: {},
+              secondaryActionIds: [],
+              selectedMemberId: source.id,
+            },
+          },
+          'context-race-csrf',
+        ),
+      )
+      expect(newerState.status).toBe(200)
+      releaseContext?.()
+
+      const rejected = await finalizing
+      expect(rejected.status).toBe(409)
+      expect((await rejected.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_REVISION_CONFLICT' },
+      })
+      expect(localStore.get('context-race-round')?.finalization).toMatchObject({
+        finalizeIds: [],
+        state: 'active',
+      })
+    } finally {
+      releaseContext?.()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('allows only one first finalization selection after concurrent live context loading', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const other = { ...source, id: 'concurrent-other', threadId: 'concurrent-other-thread' }
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    localStore.create({
+      csrfToken: 'concurrent-finalize-csrf',
+      emails: [source, other],
+      filters,
+      id: 'concurrent-finalize-round',
+      imageToken: 'concurrent-finalize-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    let contextCalls = 0
+    let contextsStarted: (() => void) | undefined
+    const bothContextsStarted = new Promise<void>((resolve) => {
+      contextsStarted = resolve
+    })
+    let releaseContexts: (() => void) | undefined
+    const contextGate = new Promise<void>((resolve) => {
+      releaseContexts = resolve
+    })
+    let releaseMarkRead: (() => void) | undefined
+    const markReadGate = new Promise<void>((resolve) => {
+      releaseMarkRead = resolve
+    })
+    let markReadStarted: (() => void) | undefined
+    const markReadStart = new Promise<void>((resolve) => {
+      markReadStarted = resolve
+    })
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
+      fastmailToken: 'test-fastmail-token',
+      markRead: async (_context, _token, ids) => {
+        markReadStarted?.()
+        await markReadGate
+        return { failed: [], markedIds: [...ids] }
+      },
+      resumeMailSnapshot: async () => {
+        contextCalls += 1
+        if (contextCalls === 2) contextsStarted?.()
+        await contextGate
+        return {
+          context: {
+            accountId: 'account',
+            apiUrl: 'https://jmap.invalid.test',
+            downloadUrl: 'https://jmap.invalid.test/{blobId}',
+            maxObjectsInGet: 100,
+            maxObjectsInSet: 100,
+            username: 'test@example.test',
+          },
+          emails: [source, other],
+          filters,
+          mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+          missingIds: [],
+          totalBeforeLimit: 2,
+          truncated: false,
+        }
+      },
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const finalizeOne = (id: string) =>
+        fetch(
+          `${localBase}/api/reviews/concurrent-finalize-round/finalize`,
+          post({ finalizeIds: [id], keepUnreadIds: [], revision: 0 }, 'concurrent-finalize-csrf'),
+        )
+      const first = finalizeOne(source.id)
+      const second = finalizeOne(other.id)
+      await bothContextsStarted
+      releaseContexts?.()
+      await markReadStart
+      const early = await Promise.race([
+        first.then((response) => ({ response, request: 'first' as const })),
+        second.then((response) => ({ response, request: 'second' as const })),
+      ])
+      expect(early.response.status).toBe(409)
+      releaseMarkRead?.()
+      const responses = await Promise.all([first, second])
+      expect(responses.map((response) => response.status).sort()).toEqual([200, 409])
+
+      const stored = localStore.get('concurrent-finalize-round')
+      expect(stored?.finalization.state).toBe('finalized')
+      expect(stored?.finalization.finalizeIds).toHaveLength(1)
+      expect([source.id, other.id]).toContain(stored?.finalization.finalizeIds[0])
+    } finally {
+      releaseContexts?.()
+      releaseMarkRead?.()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('persists a partial live finalization lock and completes the same selection on retry', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails.find((email) => email.isNewsletter)
+    expect(source).toBeDefined()
+    if (!source) return
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    localStore.create({
+      csrfToken: 'partial-live-csrf',
+      emails: [source],
+      filters,
+      id: 'partial-live-round',
+      imageToken: 'partial-live-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    let shouldFail = true
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
+      fastmailToken: 'test-fastmail-token',
+      markRead: async (_context, _token, ids) =>
+        shouldFail
+          ? {
+              failed: ids.map((id) => ({ id, reason: 'Temporärer Lesestatusfehler' })),
+              markedIds: [],
+            }
+          : { failed: [], markedIds: [...ids] },
+      resumeMailSnapshot: async () => ({
+        context: {
+          accountId: 'account',
+          apiUrl: 'https://jmap.invalid.test',
+          downloadUrl: 'https://jmap.invalid.test/{blobId}',
+          maxObjectsInGet: 100,
+          maxObjectsInSet: 100,
+          username: 'test@example.test',
+        },
+        emails: [source],
+        filters,
+        mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+        missingIds: [],
+        totalBeforeLimit: 1,
+        truncated: false,
+      }),
+      roundStore: localStore,
+      tagForLaterUnsubscribe: async (_context, _token, ids) =>
+        shouldFail
+          ? {
+              failed: ids.map((id) => ({ id, reason: 'Temporärer Labelfehler' })),
+              succeededIds: [],
+            }
+          : { failed: [], succeededIds: [...ids] },
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const body = {
+        finalizeIds: [source.id],
+        keepUnreadIds: [],
+        revision: 0,
+        secondaryActionIds: [source.id],
+      }
+      const partialResponse = await fetch(
+        `${localBase}/api/reviews/partial-live-round/finalize`,
+        post(body, 'partial-live-csrf'),
+      )
+      const partial = (await partialResponse.json()) as FinalizeResult
+      expect(partialResponse.status).toBe(207)
+      expect(partial).toMatchObject({
+        actionFailed: [{ id: source.id, reason: 'Temporärer Labelfehler' }],
+        failed: [{ id: source.id, reason: 'Temporärer Lesestatusfehler' }],
+        finalized: false,
+        remaining: 2,
+      })
+
+      clearApiStateForTests()
+      const restored = (await (
+        await fetch(`${localBase}/api/reviews/partial-live-round`)
+      ).json()) as ReviewSnapshot
+      expect(restored.finalization).toEqual({
+        result: partial,
+        selectionLocked: true,
+        status: 'active',
+      })
+      expect(restored.userState).toMatchObject({
+        processedIds: [source.id],
+        secondaryActionIds: [source.id],
+      })
+
+      shouldFail = false
+      const retryResponse = await fetch(
+        `${localBase}/api/reviews/partial-live-round/finalize`,
+        post(body, 'partial-live-csrf'),
+      )
+      expect(retryResponse.status).toBe(200)
+      expect((await retryResponse.json()) as FinalizeResult).toMatchObject({
+        actionFailed: [],
+        failed: [],
+        finalized: true,
+        remaining: 0,
+      })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('persists secondary-action failures when a later finalization step throws', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails.find((email) => email.isNewsletter)
+    expect(source).toBeDefined()
+    if (!source) return
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    localStore.create({
+      csrfToken: 'action-failure-csrf',
+      emails: [source],
+      filters,
+      id: 'action-failure-round',
+      imageToken: 'action-failure-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
+      fastmailToken: 'test-fastmail-token',
+      markRead: async () => {
+        throw new Error('Later mark-read step failed')
+      },
+      resumeMailSnapshot: async () => ({
+        context: {
+          accountId: 'account',
+          apiUrl: 'https://jmap.invalid.test',
+          downloadUrl: 'https://jmap.invalid.test/{blobId}',
+          maxObjectsInGet: 100,
+          maxObjectsInSet: 100,
+          username: 'test@example.test',
+        },
+        emails: [source],
+        filters,
+        mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+        missingIds: [],
+        totalBeforeLimit: 1,
+        truncated: false,
+      }),
+      roundStore: localStore,
+      tagForLaterUnsubscribe: async (_context, _token, ids) => ({
+        failed: ids.map((id) => ({ id, reason: 'Persistierter Labelfehler' })),
+        succeededIds: [],
+      }),
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const failed = await fetch(
+        `${localBase}/api/reviews/action-failure-round/finalize`,
+        post(
+          {
+            finalizeIds: [source.id],
+            keepUnreadIds: [],
+            revision: 0,
+            secondaryActionIds: [source.id],
+          },
+          'action-failure-csrf',
+        ),
+      )
+      expect(failed.status).toBe(500)
+      expect(localStore.get('action-failure-round')?.finalization).toMatchObject({
+        actionFailed: [{ id: source.id, reason: 'Persistierter Labelfehler' }],
+        finalizeIds: [source.id],
+        state: 'active',
+      })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('restores the persisted finalization result after process-memory loss', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const emailId = created.body.emails[0]?.id
+    expect(emailId).toBeDefined()
+    if (!emailId) return
+    const finalized = await json<FinalizeResult>(
+      `/api/reviews/${created.body.snapshotId}/finalize`,
+      post(
+        finalizationBody(created.body, { finalizeIds: [emailId], keepUnreadIds: [emailId] }),
+        created.body.csrfToken,
+      ),
+    )
+    expect(finalized.body.finalized).toBe(true)
+
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(restored.body.finalization).toMatchObject({
+      result: finalized.body,
+      selectionLocked: true,
+      status: 'finalized',
+    })
+    expect(restored.body.userState).toMatchObject({
+      keptUnreadIds: [emailId],
+      processedIds: [emailId],
+    })
+    const stateWrite = await json<{ error: { code: string } }>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post(
+        {
+          revision: restored.body.userState.revision,
+          state: {
+            bundleGroups: [],
+            index: 0,
+            keptUnreadIds: [],
+            processedIds: [],
+            replyDrafts: {},
+            secondaryActionIds: [],
+            selectedMemberId: null,
+          },
+        },
+        created.body.csrfToken,
+      ),
+    )
+    expect(stateWrite.response.status).toBe(409)
+    expect(stateWrite.body.error.code).toBe('ROUND_FINALIZED')
+  })
+
+  it('keeps a partial finalization selection locked after process-memory loss', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const emailId = created.body.emails[0]?.id
+    expect(emailId).toBeDefined()
+    if (!emailId) return
+    roundStore.saveFinalization(created.body.snapshotId, {
+      actionFailed: partialFinalizeResult.actionFailed,
+      failed: partialFinalizeResult.failed,
+      finalizeIds: [emailId],
+      keepUnreadIds: [emailId],
+      result: partialFinalizeResult,
+      state: 'active',
+    })
+
+    clearApiStateForTests()
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(restored.body.finalization).toEqual({
+      result: partialFinalizeResult,
+      selectionLocked: true,
+      status: 'active',
+    })
+    expect(restored.body.userState).toMatchObject({
+      keptUnreadIds: [emailId],
+      processedIds: [emailId],
+    })
+    const changed = await json<{ error: { code: string } }>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post(
+        {
+          revision: restored.body.userState.revision,
+          state: {
+            bundleGroups: [],
+            index: 0,
+            keptUnreadIds: [],
+            processedIds: [],
+            replyDrafts: {},
+            secondaryActionIds: [],
+            selectedMemberId: null,
+          },
+        },
+        restored.body.csrfToken,
       ),
     )
     expect(changed.response.status).toBe(409)
@@ -434,7 +1867,11 @@ describe('demo API contract', () => {
       const finalResponse = await fetch(
         `${localBase}/api/reviews/${created.snapshotId}/finalize`,
         post(
-          { finalizeIds, keepUnreadIds: [finalizeIds[0]], secondaryActionIds: [] },
+          finalizationBody(created, {
+            finalizeIds,
+            keepUnreadIds: [finalizeIds[0]],
+            secondaryActionIds: [],
+          }),
           created.csrfToken,
         ),
       )
@@ -449,7 +1886,10 @@ describe('demo API contract', () => {
       const changed = await fetch(
         `${localBase}/api/reviews/${created.snapshotId}/finalize`,
         post(
-          { finalizeIds: created.emails.map((email) => email.id), keepUnreadIds: [] },
+          finalizationBody(created, {
+            finalizeIds: created.emails.map((email) => email.id),
+            keepUnreadIds: [],
+          }),
           created.csrfToken,
         ),
       )
@@ -476,7 +1916,13 @@ describe('demo API contract', () => {
 
     const rejected = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
-      post({ finalizeIds: [processed.id], keepUnreadIds: [untouched.id] }, review.body.csrfToken),
+      post(
+        finalizationBody(review.body, {
+          finalizeIds: [processed.id],
+          keepUnreadIds: [untouched.id],
+        }),
+        review.body.csrfToken,
+      ),
     )
     expect(rejected.response.status).toBe(400)
     expect(rejected.body.error.code).toBe('INVALID_SELECTION')
@@ -490,7 +1936,10 @@ describe('demo API contract', () => {
     const rejected = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
       post(
-        { finalizeIds: ['new-mail-outside-snapshot'], keepUnreadIds: [] },
+        finalizationBody(review.body, {
+          finalizeIds: ['new-mail-outside-snapshot'],
+          keepUnreadIds: [],
+        }),
         review.body.csrfToken,
       ),
     )
@@ -512,11 +1961,11 @@ describe('demo API contract', () => {
     const finalized = await json<FinalizeResult>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
       post(
-        {
+        finalizationBody(review.body, {
           finalizeIds: [newsletter.id],
           keepUnreadIds: [],
           secondaryActionIds: [newsletter.id],
-        },
+        }),
         review.body.csrfToken,
       ),
     )
@@ -540,11 +1989,11 @@ describe('demo API contract', () => {
     const finalized = await json<FinalizeResult>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
       post(
-        {
+        finalizationBody(review.body, {
           finalizeIds: [spam.id],
           keepUnreadIds: [],
           secondaryActionIds: [spam.id],
-        },
+        }),
         review.body.csrfToken,
       ),
     )
@@ -567,11 +2016,11 @@ describe('demo API contract', () => {
     const rejected = await json<{ error: { code: string } }>(
       `/api/reviews/${review.body.snapshotId}/finalize`,
       post(
-        {
+        finalizationBody(review.body, {
           finalizeIds: [regular.id],
           keepUnreadIds: [],
           secondaryActionIds: [regular.id],
-        },
+        }),
         review.body.csrfToken,
       ),
     )

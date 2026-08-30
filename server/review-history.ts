@@ -24,6 +24,7 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
   const database = new DatabaseSync(databasePath)
   chmodSync(databasePath, 0o600)
   database.exec(`
+    PRAGMA secure_delete = ON;
     PRAGMA journal_mode = WAL;
     PRAGMA synchronous = NORMAL;
     PRAGMA busy_timeout = 5000;
@@ -69,6 +70,31 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
     new Set(emailIds.map((id) => id.trim()).filter((id) => id && id.length <= 512))
   const readRetainedIds = () =>
     new Set((list.all() as Array<{ email_id: string }>).map((row) => row.email_id))
+  const checkpointDeletedPages = () => {
+    try {
+      const checkpoint = database.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get() as {
+        busy: number | bigint
+        checkpointed: number | bigint
+        log: number | bigint
+      }
+      if (Number(checkpoint.busy) !== 0) {
+        process.stderr.write(
+          `${JSON.stringify({
+            event: 'review_history_checkpoint_busy',
+            checkpointed: Number(checkpoint.checkpointed),
+            log: Number(checkpoint.log),
+          })}\n`,
+        )
+      }
+    } catch (error) {
+      process.stderr.write(
+        `${JSON.stringify({
+          event: 'review_history_checkpoint_failed',
+          message: error instanceof Error ? error.message : 'unknown',
+        })}\n`,
+      )
+    }
+  }
 
   return {
     close() {
@@ -78,7 +104,9 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
       return Number((count.get() as { count: number | bigint }).count)
     },
     forget(emailIds: readonly string[]) {
-      for (const emailId of normalizedIds(emailIds)) remove.run(emailId)
+      let removed = 0
+      for (const emailId of normalizedIds(emailIds)) removed += Number(remove.run(emailId).changes)
+      if (removed > 0) checkpointDeletedPages()
     },
     rememberKeptUnread(emailIds: readonly string[]) {
       const now = new Date().toISOString()
@@ -89,9 +117,11 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
     },
     retainOnly(emailIds: ReadonlySet<string>) {
       const retained = normalizedIds([...emailIds])
+      let removed = 0
       for (const emailId of readRetainedIds()) {
-        if (!retained.has(emailId)) remove.run(emailId)
+        if (!retained.has(emailId)) removed += Number(remove.run(emailId).changes)
       }
+      if (removed > 0) checkpointDeletedPages()
     },
   }
 }

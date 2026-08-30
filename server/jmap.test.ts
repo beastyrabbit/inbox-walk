@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
+  createAndVerifyDraft,
   fetchEmailDetail,
   fetchUnreadEmailIds,
   fetchUnreadSnapshot,
@@ -8,6 +9,49 @@ import {
   tagEmailsForLaterUnsubscribe,
   unreadFilter,
 } from './jmap.ts'
+
+const draftContext = {
+  accountId: 'acc-1',
+  apiUrl: 'https://api.example/jmap',
+  downloadUrl: 'https://api.example/download/{accountId}/{blobId}/{name}',
+  maxObjectsInGet: 10,
+  maxObjectsInSet: 10,
+  username: 'alex@example.com',
+}
+
+const draftInput = {
+  bodyHtml: '<p>Antwort</p>',
+  bodyText: 'Antwort',
+  cc: [{ name: 'Copy', email: 'copy@example.com' }],
+  from: { name: 'Alex', email: 'alex@example.com' },
+  inReplyTo: ['message@example.com'],
+  references: ['message@example.com'],
+  subject: 'Re: Hallo',
+  threadId: 'thread-1',
+  to: [{ name: 'Mara', email: 'mara@example.com' }],
+}
+
+function storedDraft(id: string, threadId: string) {
+  return {
+    bodyValues: { text: { value: draftInput.bodyText } },
+    cc: draftInput.cc,
+    from: [draftInput.from],
+    id,
+    mailboxIds: { drafts: true },
+    receivedAt: '2026-08-30T10:00:00Z',
+    subject: draftInput.subject,
+    textBody: [{ partId: 'text', type: 'text/plain' }],
+    threadId,
+    to: draftInput.to,
+  }
+}
+
+function requestMethod(fetchMock: ReturnType<typeof vi.fn>, index: number) {
+  const request = JSON.parse(String(fetchMock.mock.calls[index]?.[1]?.body)) as {
+    methodCalls: Array<[string, unknown, string]>
+  }
+  return request.methodCalls[0]?.[0]
+}
 
 function jmapResponse(methodResponses: unknown[]) {
   return new Response(JSON.stringify({ methodResponses }), {
@@ -19,6 +63,132 @@ function jmapResponse(methodResponses: unknown[]) {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('Fastmail JMAP adapter', () => {
+  it('reuses a matching draft after process-memory loss without creating another one', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Mailbox/get',
+            { list: [{ id: 'drafts', name: 'Drafts', role: 'drafts' }] },
+            'mailboxes',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Thread/get',
+            { list: [{ id: 'thread-1', emailIds: ['incoming', 'existing-draft'] }] },
+            'draft-thread',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Email/get',
+            {
+              list: [
+                { ...storedDraft('incoming', 'thread-1'), mailboxIds: { inbox: true } },
+                storedDraft('existing-draft', 'thread-1'),
+              ],
+            },
+            'emails',
+          ],
+        ]),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createAndVerifyDraft(draftContext, 'token', draftInput)).resolves.toEqual({
+      draftId: 'existing-draft',
+      recovered: true,
+      threadId: 'thread-1',
+      verified: true,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.map((_, index) => requestMethod(fetchMock, index))).toContain(
+      'Thread/get',
+    )
+    expect(fetchMock.mock.calls.map((_, index) => requestMethod(fetchMock, index))).not.toContain(
+      'Email/query',
+    )
+    expect(fetchMock.mock.calls.map((_, index) => requestMethod(fetchMock, index))).not.toContain(
+      'Email/set',
+    )
+  })
+
+  it('does not reuse identical content outside the Drafts mailbox', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Mailbox/get',
+            { list: [{ id: 'drafts', name: 'Drafts', role: 'drafts' }] },
+            'mailboxes',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([
+          ['Thread/get', { list: [{ id: 'thread-1', emailIds: ['incoming'] }] }, 'draft-thread'],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Email/get',
+            { list: [{ ...storedDraft('incoming', 'thread-1'), mailboxIds: { inbox: true } }] },
+            'emails',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([
+          ['Email/set', { created: { draft: { id: 'new-draft', threadId: 'thread-1' } } }, 'draft'],
+        ]),
+      )
+      .mockResolvedValueOnce(
+        jmapResponse([['Email/get', { list: [storedDraft('new-draft', 'thread-1')] }, 'emails']]),
+      )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createAndVerifyDraft(draftContext, 'token', draftInput)).resolves.toEqual({
+      draftId: 'new-draft',
+      recovered: false,
+      threadId: 'thread-1',
+      verified: true,
+    })
+    expect(fetchMock.mock.calls.map((_, index) => requestMethod(fetchMock, index))).toContain(
+      'Email/set',
+    )
+  })
+
+  it('fails closed when the draft preflight cannot be completed', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jmapResponse([
+          [
+            'Mailbox/get',
+            { list: [{ id: 'drafts', name: 'Drafts', role: 'drafts' }] },
+            'mailboxes',
+          ],
+        ]),
+      )
+      .mockResolvedValueOnce(new Response('Unavailable', { status: 503 }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(createAndVerifyDraft(draftContext, 'token', draftInput)).rejects.toMatchObject({
+      code: 'FASTMAIL_REQUEST_FAILED',
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls.map((_, index) => requestMethod(fetchMock, index))).not.toContain(
+      'Email/set',
+    )
+  })
+
   it('queries only unseen, non-draft messages', () => {
     expect(unreadFilter()).toEqual({
       operator: 'AND',

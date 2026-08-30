@@ -7,10 +7,10 @@ import type {
   FinalizeResult,
   MailAddress,
   ReplyProposal,
-  ReviewBundleRun,
   ReviewEmail,
   ReviewFilters,
   ReviewOptions,
+  ReviewRoundUserState,
   ReviewSnapshot,
   ThreadContext,
 } from './shared.ts'
@@ -42,7 +42,9 @@ async function payload<T>(response: Response): Promise<T> {
   return body as T
 }
 
-async function post<T>(url: string, body: unknown, csrfToken?: string) {
+async function post<T>(url: string, body: unknown, csrfToken?: string, persistOnUnload = false) {
+  const serialized = JSON.stringify(body)
+  const keepalive = persistOnUnload && new TextEncoder().encode(serialized).byteLength <= 60 * 1024
   return payload<T>(
     await fetch(url, {
       method: 'POST',
@@ -50,7 +52,8 @@ async function post<T>(url: string, body: unknown, csrfToken?: string) {
         'Content-Type': 'application/json',
         ...(csrfToken ? { 'X-Inbox-Walk-CSRF': csrfToken } : {}),
       },
-      body: JSON.stringify(body),
+      body: serialized,
+      keepalive,
     }),
   )
 }
@@ -74,6 +77,9 @@ export const api = {
   async createReview(filters: ReviewFilters) {
     return post<ReviewSnapshot>('/api/reviews', { filters })
   },
+  async review(roundId: string) {
+    return payload<ReviewSnapshot>(await fetch(`/api/reviews/${encodeURIComponent(roundId)}`))
+  },
   async resumeReview(emailIds: string[], filters: ReviewFilters) {
     return post<ReviewSnapshot>('/api/reviews/resume', { emailIds, filters })
   },
@@ -84,11 +90,23 @@ export const api = {
       ),
     )
   },
-  async bundles(snapshot: ReviewSnapshot) {
-    return post<ReviewBundleRun>(
+  async bundles(snapshot: Pick<ReviewSnapshot, 'csrfToken' | 'snapshotId'>) {
+    return post<ReviewSnapshot>(
       `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundles`,
       {},
       snapshot.csrfToken,
+    )
+  },
+  async updateReviewState(
+    snapshot: ReviewSnapshot,
+    revision: number,
+    state: Omit<ReviewRoundUserState, 'revision'>,
+  ) {
+    return post<ReviewRoundUserState>(
+      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/state`,
+      { revision, state },
+      snapshot.csrfToken,
+      true,
     )
   },
   async bundleLabel(
@@ -116,13 +134,14 @@ export const api = {
   },
   async finalize(
     snapshot: ReviewSnapshot,
+    revision: number,
     finalizeIds: string[],
     keepUnreadIds: string[],
     secondaryActionIds: string[],
   ) {
     return post<FinalizeResult>(
       `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/finalize`,
-      { finalizeIds, keepUnreadIds, secondaryActionIds },
+      { finalizeIds, keepUnreadIds, revision, secondaryActionIds },
       snapshot.csrfToken,
     )
   },

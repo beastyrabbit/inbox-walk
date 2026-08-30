@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -39,6 +39,25 @@ describe('SQLite review history', () => {
     history.rememberKeptUnread(['  ', 'x'.repeat(513)])
     expect(history.count()).toBe(0)
     history.close()
+  })
+
+  it('securely deletes forgotten IDs from the SQLite file', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'inbox-walk-history-'))
+    directories.push(directory)
+    const databasePath = join(directory, 'history.sqlite')
+    const forgottenId = `forgotten-${'sensitive-marker-'.repeat(20)}`
+    const marker = Buffer.from(forgottenId)
+    const history = createReviewHistory(databasePath)
+    history.rememberKeptUnread([forgottenId])
+
+    const checkpoint = new DatabaseSync(databasePath)
+    checkpoint.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    checkpoint.close()
+    expect(readFileSync(databasePath).includes(marker)).toBe(true)
+
+    history.forget([forgottenId])
+    history.close()
+    expect(readFileSync(databasePath).includes(marker)).toBe(false)
   })
 
   it('migrates legacy viewed candidates and can retain only messages that are still unread', () => {

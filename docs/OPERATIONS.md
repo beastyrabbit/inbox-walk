@@ -17,6 +17,7 @@
 - Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `codex-settings.json`, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
 - Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
 - Inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
+- Bundle-call limit: `CODEX_BUNDLE_MAX_CALLS=64`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
 
 The process refuses to start in live mode unless the Fastmail credential is
@@ -28,14 +29,26 @@ The pod must mount `/data` writable for UID/GID `1000`; kub-homelab supplies
 no complete content can be recovered. Live mode refuses to start without an
 explicit HTTP(S) `TIKA_URL`.
 
-`inbox-walk.sqlite` records only Fastmail message IDs deliberately kept unread,
-first/last-retained timestamps, and a retain count. It is protected by the
-existing private `/data` volume and lets the user optionally exclude those
-deferred messages from new rounds. IDs successfully marked read are removed,
-and the options request reconciles remaining IDs against Fastmail so messages
-read or deleted elsewhere do not inflate the count. Deleting only this database
-while the app is stopped resets that history; it does not change mail in
-Fastmail.
+`inbox-walk.sqlite` stores durable review rounds: stable IDs and tokens, filters,
+mail summaries, bundle-analysis progress and provenance, bundle results, user
+decisions, the round's frozen hashed learning examples, reply editor state, and
+finalization attempts. It does not store received message bodies or attachment
+content. The same database keeps the
+separate retained-unread history with Fastmail IDs, first/last-retained
+timestamps, and a retain count. The options request reconciles that history
+against Fastmail. Deleting this database while the app is stopped removes both
+open rounds and retained-unread history; it does not change mail in Fastmail.
+Finished rounds are retained for seven days, active rounds for 30 days, with a
+hard cap of 200 rounds. Pruning runs at startup, once per minute, and when a new
+round is created.
+
+Run one Inbox Walk application replica against this SQLite volume. Process-local
+job ownership prevents duplicate Codex work inside that replica; the persisted
+decision checkpoints handle restarts. Multiple replicas do not coordinate one
+round's provider calls.
+The app freezes the resolved bundle-call limit with each new round. Changing
+`CODEX_BUNDLE_MAX_CALLS` affects later rounds, not an analysis resumed after a
+restart.
 
 `bundle-learning.sqlite` stores hashed relationship signals from explicit merge,
 split, and confirmation actions. It does not store message bodies, previews, or
@@ -68,8 +81,8 @@ Check `/api/auth/codex/status` for the non-secret configured flag and model. Do
 not inspect or print `/data/pi/auth.json`; reconnect from the app when OAuth can
 no longer refresh. The Codex dialog stores its Sol, Terra, or Luna selection in
 `/data/codex-settings.json`; `CODEX_MODEL` remains the startup default. For the
-review history, inspect schema and aggregate counts
-only rather than printing message IDs.
+review persistence, inspect schema and aggregate counts only rather than
+printing message IDs, subjects, previews, addresses, or editor text.
 
 Do not print Kubernetes Secret values or application credentials while
 troubleshooting. Inspect key names and sync status only.

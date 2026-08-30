@@ -15,7 +15,7 @@ Fastmail.
 - Bundles related threads, repository activity, deployments, orders, and carrier updates while keeping every original inspectable.
 - Learns only from explicit bundle corrections and gives Codex at most two confirmed positive and two confirmed negative examples per decision.
 - Opens every new round with a dedicated selection page instead of loading mail immediately.
-- Resumes the exact snapshot and local decisions after a browser refresh.
+- Gives every round a stable URL and restores its snapshot, analysis, decisions, and finalization after a browser refresh or app restart.
 - Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
 - Can omit messages deliberately kept unread in an earlier round using a small local SQLite history.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
@@ -65,11 +65,30 @@ drafts. Sol is the deployment default; Sol, Terra, and Luna can be selected in
 the UI without restarting the app. The choice is stored in
 `DATA_DIR/codex-settings.json`.
 
-Fastmail message IDs are recorded in `DATA_DIR/inbox-walk.sqlite` only when a
-completed round deliberately keeps them unread. A future round can optionally
-hide those deferred messages. The database stores IDs, timestamps, and a retain
-count only—never senders, subjects, bodies, or attachments. Messages marked read
-are removed from the history. Leave **Zurückgestellte Nachrichten ausblenden**
+Connect Codex on the selection screen before starting a round. The app first
+freezes the round, then asks Codex to judge only plausible relationships found
+by the local index. It does not run again when you open a message. Later mail is
+not added to the frozen round. The bounded, hashed learning-example corpus is
+also frozen with the round and reused after a restart. A new round gets a new
+analysis.
+
+Each completed Codex decision is checkpointed in SQLite. A browser reload keeps
+the current job running. After a process crash, the app replays saved decisions
+and may repeat only the provider call that was still open. A finished analysis
+is never run again. `CODEX_BUNDLE_MAX_CALLS` limits provider calls per round and
+defaults to 64. The resolved limit is frozen with the round, so a configuration
+change during a restart cannot change an in-progress analysis. Reaching the
+limit falls back to the safe individual-message view.
+
+`DATA_DIR/inbox-walk.sqlite` stores review rounds with their fixed IDs, filters,
+mail summaries, frozen hashed learning examples, bundle-analysis status, Codex
+checkpoints, decisions, reply editor state, and finalization results. It never
+stores received message bodies or attachment content; the persisted summary
+includes Fastmail's short preview excerpt.
+Finished rounds are retained for seven days and active rounds for 30 days, with
+a 200-round cap. The same database keeps a separate history of IDs deliberately
+left unread, so a future round can optionally hide them. IDs marked read are
+removed from that history. Leave **Zurückgestellte Nachrichten ausblenden**
 unchecked to include every matching unread message as before.
 
 ## Keyboard controls
@@ -102,8 +121,9 @@ The current usable release is `v0.6.1`, deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
-The Codex OAuth record and retained-unread SQLite history are stored under
-`DATA_DIR`; `TIKA_URL` points to the document-extraction sidecar.
+The Codex OAuth record, review rounds, retained-unread history, and bundle
+learning data are stored under `DATA_DIR`; `TIKA_URL` points to the
+document-extraction sidecar.
 
 Deployment is managed from `beasty/kub-homelab`. Runtime secrets are synced by
 the Infisical Operator; no secret values belong in this repository or in the

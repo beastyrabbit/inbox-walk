@@ -84,6 +84,10 @@ export const codexModels = [
 
 export type CodexModelId = (typeof codexModels)[number]['id']
 
+export function isCodexModelId(value: unknown): value is CodexModelId {
+  return codexModels.some((model) => model.id === value)
+}
+
 export interface CodexAuthStatus {
   configured: boolean
   model: CodexModelId
@@ -105,15 +109,34 @@ export interface CodexLoginState {
 }
 
 export interface ReviewSnapshot {
+  analysis: ReviewAnalysisState
+  bundleRun?: ReviewBundleRun
   csrfToken: string
   imageToken: string
   emails: ReviewEmailSummary[]
+  finalization: ReviewFinalizationState
   filters: ReviewFilters
   missingIds: string[]
   mode: 'demo' | 'live'
   snapshotId: string
   totalBeforeLimit: number
   truncated: boolean
+  userState: ReviewRoundUserState
+}
+
+export type ReviewAnalysisStatus = 'pending' | 'running' | 'complete'
+export type ReviewAnalysisEngine = 'codex' | 'heuristic' | 'fallback'
+
+export interface ReviewAnalysisState {
+  callCount: number
+  engine: ReviewAnalysisEngine
+  error?: string
+  model?: string
+  phase: string
+  processedEmailCount: number
+  progress: number
+  status: ReviewAnalysisStatus
+  totalEmailCount: number
 }
 
 export type BundleKind =
@@ -148,7 +171,23 @@ export interface ReviewBundleRun {
   snapshotId: string
 }
 
+export interface ReviewRoundUserState {
+  bundleGroups: string[][]
+  index: number
+  keptUnreadIds: string[]
+  processedIds: string[]
+  revision: number
+  secondaryActionIds: string[]
+  selectedMemberId: string | null
+  replyDrafts: Record<string, ReplyEditorState>
+}
+
 export interface ReviewCheckpoint {
+  roundId: string
+  version: 7
+}
+
+export interface LegacyReviewCheckpoint {
   version: 6
   bundleGroups: string[][]
   emailIds: string[]
@@ -159,6 +198,8 @@ export interface ReviewCheckpoint {
   secondaryActionIds: string[]
   replyDrafts: Record<string, ReplyEditorState>
 }
+
+export type LoadedReviewCheckpoint = ReviewCheckpoint | LegacyReviewCheckpoint
 
 export interface FinalizeFailure {
   id: string
@@ -177,6 +218,12 @@ export interface FinalizeResult {
   rescuedFromSpam: number
   taggedForUnsubscribe: number
   untouched: number
+}
+
+export interface ReviewFinalizationState {
+  result: FinalizeResult | null
+  selectionLocked: boolean
+  status: 'active' | 'finalized' | 'finalizing'
 }
 
 export interface MailIdentity {

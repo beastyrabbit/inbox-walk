@@ -12,15 +12,54 @@ import {
   SettingsManager,
 } from '@earendil-works/pi-coding-agent'
 import { Type } from 'typebox'
-import { type CodexModelId, codexModels } from '../src/shared.ts'
+import { type CodexModelId, isCodexModelId } from '../src/shared.ts'
 import type { BundleDecision, BundleDecisionInput } from './bundles.ts'
 
 const CODEX_PROVIDER = 'openai-codex'
 const DEFAULT_CODEX_MODEL: CodexModelId = 'gpt-5.6-sol'
-const codexModelIds = new Set<CodexModelId>(codexModels.map((model) => model.id))
 
-function isCodexModelId(value: unknown): value is CodexModelId {
-  return typeof value === 'string' && codexModelIds.has(value as CodexModelId)
+export class CodexAuthenticationError extends Error {
+  constructor(options?: ErrorOptions) {
+    super('Codex authentication is unavailable.', options)
+    this.name = 'CodexAuthenticationError'
+  }
+}
+
+export function isCodexAuthenticationFailure(error: unknown) {
+  if (error instanceof CodexAuthenticationError) return true
+  const message = error instanceof Error ? error.message : String(error)
+  return (
+    /\b(?:http(?: status)?\s*)?401\b|\bunauthori[sz]ed\b/i.test(message) ||
+    /invalid[_ -]?grant|(?:access|refresh|oauth) token (?:has )?expired|expired (?:access|refresh|oauth) token/i.test(
+      message,
+    ) ||
+    /no api key|oauth (?:login |token |refresh )?(?:failed|failure)|failed to refresh oauth token/i.test(
+      message,
+    )
+  )
+}
+
+function rethrowCodexAuthenticationFailure(error: unknown): never {
+  if (error instanceof CodexAuthenticationError) throw error
+  if (isCodexAuthenticationFailure(error)) {
+    throw new CodexAuthenticationError({ cause: error })
+  }
+  throw error
+}
+
+async function requireCodexRequestAuth(
+  registry: ModelRegistry,
+  model: NonNullable<ReturnType<ModelRegistry['find']>>,
+) {
+  const auth = await registry.getApiKeyAndHeaders(model)
+  if (!auth.ok) {
+    rethrowCodexAuthenticationFailure(new Error(auth.error))
+  }
+  if (!auth.apiKey) {
+    throw new CodexAuthenticationError({
+      cause: new Error('No API key for Codex.'),
+    })
+  }
 }
 
 function codexSettingsPath() {
@@ -152,6 +191,7 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
   const modelId = selectedCodexModel()
   const model = registry.find(CODEX_PROVIDER, modelId)
   if (!model) throw new Error(`Codex model ${modelId} is unavailable.`)
+  await requireCodexRequestAuth(registry, model)
 
   const submitted: CodexReplyOutput[] = []
   const submitTool = defineTool({
@@ -212,33 +252,42 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
   const abortSession = () => {
     void session.abort().catch(() => {})
   }
+  let rejectTimeout: (error: Error) => void = () => {}
+  const timeout = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject
+  })
+  const failOnTimeout = () => {
+    rejectTimeout(new Error(`Codex inference timed out after ${timeoutMs} ms.`))
+  }
   timeoutSignal.addEventListener('abort', abortSession, { once: true })
+  timeoutSignal.addEventListener('abort', failOnTimeout, { once: true })
   try {
-    let promptError: unknown
     try {
-      await session.prompt(input.prompt, {
-        expandPromptTemplates: false,
-        source: 'rpc',
-        images: input.images,
-      })
+      await Promise.race([
+        session.prompt(input.prompt, {
+          expandPromptTemplates: false,
+          source: 'rpc',
+          images: input.images,
+        }),
+        timeout,
+      ])
+      const message = [...session.messages].reverse().find((entry) => entry.role === 'assistant') as
+        | AssistantMessage
+        | undefined
+      if (!message) throw new Error('Codex returned no assistant response.')
+      if (message.stopReason === 'error') {
+        throw new Error(message.errorMessage || 'Codex stopped with an error.')
+      }
+      if (submitted.length !== 1 || !submitted[0]) {
+        throw new Error('Codex did not submit exactly one structured reply proposal.')
+      }
+      return submitted[0]
     } catch (error) {
-      promptError = error
+      rethrowCodexAuthenticationFailure(error)
     }
-    if (timeoutSignal.aborted) throw new Error(`Codex inference timed out after ${timeoutMs} ms.`)
-    if (promptError) throw promptError
-    const message = [...session.messages].reverse().find((entry) => entry.role === 'assistant') as
-      | AssistantMessage
-      | undefined
-    if (!message) throw new Error('Codex returned no assistant response.')
-    if (message.stopReason === 'error') {
-      throw new Error(message.errorMessage || 'Codex stopped with an error.')
-    }
-    if (submitted.length !== 1 || !submitted[0]) {
-      throw new Error('Codex did not submit exactly one structured reply proposal.')
-    }
-    return submitted[0]
   } finally {
     timeoutSignal.removeEventListener('abort', abortSession)
+    timeoutSignal.removeEventListener('abort', failOnTimeout)
     session.dispose()
   }
 }
@@ -278,7 +327,10 @@ function bundlePrompt(input: BundleDecisionInput) {
   })
 }
 
-export async function runCodexBundleDecision(input: BundleDecisionInput): Promise<BundleDecision> {
+export async function runCodexBundleDecision(
+  input: BundleDecisionInput,
+  frozenModelId = selectedCodexModel(),
+): Promise<BundleDecision> {
   if (process.env.VITEST) {
     throw new Error(
       'Live AI inference is disabled in automated tests. A manual live run requires an explicit user request.',
@@ -287,9 +339,9 @@ export async function runCodexBundleDecision(input: BundleDecisionInput): Promis
   const authStorage = getCodexAuthStorage()
   authStorage.reload()
   const registry = ModelRegistry.inMemory(authStorage)
-  const modelId = selectedCodexModel()
-  const model = registry.find(CODEX_PROVIDER, modelId)
-  if (!model) throw new Error(`Codex model ${modelId} is unavailable.`)
+  const model = registry.find(CODEX_PROVIDER, frozenModelId)
+  if (!model) throw new Error(`Codex model ${frozenModelId} is unavailable.`)
+  await requireCodexRequestAuth(registry, model)
   const submitted: BundleDecision[] = []
   const submitTool = defineTool({
     name: 'submit_bundle_decision',
@@ -340,23 +392,38 @@ export async function runCodexBundleDecision(input: BundleDecisionInput): Promis
     : 5 * 60_000
   const timeoutSignal = AbortSignal.timeout(timeoutMs)
   const abortSession = () => void session.abort().catch(() => {})
+  let rejectTimeout: (error: Error) => void = () => {}
+  const timeout = new Promise<never>((_resolve, reject) => {
+    rejectTimeout = reject
+  })
+  const failOnTimeout = () => {
+    rejectTimeout(new Error(`Codex inference timed out after ${timeoutMs} ms.`))
+  }
   timeoutSignal.addEventListener('abort', abortSession, { once: true })
+  timeoutSignal.addEventListener('abort', failOnTimeout, { once: true })
   try {
-    await session.prompt(bundlePrompt(input), { expandPromptTemplates: false, source: 'rpc' })
-    if (timeoutSignal.aborted) throw new Error(`Codex inference timed out after ${timeoutMs} ms.`)
-    const message = [...session.messages].reverse().find((entry) => entry.role === 'assistant') as
-      | AssistantMessage
-      | undefined
-    if (!message) throw new Error('Codex returned no assistant response.')
-    if (message.stopReason === 'error') {
-      throw new Error(message.errorMessage || 'Codex stopped with an error.')
+    try {
+      await Promise.race([
+        session.prompt(bundlePrompt(input), { expandPromptTemplates: false, source: 'rpc' }),
+        timeout,
+      ])
+      const message = [...session.messages].reverse().find((entry) => entry.role === 'assistant') as
+        | AssistantMessage
+        | undefined
+      if (!message) throw new Error('Codex returned no assistant response.')
+      if (message.stopReason === 'error') {
+        throw new Error(message.errorMessage || 'Codex stopped with an error.')
+      }
+      if (submitted.length !== 1 || !submitted[0]) {
+        throw new Error('Codex did not submit exactly one bundle decision.')
+      }
+      return submitted[0]
+    } catch (error) {
+      rethrowCodexAuthenticationFailure(error)
     }
-    if (submitted.length !== 1 || !submitted[0]) {
-      throw new Error('Codex did not submit exactly one bundle decision.')
-    }
-    return submitted[0]
   } finally {
     timeoutSignal.removeEventListener('abort', abortSession)
+    timeoutSignal.removeEventListener('abort', failOnTimeout)
     session.dispose()
   }
 }

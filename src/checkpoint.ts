@@ -1,14 +1,27 @@
-import type { ReplyEditorState, ReviewCheckpoint, ReviewFilters } from './shared.ts'
+import type {
+  LegacyReviewCheckpoint,
+  LoadedReviewCheckpoint,
+  ReplyEditorState,
+  ReviewCheckpoint,
+  ReviewFilters,
+} from './shared.ts'
 
 const KEY = 'inbox-walk:checkpoint:v1'
+let volatileLegacyCheckpoint: LegacyReviewCheckpoint | null = null
 
-export function loadCheckpoint(): ReviewCheckpoint | null {
+export function loadCheckpoint(): LoadedReviewCheckpoint | null {
   try {
     const raw = localStorage.getItem(KEY)
-    if (!raw) return null
-    const value = JSON.parse(raw) as Omit<Partial<ReviewCheckpoint>, 'version'> & {
-      version?: number
+    if (!raw) return volatileLegacyCheckpoint
+    const value = JSON.parse(raw) as Record<string, unknown> & { version?: number }
+    if (value.version === 7 && typeof value.roundId === 'string' && value.roundId.length > 0) {
+      volatileLegacyCheckpoint = null
+      return { version: 7, roundId: value.roundId }
     }
+    // Legacy checkpoints contain message IDs and, in some versions, full draft text.
+    // Keep the parsed value in memory just long enough to migrate it, but remove the
+    // durable browser copy immediately. A successful migration writes back only v7.
+    localStorage.removeItem(KEY)
     if (
       (value.version !== 1 &&
         value.version !== 2 &&
@@ -21,10 +34,10 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
       !value.filters ||
       typeof value.index !== 'number'
     ) {
-      localStorage.removeItem(KEY)
+      volatileLegacyCheckpoint = null
       return null
     }
-    return {
+    volatileLegacyCheckpoint = {
       version: 6,
       bundleGroups: Array.isArray(value.bundleGroups)
         ? value.bundleGroups
@@ -52,9 +65,15 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
             ) as string[])
           : [],
       replyDrafts: (value.replyDrafts ?? {}) as Record<string, ReplyEditorState>,
-    }
+    } satisfies LegacyReviewCheckpoint
+    return volatileLegacyCheckpoint
   } catch {
-    localStorage.removeItem(KEY)
+    volatileLegacyCheckpoint = null
+    try {
+      localStorage.removeItem(KEY)
+    } catch {
+      // Storage can be unavailable in hardened browser contexts.
+    }
     return null
   }
 }
@@ -62,6 +81,7 @@ export function loadCheckpoint(): ReviewCheckpoint | null {
 export function saveCheckpoint(checkpoint: ReviewCheckpoint) {
   try {
     localStorage.setItem(KEY, JSON.stringify(checkpoint))
+    volatileLegacyCheckpoint = null
     return true
   } catch {
     return false
@@ -69,6 +89,7 @@ export function saveCheckpoint(checkpoint: ReviewCheckpoint) {
 }
 
 export function clearCheckpoint() {
+  volatileLegacyCheckpoint = null
   try {
     localStorage.removeItem(KEY)
   } catch {

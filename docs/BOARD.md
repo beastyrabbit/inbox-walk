@@ -15,7 +15,7 @@ There are no active release blockers.
 - [x] Complete paginated JMAP unread snapshot without a fixed message limit.
 - [x] Contextual review bundles for related repository, deployment, order, and carrier mail.
 - [x] Per-original keep-unread controls plus explicit merge, split, and learning feedback.
-- [x] Exact checkpoint resume for snapshot IDs, bundle groups, and review decisions.
+- [x] Durable review rounds with stable URLs, persisted bundle analysis, decisions, and finalization.
 - [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.
 - [x] Safe remote-image proxying with authenticated same-origin iframe resources.
 - [x] Dedicated pre-review selection for normal mail or Spam with direct controls.

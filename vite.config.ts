@@ -1,11 +1,19 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv } from 'vite'
-import { createApiMiddleware } from './server/api.ts'
+import { createApiMiddleware, waitForApiJobs } from './server/api.ts'
+import { createBundleStore } from './server/bundle-store.ts'
 import { createReviewHistory } from './server/review-history.ts'
+import { createRoundStore } from './server/round-store.ts'
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
-  for (const key of ['CODEX_INFERENCE_TIMEOUT_MS', 'CODEX_MODEL', 'DATA_DIR', 'TIKA_URL']) {
+  for (const key of [
+    'CODEX_BUNDLE_MAX_CALLS',
+    'CODEX_INFERENCE_TIMEOUT_MS',
+    'CODEX_MODEL',
+    'DATA_DIR',
+    'TIKA_URL',
+  ]) {
     if (!process.env[key] && env[key]) process.env[key] = env[key]
   }
   const apiOptions = {
@@ -24,8 +32,18 @@ export default defineConfig(({ mode }) => {
         name: 'mail-review-api',
         configureServer(server) {
           const reviewHistory = createReviewHistory()
-          server.middlewares.use(createApiMiddleware({ ...apiOptions, reviewHistory }))
-          server.httpServer?.once('close', () => reviewHistory.close())
+          const bundleStore = createBundleStore()
+          const roundStore = createRoundStore()
+          server.middlewares.use(
+            createApiMiddleware({ ...apiOptions, bundleStore, reviewHistory, roundStore }),
+          )
+          server.httpServer?.once('close', () => {
+            void waitForApiJobs().finally(() => {
+              reviewHistory.close()
+              bundleStore.close()
+              roundStore.close()
+            })
+          })
         },
       },
     ],

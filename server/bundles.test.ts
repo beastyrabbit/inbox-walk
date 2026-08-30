@@ -1,9 +1,14 @@
+import { createHash } from 'node:crypto'
 import { describe, expect, it, vi } from 'vitest'
 import type { ReviewEmailSummary } from '../src/shared.ts'
 import {
+  type BundleBuildProgress,
   buildReviewBundles,
   extractBundleSignals,
+  hashLearningSignal,
+  learningSignalsFor,
   selectBundleExamples,
+  singletonBundleRun,
   validateBundlePartition,
 } from './bundles.ts'
 
@@ -54,6 +59,39 @@ describe('contextual bundle builder', () => {
     expect(extractBundleSignals(invoice).exactKeys).toEqual(['thread:thread-1'])
     const run = await buildReviewBundles('snapshot', [invoice, appointment])
     expect(run.bundles.map((bundle) => bundle.emailIds)).toEqual([['1'], ['2']])
+  })
+
+  it('uses normalized one-way relationship signals without exposing sender identity', () => {
+    const first = mail('1', 'Private note', 'Hello', 'CaseSensitiveThread')
+    first.from = [{ name: 'Dr. Sensitive Person', email: 'sensitive@private-family.example' }]
+    const equivalent = { ...first, from: [{ ...first.from[0], name: '  DR. SENSITIVE PERSON  ' }] }
+
+    const signals = learningSignalsFor([first])
+
+    expect(signals).toContain(hashLearningSignal('provider:Dr. Sensitive Person'))
+    expect(signals).toEqual(learningSignalsFor([equivalent]))
+    expect(signals.every((signal) => /^[a-z][a-z0-9_-]*:sha256:[a-f0-9]{64}$/.test(signal))).toBe(
+      true,
+    )
+    expect(signals.join(' ')).not.toContain('sensitive')
+    expect(hashLearningSignal(signals[0] ?? '')).toBe(signals[0])
+    const legacyThreadSignal = `thread:sha256:${createHash('sha256')
+      .update('thread:CaseSensitiveThread')
+      .digest('hex')}`
+    expect(signals).toContain(legacyThreadSignal)
+    expect(
+      selectBundleExamples(
+        [
+          {
+            anchorSignals: [legacyThreadSignal],
+            candidateSignals: [],
+            correct: true,
+            reason: 'Vom Nutzer im Review bestätigt.',
+          },
+        ],
+        signals,
+      ),
+    ).toHaveLength(1)
   })
 
   it('prejoins exact keys, preserves exclusions, and partitions every message once', async () => {
@@ -141,5 +179,64 @@ describe('contextual bundle builder', () => {
     expect(selected).toHaveLength(4)
     expect(selected.filter((example) => example.correct)).toHaveLength(2)
     expect(selected.filter((example) => !example.correct)).toHaveLength(2)
+  })
+
+  it('reports monotonic analysis progress with Codex provenance and call count', async () => {
+    const emails = [
+      mail('1', 'August electricity invoice', 'Electricity account notice'),
+      mail('2', 'August electricity reminder', 'Electricity account notice'),
+    ]
+    const decide = vi.fn(async () => ({
+      includedEmailIds: [],
+      kind: 'standalone' as const,
+      title: 'Separate notices',
+      currentState: 'Open',
+      summary: 'Separate stories.',
+      linkEvidence: [],
+      membershipConfidence: 0.9,
+    }))
+    const events: BundleBuildProgress[] = []
+
+    await buildReviewBundles('snapshot', emails, decide, [], {
+      engine: 'codex',
+      model: 'gpt-5.6-sol',
+      onProgress: (event) => events.push(event),
+    })
+
+    expect(events.map((event) => event.progress)).toEqual(
+      [...events.map((event) => event.progress)].sort((left, right) => left - right),
+    )
+    expect(events.some((event) => event.phase === 'deciding')).toBe(true)
+    expect(events.at(-1)).toMatchObject({
+      codexCallCount: decide.mock.calls.length,
+      engine: 'codex',
+      model: 'gpt-5.6-sol',
+      phase: 'complete',
+      processedEmailCount: emails.length,
+      progress: 1,
+      totalEmailCount: emails.length,
+    })
+  })
+
+  it('reports a completed fallback with the attempted Codex call count', () => {
+    const emails = [mail('1', 'Notice', 'Fallback notice')]
+    const events: BundleBuildProgress[] = []
+
+    const run = singletonBundleRun('snapshot', emails, {
+      codexCallCount: 3,
+      model: 'gpt-5.6-sol',
+      onProgress: (event) => events.push(event),
+    })
+
+    expect(run.fallback).toBe(true)
+    expect(events.map((event) => event.phase)).toEqual(['fallback', 'complete'])
+    expect(events.map((event) => event.progress)).toEqual([0.95, 1])
+    expect(events.at(-1)).toMatchObject({
+      codexCallCount: 3,
+      engine: 'fallback',
+      model: 'gpt-5.6-sol',
+      processedEmailCount: 1,
+      totalEmailCount: 1,
+    })
   })
 })

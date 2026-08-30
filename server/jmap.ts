@@ -857,6 +857,7 @@ async function getDraftMailbox(context: MailAccountContext, token: string) {
 function matchesDraft(email: JmapEmail, input: DraftInput) {
   const text = partValue(email.textBody, email.bodyValues)
   return (
+    email.threadId === input.threadId &&
     (email.subject?.trim() ?? '') === input.subject.trim() &&
     normalizedAddresses(email.from ?? []) === normalizedAddresses([input.from]) &&
     normalizedAddresses(email.to ?? []) === normalizedAddresses(input.to) &&
@@ -882,21 +883,29 @@ async function recoverDraft(
   draftsMailboxId: string,
   input: DraftInput,
 ) {
-  const query = await callJmap<never>(context.apiUrl, token, [
-    [
-      'Email/query',
-      {
-        accountId: context.accountId,
-        filter: { inMailbox: draftsMailboxId },
-        limit: 25,
-        sort: [{ property: 'receivedAt', isAscending: false }],
-      },
-      'draft-query',
-    ],
+  const responses = await callJmap<{ id: string; emailIds: string[] }>(context.apiUrl, token, [
+    ['Thread/get', { accountId: context.accountId, ids: [input.threadId] }, 'draft-thread'],
   ])
-  const ids = responseFor(query, 'draft-query').ids ?? []
-  const fetched = await getEmails(context, token, ids, true)
-  return fetched.list.find((email) => matchesDraft(email, input))
+  const thread = responseFor(responses, 'draft-thread').list?.[0]
+  if (!thread) {
+    throw new JmapError('Der Thread für den Draft wurde nicht gefunden.', 'THREAD_NOT_FOUND', 404)
+  }
+  if (thread.emailIds.length > THREAD_LIMIT) {
+    throw new JmapError(
+      `Der Thread enthält mehr als ${THREAD_LIMIT} Nachrichten. Die Draft-Prüfung wurde sicher abgebrochen.`,
+      'THREAD_TOO_LARGE',
+    )
+  }
+  const fetched = await getEmails(context, token, thread.emailIds, true)
+  if (fetched.missing.length > 0) {
+    throw new JmapError(
+      'Der Thread hat sich während der Draft-Prüfung geändert. Bitte versuche es erneut.',
+      'DRAFT_PREFLIGHT_INCOMPLETE',
+    )
+  }
+  return fetched.list.find(
+    (email) => email.mailboxIds[draftsMailboxId] === true && matchesDraft(email, input),
+  )
 }
 
 export async function createAndVerifyDraft(
@@ -905,6 +914,15 @@ export async function createAndVerifyDraft(
   input: DraftInput,
 ): Promise<DraftCreateResult> {
   const draftsMailboxId = await getDraftMailbox(context, token)
+  const existing = await recoverDraft(context, token, draftsMailboxId, input)
+  if (existing) {
+    return {
+      draftId: existing.id,
+      recovered: true,
+      threadId: existing.threadId,
+      verified: true,
+    }
+  }
   const createId = 'draft'
   const draft = {
     mailboxIds: { [draftsMailboxId]: true },

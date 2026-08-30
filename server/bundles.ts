@@ -67,6 +67,69 @@ export interface BundleDecision {
 
 export type DecideBundle = (input: BundleDecisionInput) => Promise<BundleDecision>
 
+export type BundleAnalysisEngine = 'codex' | 'fallback' | 'heuristic'
+
+export type BundleBuildPhase =
+  | 'indexing'
+  | 'grouping'
+  | 'deciding'
+  | 'reconciling'
+  | 'finalizing'
+  | 'fallback'
+  | 'complete'
+
+export interface BundleBuildProgress {
+  codexCallCount: number
+  engine: BundleAnalysisEngine
+  model?: string
+  phase: BundleBuildPhase
+  processedEmailCount: number
+  progress: number
+  totalEmailCount: number
+}
+
+export interface BuildReviewBundlesOptions {
+  codexCallCount?: number
+  engine?: BundleAnalysisEngine
+  getCodexCallCount?: () => number
+  model?: string
+  onProgress?: (progress: BundleBuildProgress) => void
+}
+
+function bundleProgressReporter(
+  totalEmailCount: number,
+  options: BuildReviewBundlesOptions,
+  defaultEngine: BundleAnalysisEngine,
+) {
+  let lastProgress = 0
+  let codexCallCount = Math.max(0, Math.floor(options.codexCallCount ?? 0))
+  const currentCodexCallCount = () =>
+    Math.max(0, Math.floor(options.getCodexCallCount?.() ?? codexCallCount))
+  const emit = (
+    phase: BundleBuildPhase,
+    progress: number,
+    processedEmailCount: number,
+    engine = options.engine ?? defaultEngine,
+  ) => {
+    lastProgress = Math.max(lastProgress, Math.min(1, Math.max(0, progress)))
+    options.onProgress?.({
+      codexCallCount: currentCodexCallCount(),
+      engine,
+      ...(options.model ? { model: options.model } : {}),
+      phase,
+      processedEmailCount: Math.min(totalEmailCount, Math.max(0, Math.floor(processedEmailCount))),
+      progress: lastProgress,
+      totalEmailCount,
+    })
+  }
+  return {
+    codexCallStarted() {
+      if (!options.getCodexCallCount) codexCallCount += 1
+    },
+    emit,
+  }
+}
+
 function normalized(value: string) {
   return value.normalize('NFKC').toLocaleLowerCase('en-US')
 }
@@ -161,14 +224,32 @@ export function learningSignalsFor(emails: readonly ReviewEmailSummary[]) {
     emails.flatMap((email) => {
       const signals = extractBundleSignals(email)
       return [
-        `provider:${signals.provider.toLowerCase()}`,
-        ...[...signals.exactKeys, ...signals.conflictKeys].map((signal) => {
-          const type = signal.split(':')[0]
-          return `${type}:sha256:${createHash('sha256').update(signal).digest('hex')}`
-        }),
+        hashLearningSignal(`provider:${signals.provider}`),
+        ...[...signals.exactKeys, ...signals.conflictKeys].flatMap((signal) =>
+          unique([hashLearningSignal(signal), legacyHashedLearningSignal(signal)]),
+        ),
       ]
     }),
   ).slice(0, 100)
+}
+
+const HASHED_LEARNING_SIGNAL = /^([a-z][a-z0-9_-]{0,31}):sha256:([a-f0-9]{64})$/i
+
+export function hashLearningSignal(signal: string) {
+  const canonical = normalized(signal.trim())
+  const alreadyHashed = HASHED_LEARNING_SIGNAL.exec(canonical)
+  if (alreadyHashed) {
+    return `${alreadyHashed[1]}:sha256:${alreadyHashed[2]}`
+  }
+  const separator = canonical.indexOf(':')
+  const proposedType = separator > 0 ? canonical.slice(0, separator) : 'signal'
+  const type = /^[a-z][a-z0-9_-]{0,31}$/.test(proposedType) ? proposedType : 'signal'
+  return `${type}:sha256:${createHash('sha256').update(canonical).digest('hex')}`
+}
+
+function legacyHashedLearningSignal(signal: string) {
+  const type = signal.split(':')[0]
+  return `${type}:sha256:${createHash('sha256').update(signal).digest('hex')}`
 }
 
 class UnionFind {
@@ -343,13 +424,21 @@ function asBundle(
   }
 }
 
-export function singletonBundleRun(snapshotId: string, emails: readonly ReviewEmailSummary[]) {
+export function singletonBundleRun(
+  snapshotId: string,
+  emails: readonly ReviewEmailSummary[],
+  options: BuildReviewBundlesOptions = {},
+) {
+  const progress = bundleProgressReporter(emails.length, options, 'fallback')
   const signals = new Map(emails.map((email) => [email.id, extractBundleSignals(email)]))
-  return {
+  const run = {
     bundles: emails.map((email) => asBundle([email], signals)),
     fallback: true,
     snapshotId,
   } satisfies ReviewBundleRun
+  progress.emit('fallback', 0.95, emails.length, 'fallback')
+  progress.emit('complete', 1, emails.length, 'fallback')
+  return run
 }
 
 export function validateBundlePartition(
@@ -396,8 +485,14 @@ export async function buildReviewBundles(
   emails: readonly ReviewEmailSummary[],
   decide?: DecideBundle,
   examples: readonly BundleExample[] = [],
+  options: BuildReviewBundlesOptions = {},
 ): Promise<ReviewBundleRun> {
-  if (emails.length === 0) return { bundles: [], fallback: false, snapshotId }
+  const progress = bundleProgressReporter(emails.length, options, decide ? 'codex' : 'heuristic')
+  progress.emit('indexing', 0, 0)
+  if (emails.length === 0) {
+    progress.emit('complete', 1, 0)
+    return { bundles: [], fallback: false, snapshotId }
+  }
   const byId = new Map(emails.map((email) => [email.id, email]))
   const signals = new Map(emails.map((email) => [email.id, extractBundleSignals(email)]))
   const union = new UnionFind()
@@ -412,12 +507,18 @@ export async function buildReviewBundles(
       } else keyOwners.set(key, email.id)
     }
   }
+  progress.emit('grouping', 0.1, 0)
   const lexicalIndex = ftsCandidates(emails, signals)
   try {
     const open = new Set(emails.map((email) => union.find(email.id)))
     const membersFor = (root: string) =>
       emails.filter((email) => open.has(root) && union.find(email.id) === root)
     const bundles: ReviewBundle[] = []
+    let processedEmailCount = 0
+
+    const analysisProgress = () => 0.15 + (0.75 * processedEmailCount) / Math.max(1, emails.length)
+
+    progress.emit('grouping', analysisProgress(), processedEmailCount)
 
     while (open.size > 0) {
       const seedRoot = [...open][0]
@@ -436,7 +537,10 @@ export async function buildReviewBundles(
       })
       let metadata: Omit<BundleDecision, 'includedEmailIds'> | undefined
 
-      const judgeRootPages = async (roots: readonly string[]) => {
+      const judgeRootPages = async (
+        roots: readonly string[],
+        phase: Extract<BundleBuildPhase, 'deciding' | 'reconciling'> = 'deciding',
+      ) => {
         if (!decide) return false
         let acceptedAny = false
         const pages =
@@ -445,6 +549,8 @@ export async function buildReviewBundles(
           const pageRoots = roots.slice(pageIndex * 100, (pageIndex + 1) * 100)
           const perRoot = Math.max(1, Math.floor(100 / Math.max(1, pageRoots.length)))
           const pageCandidates = pageRoots.flatMap((root) => membersFor(root).slice(0, perRoot))
+          progress.codexCallStarted()
+          progress.emit(phase, analysisProgress(), processedEmailCount)
           const decision = await decide({
             candidates: pageCandidates,
             examples: selectBundleExamples(
@@ -491,18 +597,24 @@ export async function buildReviewBundles(
           if (root === seedRoot || alreadyConsidered.has(root)) return false
           return !hardConflict(seed, membersFor(root), signals)
         })
-        if (reconciledRoots.length > 0) await judgeRootPages(reconciledRoots)
+        if (reconciledRoots.length > 0) {
+          await judgeRootPages(reconciledRoots, 'reconciling')
+        }
       }
       open.delete(seedRoot)
       const bundle = asBundle(seed, signals, metadata)
       bundle.bundleId = `bundle-${stableId(bundle.emailIds)}`
       bundles.push(bundle)
+      processedEmailCount += bundle.emailIds.length
+      progress.emit('grouping', analysisProgress(), processedEmailCount)
     }
 
+    progress.emit('finalizing', 0.95, processedEmailCount)
     validateBundlePartition(
       emails.map((email) => email.id),
       bundles,
     )
+    progress.emit('complete', 1, emails.length)
     return { bundles, fallback: false, snapshotId }
   } finally {
     lexicalIndex.close()
