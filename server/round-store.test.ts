@@ -10,7 +10,7 @@ import type {
   ReviewEmailSummary,
   ReviewFilters,
 } from '../src/shared.ts'
-import { type BundleExample, hashLearningSignal } from './bundles.ts'
+import { type BundleExample, type BundlePartitionDecision, hashLearningSignal } from './bundles.ts'
 import { createRoundStore, RoundNotFoundError, RoundRevisionConflictError } from './round-store.ts'
 
 const { DatabaseSync } = createRequire(import.meta.url)(
@@ -170,6 +170,48 @@ describe('SQLite review round store', () => {
       }).id,
     ).toBe('memory-round')
     store.close()
+  })
+
+  it('rejects malformed persisted global partition metadata', () => {
+    const databasePath = createDatabasePath()
+    const { store } = createRound(databasePath)
+    const decision: BundlePartitionDecision = {
+      standaloneEmailIds: [],
+      stories: [
+        {
+          currentState: 'Aktuell',
+          emailIds: ['mail-1', 'mail-2'],
+          kind: 'conversation',
+          linkEvidence: ['Gleicher Vorgang'],
+          membershipConfidence: 0.9,
+          summary: 'Zwei zusammengehörige Nachrichten.',
+          title: 'Konkreter Vorgang',
+        },
+      ],
+    }
+    expect(store.saveBundlePartition('round-1', 'global-key', decision)).toEqual(decision)
+    store.close()
+
+    const database = new DatabaseSync(databasePath)
+    database
+      .prepare(
+        'UPDATE review_round_bundle_decision SET decision_json = ? WHERE round_id = ? AND decision_key = ?',
+      )
+      .run(
+        JSON.stringify({
+          ...decision,
+          stories: [{ ...decision.stories[0], membershipConfidence: 'invalid' }],
+        }),
+        'round-1',
+        'global-key',
+      )
+    database.close()
+
+    const reopened = createRoundStore(databasePath)
+    expect(() => reopened.getBundlePartition('round-1', 'global-key')).toThrow(
+      'story confidence is invalid',
+    )
+    reopened.close()
   })
 
   it('persists a complete round, analysis, bundles, decisions, and finalization across reopen', () => {

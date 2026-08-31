@@ -25,9 +25,9 @@ If a body cannot be loaded, that message is protected as unread automatically.
 
 1. Create and persist the run ID before fetching mail. Keep the user on the rounds table while the backend fetches and analyzes it.
 2. Persist the frozen snapshot, Codex model, thinking level, and hashed learning-example corpus before the first provider request.
-3. Rebuild the local candidate index from every summary in that snapshot. Use exact identifiers, full-text matches, and bounded cross-provider time recall to find plausible related messages.
-4. Send Codex only summary fields: ID, subject, preview, time, sender, and thread ID. Exact local groups need no second seed check.
-5. Save every completed Codex decision before moving to the next one. Resume from those decisions after a process restart.
+3. Send every frozen summary to Codex in one global request without a local candidate prefilter. The supplied fields are ID, subject, preview, time, sender, recipients, thread ID, mailbox names, and summary flags; bodies and attachments are not part of grouping.
+4. Normalize the proposed partition deterministically: prefer higher-confidence stories for duplicate assignments, use stable model order as the tie-breaker, dissolve stories left with fewer than two messages, and classify every unassigned snapshot ID as standalone. Reject unknown IDs and malformed story metadata.
+5. Save the complete normalized partition before constructing the final review run. Resume from that checkpoint after a process restart.
 6. A reload or open action only reads stored status and results. Only an explicit reanalysis starts a new generation on the same snapshot.
 7. Keep later incoming mail outside the round. Analyze it in a new round.
 8. In live mode, fail visibly when Codex is unavailable or times out. Never silently downgrade the run to local or singleton analysis.

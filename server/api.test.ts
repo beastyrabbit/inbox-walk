@@ -18,7 +18,7 @@ import {
   waitForApiJobs,
 } from './api.ts'
 import { type BundleExample, hashLearningSignal } from './bundles.ts'
-import { CodexAuthenticationError } from './codex.ts'
+import { CodexAuthenticationError, CodexContextLengthError } from './codex.ts'
 import { demoEmails } from './demo.ts'
 import { createRoundStore } from './round-store.ts'
 
@@ -26,6 +26,7 @@ let server: Server
 let baseUrl = ''
 const retainedIds = new Set<string>()
 let injectUnknownBundleId = false
+let bundleDecisionFailure: Error | null = null
 let bundleDecisionCalls = 0
 let bundleDecisionGate: Promise<void> | null = null
 let releaseBundleDecision: (() => void) | null = null
@@ -158,6 +159,7 @@ beforeAll(async () => {
     bundleDecider: async () => {
       bundleDecisionCalls += 1
       if (bundleDecisionGate) await bundleDecisionGate
+      if (bundleDecisionFailure) throw bundleDecisionFailure
       return {
         includedEmailIds: injectUnknownBundleId ? ['outside-frozen-snapshot'] : [],
         kind: 'standalone',
@@ -192,6 +194,7 @@ beforeEach(() => {
   clearApiStateForTests()
   retainedIds.clear()
   injectUnknownBundleId = false
+  bundleDecisionFailure = null
   bundleDecisionCalls = 0
   bundleDecisionGate = null
   releaseBundleDecision = null
@@ -700,6 +703,181 @@ describe('demo API contract', () => {
       expect(savedRuns).toBe(0)
       expect(localStore.get(id)).toBeNull()
     } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('aborts a manual bundle job before reanalysis and only persists the new generation', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const summaries = [
+      source,
+      {
+        ...source,
+        id: `${source.id}-generation-peer`,
+        receivedAt: new Date(Date.parse(source.receivedAt) + 1_000).toISOString(),
+        subject: `${source.subject} · Fortsetzung`,
+        threadId: `${source.threadId}-generation-peer`,
+      },
+    ].map((email) => ({
+      from: email.from,
+      hasAttachment: email.hasAttachment,
+      id: email.id,
+      isNewsletter: email.isNewsletter,
+      mailboxNames: email.mailboxNames,
+      preview: email.preview,
+      receivedAt: email.receivedAt,
+      subject: email.subject,
+      threadId: email.threadId,
+      to: email.to,
+    }))
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'waiting',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+        thinkingLevel: 'high',
+        totalEmailCount: summaries.length,
+      },
+      csrfToken: 'manual-generation-csrf',
+      emails: summaries,
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 1,
+      id: 'manual-generation-round',
+      imageToken: 'manual-generation-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+      runStatus: 'ready',
+    })
+    const checkpointWriteGenerations: Array<number | undefined> = []
+    const bundleRunWriteGenerations: Array<number | undefined> = []
+    const observedStore = {
+      ...localStore,
+      saveBundlePartition: (...args: Parameters<(typeof localStore)['saveBundlePartition']>) => {
+        checkpointWriteGenerations.push(args[3])
+        return localStore.saveBundlePartition(...args)
+      },
+      saveBundleRun: (...args: Parameters<(typeof localStore)['saveBundleRun']>) => {
+        bundleRunWriteGenerations.push(args[3])
+        return localStore.saveBundleRun(...args)
+      },
+    }
+    let providerCalls = 0
+    let firstSignal: AbortSignal | undefined
+    let firstSignalAborted = false
+    let firstCallStartedResolve: (() => void) | undefined
+    const firstCallStarted = new Promise<void>((resolve) => {
+      firstCallStartedResolve = resolve
+    })
+    let releaseFirstCall: (() => void) | undefined
+    const firstCallGate = new Promise<void>((resolve) => {
+      releaseFirstCall = resolve
+    })
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      bundlePartitionDecider: async (input, signal) => {
+        providerCalls += 1
+        const generation = providerCalls
+        if (generation === 1) {
+          firstSignal = signal
+          firstCallStartedResolve?.()
+          const abort = () => {
+            firstSignalAborted = true
+            releaseFirstCall?.()
+          }
+          signal?.addEventListener('abort', abort, { once: true })
+          if (signal?.aborted) abort()
+          await firstCallGate
+        }
+        return {
+          standaloneEmailIds: [],
+          stories: [
+            {
+              currentState: `Generation ${generation} abgeschlossen`,
+              emailIds: input.emails.map((email) => email.id),
+              kind: 'conversation',
+              linkEvidence: [`Generation ${generation}`],
+              membershipConfidence: 1,
+              summary: `Ergebnis aus Generation ${generation}.`,
+              title: `Generation ${generation}`,
+            },
+          ],
+        }
+      },
+      codexAuthStatus: () => ({
+        configured: true,
+        model: 'gpt-5.6-sol',
+        thinkingLevel: 'high',
+      }),
+      roundStore: observedStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const opened = await fetch(`${localBase}/api/reviews/manual-generation-round`)
+      expect(opened.status).toBe(200)
+
+      const started = await fetch(
+        `${localBase}/api/reviews/manual-generation-round/bundles`,
+        post({}, 'manual-generation-csrf'),
+      )
+      expect(started.status).toBe(202)
+      await firstCallStarted
+      expect(firstSignal?.aborted).toBe(false)
+
+      const reanalyzed = await fetch(
+        `${localBase}/api/reviews/manual-generation-round/reanalyze`,
+        post({}, 'manual-generation-csrf'),
+      )
+      expect(reanalyzed.status).toBe(202)
+      expect((await reanalyzed.json()) as ReviewRunSummary).toMatchObject({
+        generation: 2,
+        status: 'analyzing',
+      })
+      expect(firstSignalAborted).toBe(true)
+      expect(firstSignal?.aborted).toBe(true)
+
+      await waitForApiJobs()
+      expect(providerCalls).toBe(2)
+      expect(checkpointWriteGenerations).toEqual([2])
+      expect(bundleRunWriteGenerations).toEqual([2])
+      const completed = localStore.get('manual-generation-round')
+      expect(completed).toMatchObject({
+        analysis: { callCount: 1, status: 'complete' },
+        generation: 2,
+        runStatus: 'ready',
+      })
+      expect(completed?.bundleRun?.bundles).toEqual([
+        expect.objectContaining({ title: 'Generation 2' }),
+      ])
+    } finally {
+      releaseFirstCall?.()
+      await waitForApiJobs()
       await new Promise<void>((resolve, reject) =>
         localServer.close((error) => (error ? reject(error) : resolve())),
       )
@@ -1973,6 +2151,254 @@ describe('demo API contract', () => {
     }
   })
 
+  it('sends the complete live snapshot through one global partition call and replays the persisted run after restart', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const summaries = Array.from({ length: 379 }, (_, index) => ({
+      from: source.from,
+      hasAttachment: false,
+      id: `global-partition-${index.toString().padStart(3, '0')}`,
+      isNewsletter: false,
+      mailboxNames: ['Inbox'],
+      preview: `Global partition preview ${index}`,
+      receivedAt: new Date(Date.parse(source.receivedAt) + index * 1_000).toISOString(),
+      subject: `Global partition subject ${index}`,
+      threadId: `global-partition-thread-${index}`,
+      to: source.to,
+    }))
+    const expectedIds = summaries.map((email) => email.id)
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'waiting',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+        totalEmailCount: summaries.length,
+      },
+      csrfToken: 'global-partition-csrf',
+      emails: summaries,
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 1,
+      id: 'global-partition-round',
+      imageToken: 'global-partition-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+    })
+    let providerCalls = 0
+    const observedInputIds: string[][] = []
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      bundlePartitionDecider: async (input) => {
+        providerCalls += 1
+        observedInputIds.push(input.emails.map((email) => email.id))
+        return {
+          standaloneEmailIds: expectedIds.slice(2),
+          stories: [
+            {
+              currentState: 'Zusammengehörige Nachrichten erkannt',
+              emailIds: expectedIds.slice(0, 2),
+              kind: 'conversation',
+              linkEvidence: ['Gleicher konkreter Vorgang'],
+              membershipConfidence: 1,
+              summary: 'Die ersten beiden Nachrichten bilden einen konkreten Vorgang.',
+              title: 'Global erkannter Vorgang',
+            },
+          ],
+        }
+      },
+      codexAuthStatus: () => ({
+        configured: true,
+        model: 'gpt-5.6-sol',
+        thinkingLevel: 'high',
+      }),
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const started = await fetch(
+        `${localBase}/api/reviews/global-partition-round/bundles`,
+        post({}, 'global-partition-csrf'),
+      )
+      expect(started.status).toBe(202)
+      await waitForApiJobs()
+
+      expect(providerCalls).toBe(1)
+      expect(observedInputIds).toEqual([expectedIds])
+      const persisted = localStore.get('global-partition-round')
+      expect(persisted).toMatchObject({
+        analysis: { callCount: 1, status: 'complete' },
+        runStatus: 'ready',
+      })
+      expect(persisted?.bundleRun).toBeDefined()
+
+      clearApiStateForTests()
+      const reopenedResponse = await fetch(`${localBase}/api/reviews/global-partition-round`)
+      expect(reopenedResponse.status).toBe(200)
+      const reopened = (await reopenedResponse.json()) as ReviewSnapshot
+      expect(reopened.analysis).toMatchObject({ callCount: 1, status: 'complete' })
+      expect(reopened.bundleRun).toEqual(persisted?.bundleRun)
+      expect(providerCalls).toBe(1)
+      expect(observedInputIds).toEqual([expectedIds])
+    } finally {
+      await waitForApiJobs()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('keeps a concurrent reanalysis generation authoritative during stale snapshot recovery', async () => {
+    clearApiStateForTests()
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    const roundId = 'stale-snapshot-recovery-round'
+    localStore.create({
+      analysis: {
+        callCount: 1,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'deciding',
+        processedEmailCount: 0,
+        progress: 0.15,
+        status: 'running',
+        thinkingLevel: 'high',
+        totalEmailCount: 1,
+      },
+      csrfToken: 'stale-snapshot-recovery-csrf',
+      emails: [source],
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 1,
+      id: roundId,
+      imageToken: 'stale-snapshot-recovery-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+      runStatus: 'ready',
+    })
+
+    let reanalysisStarted = false
+    const analysisWriteGenerations: Array<number | undefined> = []
+    const runStatusWriteGenerations: number[] = []
+    const racingStore = {
+      ...localStore,
+      updateAnalysis: (...args: Parameters<(typeof localStore)['updateAnalysis']>) => {
+        analysisWriteGenerations.push(args[2])
+        if (!reanalysisStarted && args[0] === roundId && args[1].phase === 'waiting') {
+          reanalysisStarted = true
+          expect(
+            localStore.reanalyze(roundId, {
+              callCount: 0,
+              engine: 'codex',
+              error: null,
+              model: 'gpt-5.6-sol',
+              phase: 'indexing',
+              processedEmailCount: 0,
+              progress: 0,
+              status: 'pending',
+              thinkingLevel: 'high',
+              totalEmailCount: 1,
+            }),
+          ).toMatchObject({
+            analysis: { phase: 'indexing', status: 'pending' },
+            generation: 2,
+            runStatus: 'analyzing',
+          })
+        }
+        return localStore.updateAnalysis(...args)
+      },
+      updateRunStatus: (...args: Parameters<(typeof localStore)['updateRunStatus']>) => {
+        runStatusWriteGenerations.push(args[1])
+        return localStore.updateRunStatus(...args)
+      },
+    }
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: true,
+      codexAuthStatus: () => ({
+        configured: false,
+        model: 'gpt-5.6-sol',
+        thinkingLevel: 'high',
+      }),
+      roundStore: racingStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+
+      const restoredResponse = await fetch(`${localBase}/api/reviews/${roundId}`)
+      expect(restoredResponse.status).toBe(200)
+      expect((await restoredResponse.json()) as ReviewSnapshot).toMatchObject({
+        analysis: { phase: 'waiting_for_codex', status: 'pending' },
+        snapshotId: roundId,
+      })
+      await waitForApiJobs()
+
+      const resumedResponse = await fetch(`${localBase}/api/reviews`)
+      expect(resumedResponse.status).toBe(200)
+      await waitForApiJobs()
+
+      expect(reanalysisStarted).toBe(true)
+      expect(analysisWriteGenerations).toEqual([1])
+      expect(runStatusWriteGenerations).toEqual([1, 2])
+      expect(localStore.get(roundId)).toMatchObject({
+        analysis: {
+          callCount: 0,
+          phase: 'waiting_for_codex',
+          progress: 0,
+          status: 'pending',
+        },
+        bundleRun: null,
+        generation: 2,
+        runStatus: 'failed',
+      })
+      expect(localStore.get(roundId)?.analysis.error).toContain('erneut verbunden')
+    } finally {
+      await waitForApiJobs()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
   it('keeps an unfinished Codex analysis pending when its login is unavailable', async () => {
     clearApiStateForTests()
     const localStore = createRoundStore(':memory:')
@@ -2578,6 +3004,22 @@ describe('demo API contract', () => {
       headers: { 'X-Inbox-Walk-CSRF': created.csrfToken },
     })
     expect(deleted.status).toBe(204)
+  })
+
+  it('reports provider context exhaustion as an actionable failed run', async () => {
+    bundleDecisionFailure = new CodexContextLengthError()
+    const response = await fetch(
+      `${baseUrl}/api/reviews`,
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const created = (await response.json()) as ReviewRunSummary
+    expect(response.status).toBe(202)
+
+    await waitForApiJobs()
+    const failed = roundStore.get(created.id)
+    expect(failed).toMatchObject({ bundleRun: null, runStatus: 'failed' })
+    expect(failed?.analysis.error).toContain('Kontextfenster')
+    expect(failed?.analysis.error).toContain('kleineren Zeitraum')
   })
 
   it('builds reply context, proposes text, saves a draft, and exposes no send route', async () => {

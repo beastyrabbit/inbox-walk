@@ -1,5 +1,10 @@
+import { readFileSync } from 'node:fs'
 import { expect, type Page, test } from '@playwright/test'
 import type { ReviewRunSummary } from '../src/shared.ts'
+
+const { version: appVersion } = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+) as { version: string }
 
 async function startAndOpenRound(page: Page) {
   await page.getByRole('button', { name: 'Runde starten' }).click()
@@ -25,6 +30,28 @@ test('configures every new round on a dedicated direct-selection screen', async 
   )
   await expect(page.getByLabel('Zurückgestellte Nachrichten ausblenden')).not.toBeChecked()
   await expect(page.getByRole('button', { name: 'Runde öffnen' }).first()).toBeEnabled()
+})
+
+test('shows the package version beside the product name', async ({ page }) => {
+  const visibleVersion = `v${appVersion}`
+  const overviewButton = page.getByRole('button', {
+    name: `Nachrichtenübersicht öffnen · Inbox Walk ${visibleVersion}`,
+  })
+
+  await expect(overviewButton.getByText(visibleVersion, { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  )
+  await page.getByRole('button', { name: 'Runden' }).click()
+  const productHeading = page.getByRole('heading', {
+    name: `Inbox Walk ${visibleVersion}`,
+    exact: true,
+  })
+  await expect(productHeading).toBeVisible()
+  await expect(productHeading.getByText(visibleVersion, { exact: true })).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  )
 })
 
 test('keeps the overview visible and shows the new run before processing starts', async ({
@@ -227,7 +254,11 @@ test('shows concrete Codex call progress while a large round is still analyzing'
   })
 
   await page.reload()
-  await expect(page.getByText(/0 von 379 · 3 Codex-Aufrufe/)).toBeVisible()
+  await expect(
+    page.getByText(
+      /Codex analysiert alle Nachrichten gemeinsam · 379 Nachrichten · 3 Codex-Aufrufe/,
+    ),
+  ).toBeVisible()
 })
 
 test('keeps a stable round URL across reload and reopening from the overview', async ({ page }) => {

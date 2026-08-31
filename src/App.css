@@ -67,6 +67,31 @@
   font-weight: 650;
 }
 
+.brand-name,
+.setup-brand {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 7px;
+}
+
+.setup-brand {
+  flex-wrap: wrap;
+  row-gap: 0;
+}
+
+.setup-brand > span:first-child {
+  white-space: nowrap;
+}
+
+.app-version {
+  color: var(--ink-soft);
+  font-family: "Public Sans", sans-serif;
+  font-size: 10px;
+  font-weight: 550;
+  letter-spacing: 0;
+  white-space: nowrap;
+}
+
 .counter {
   color: var(--ink-soft);
   font-family: "Public Sans", sans-serif;
@@ -1622,6 +1647,7 @@
     padding: 30px 18px 48px;
   }
   .setup-header {
+    gap: 12px;
     padding-bottom: 22px;
   }
   .setup-header .button {
@@ -1728,14 +1754,14 @@
     grid-template-rows: 54px minmax(0, 1fr) 68px;
   }
   .topbar {
-    padding: 0 14px;
+    padding: 0 10px;
   }
   .counter,
   .top-actions .mode-label {
     display: none;
   }
   .top-actions {
-    gap: 7px;
+    gap: 4px;
   }
   .analysis-badge {
     max-width: 96px;

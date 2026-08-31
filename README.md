@@ -27,6 +27,7 @@ Fastmail.
 - Loads up to 100 messages from the selected reply thread; this limit does not cap a review round.
 - Sends every supported image to Codex and extracts every supported document through Apache Tika.
 - Selects Sol, Terra, or Luna for new Codex work without restarting the app.
+- Shows the running release version in the application shell.
 - Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
 - Creates and reads back a normal Fastmail draft with reply headers and identity signature.
 - Exposes `/healthz` and `/readyz` for Kubernetes probes.
@@ -69,30 +70,29 @@ can be selected without restarting the app. The choices are stored together in
 `DATA_DIR/codex-settings.json`.
 
 Connect Codex in the settings menu before starting a round. The app stores the
-run first, freezes every matching summary, and rebuilds its local relationship
-index for that snapshot. Exact IDs and same-thread links are joined locally.
-Codex then checks every remaining story seed against broad text and
-cross-provider time candidates. A message accepted into an earlier story does
-not need a second seed check. Opening a message never starts analysis. Later
+run first and freezes every matching summary. Codex receives the complete frozen
+set in one request and partitions every message into a concrete multi-message
+story or a standalone item. The app does not preselect candidates or join
+stories before Codex sees them. Opening a message never starts analysis. Later
 mail is not added to the frozen round.
 
-Codex decisions are checkpointed in SQLite as the run accepts them. A browser reload keeps
-the current job running. After a process crash, the app replays saved decisions;
-only work without a durable checkpoint may be repeated. Reloading or opening
-a finished round does not run Codex again. Only **Neu analysieren** starts a new
-analysis generation on the same snapshot. Every message in the snapshot is
-covered; there is no per-round provider-call cutoff.
-Each Codex batch is checked against the exact candidate IDs before any decision
-is checkpointed. If cohorts reference IDs outside their own candidates, valid
-cohorts stay saved and each invalid cohort is retried once in an isolated
-request. A second invalid answer fails visibly and is never stored or accepted.
+The complete Codex partition is checkpointed in SQLite before the final run is
+stored. A browser reload keeps the current job running. After a process crash,
+the app reuses a complete saved partition; only an unfinished provider request
+may be repeated. Reloading or opening a finished round does not run Codex again.
+Only **Neu analysieren** starts a new analysis generation on the same snapshot.
+The backend turns overlapping model suggestions into one deterministic
+partition: higher-confidence stories win duplicate assignments, undersized
+stories dissolve, and every otherwise unassigned snapshot message becomes a
+standalone item. Unknown IDs and malformed story metadata still fail closed.
 If a started Codex run later needs a new login, it fails visibly instead of
 silently changing engines. Reconnect Codex and rerun the analysis on the same
 frozen snapshot.
 
-`CODEX_INFERENCE_TIMEOUT_MS` limits one Codex request, not the number of messages
-in a round. The default is five minutes. If a request has not finished by then,
-the run becomes **Fehlgeschlagen** and remains available for a fresh analysis.
+`CODEX_BUNDLE_TIMEOUT_MS` limits the one global grouping request. It defaults to
+30 minutes and can be raised to at most 60 minutes. `CODEX_INFERENCE_TIMEOUT_MS`
+keeps the five-minute default for other Codex work. A timeout marks the run
+**Fehlgeschlagen** and leaves it available for a fresh analysis.
 
 `DATA_DIR/inbox-walk.sqlite` stores review rounds with their fixed IDs, filters,
 mail summaries, frozen hashed learning examples, bundle-analysis status, Codex
@@ -131,7 +131,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-This source tree describes release `v0.8.1`. Production releases are deployed at
+This source tree describes release `v0.9.0`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

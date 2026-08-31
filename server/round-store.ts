@@ -15,7 +15,13 @@ import type {
   ReviewEmailSummary,
   ReviewFilters,
 } from '../src/shared.ts'
-import { type BundleDecision, type BundleExample, hashLearningSignal } from './bundles.ts'
+import {
+  type BundleDecision,
+  type BundleExample,
+  type BundlePartitionDecision,
+  hashLearningSignal,
+  validateBundlePartitionDecisionShape,
+} from './bundles.ts'
 
 const { DatabaseSync } = createRequire(import.meta.url)(
   'node:sqlite',
@@ -164,6 +170,11 @@ export interface RoundStore {
     decisionKey: string,
     expectedGeneration?: number,
   ): BundleDecision | null
+  getBundlePartition(
+    roundId: string,
+    decisionKey: string,
+    expectedGeneration?: number,
+  ): BundlePartitionDecision | null
   get(roundId: string): StoredReviewRound | null
   list(): StoredReviewRunSummary[]
   populate(
@@ -184,6 +195,12 @@ export interface RoundStore {
     decision: BundleDecision,
     expectedGeneration?: number,
   ): BundleDecision | null
+  saveBundlePartition(
+    roundId: string,
+    decisionKey: string,
+    decision: BundlePartitionDecision,
+    expectedGeneration?: number,
+  ): BundlePartitionDecision | null
   saveFinalization(roundId: string, finalization: RoundFinalizationUpdate): StoredReviewRound | null
   updateAnalysis(
     roundId: string,
@@ -492,6 +509,22 @@ function cleanBundleDecision(decision: BundleDecision): BundleDecision {
     membershipConfidence: decision.membershipConfidence,
     summary: decision.summary,
     title: decision.title,
+  }
+}
+
+function cleanBundlePartition(decision: unknown): BundlePartitionDecision {
+  validateBundlePartitionDecisionShape(decision)
+  return {
+    standaloneEmailIds: [...decision.standaloneEmailIds],
+    stories: decision.stories.map((story) => ({
+      currentState: story.currentState,
+      emailIds: [...story.emailIds],
+      kind: story.kind,
+      linkEvidence: [...story.linkEvidence],
+      membershipConfidence: story.membershipConfidence,
+      summary: story.summary,
+      title: story.title,
+    })),
   }
 }
 
@@ -1346,6 +1379,19 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
         | undefined
       return row ? cleanBundleDecision(jsonParse<BundleDecision>(row.decision_json)) : null
     },
+    getBundlePartition(roundId, decisionKey, expectedGeneration) {
+      assertNonEmpty(decisionKey, 'Bundle partition key')
+      if (expectedGeneration !== undefined) {
+        const row = selectRound.get(roundId) as RoundRow | undefined
+        if (!row || Number(row.generation) !== expectedGeneration) return null
+      }
+      const row = selectBundleDecision.get(roundId, decisionKey) as
+        | { decision_json: string }
+        | undefined
+      return row
+        ? cleanBundlePartition(jsonParse<BundlePartitionDecision>(row.decision_json))
+        : null
+    },
     get,
     list() {
       return (
@@ -1511,6 +1557,28 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
         | undefined
       return persisted
         ? cleanBundleDecision(jsonParse<BundleDecision>(persisted.decision_json))
+        : null
+    },
+    saveBundlePartition(roundId, decisionKey, decision, expectedGeneration) {
+      assertNonEmpty(decisionKey, 'Bundle partition key')
+      const clean = cleanBundlePartition(decision)
+      const now = new Date().toISOString()
+      const saved = transaction(() => {
+        const row = selectRound.get(roundId) as RoundRow | undefined
+        if (!row) return false
+        if (expectedGeneration !== undefined && Number(row.generation) !== expectedGeneration) {
+          return false
+        }
+        insertBundleDecision.run(roundId, decisionKey, JSON.stringify(clean), now)
+        touchRound.run(now, roundId)
+        return true
+      })
+      if (!saved) return null
+      const persisted = selectBundleDecision.get(roundId, decisionKey) as
+        | { decision_json: string }
+        | undefined
+      return persisted
+        ? cleanBundlePartition(jsonParse<BundlePartitionDecision>(persisted.decision_json))
         : null
     },
     saveBundleRun(roundId, bundleRun, analysisPatch = {}, expectedGeneration) {

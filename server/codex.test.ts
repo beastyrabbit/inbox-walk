@@ -3,10 +3,19 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
+  bundleDecisionSystemPrompt,
+  bundlePartitionPrompt,
+  bundlePartitionSystemPrompt,
   CodexAuthenticationError,
+  CodexContextLengthError,
   codexAuthStoragePath,
+  codexBundleTimeoutMs,
+  DEFAULT_CODEX_BUNDLE_TIMEOUT_MS,
   ensureCodexStorageReady,
+  finalCodexToolResult,
   isCodexAuthenticationFailure,
+  MAX_CODEX_BUNDLE_TIMEOUT_MS,
+  requireSubmittedBundlePartition,
   runCodexReply,
   selectCodexModel,
   selectCodexSettings,
@@ -32,6 +41,103 @@ afterEach(() => {
 })
 
 describe('Codex provider boundary', () => {
+  it('terminates the agent loop after accepting a structured result', () => {
+    expect(finalCodexToolResult('accepted')).toMatchObject({ terminate: true })
+  })
+
+  it('gives the global partition a 30 minute default and a 60 minute safety ceiling', () => {
+    expect(codexBundleTimeoutMs(undefined)).toBe(DEFAULT_CODEX_BUNDLE_TIMEOUT_MS)
+    expect(codexBundleTimeoutMs('300000')).toBe(300_000)
+    expect(codexBundleTimeoutMs('9999999')).toBe(MAX_CODEX_BUNDLE_TIMEOUT_MS)
+    expect(codexBundleTimeoutMs('invalid')).toBe(DEFAULT_CODEX_BUNDLE_TIMEOUT_MS)
+  })
+
+  it('reports provider context exhaustion separately from malformed partition output', () => {
+    expect(() => requireSubmittedBundlePartition({ stopReason: 'length' }, [])).toThrow(
+      CodexContextLengthError,
+    )
+    expect(() =>
+      requireSubmittedBundlePartition(
+        { errorMessage: 'maximum number of tokens exceeded', stopReason: 'error' },
+        [],
+      ),
+    ).toThrow(CodexContextLengthError)
+    expect(() => requireSubmittedBundlePartition({ stopReason: 'stop' }, [])).toThrow(
+      'did not submit exactly one complete bundle partition',
+    )
+  })
+
+  it('requires a complete global partition before materializing review stories', () => {
+    const prompt = bundlePartitionSystemPrompt()
+
+    expect(prompt).toContain('Inspect every supplied email summary together')
+    expect(prompt).toContain('complete set')
+    expect(prompt).toContain('Every supplied ID must appear exactly once')
+    expect(prompt).toContain('A story may be transitive')
+    expect(prompt).toContain('Never group generic card notifications with each other')
+    expect(prompt).toContain('unique compatible charge event within minutes')
+    expect(prompt).toContain('several items or parcels')
+    expect(prompt).toContain('continuous unresolved incident across successive SHAs or providers')
+    expect(prompt).toContain('stories contains only groups of at least two emails')
+    expect(prompt).toContain('standaloneEmailIds contains every remaining email')
+    expect(prompt).toContain('submit_bundle_partition exactly once')
+  })
+
+  it('sends every frozen summary field to the global partition', () => {
+    const email = {
+      from: [{ email: 'orders@example.com', name: 'Orders' }],
+      hasAttachment: true,
+      id: 'message-1',
+      isNewsletter: true,
+      mailboxNames: ['Inbox', 'Orders'],
+      preview: 'A short preview',
+      receivedAt: '2026-08-31T10:00:00.000Z',
+      subject: 'Order update',
+      threadId: 'thread-1',
+      to: [{ email: 'account@example.com', name: 'Account' }],
+    }
+    const parsed = JSON.parse(bundlePartitionPrompt({ emails: [email], examples: [] })) as {
+      emails: unknown[]
+    }
+    expect(parsed.emails).toEqual([email])
+  })
+
+  it('defines entity-level lifecycle, recurring-series, evidence, and title rules', () => {
+    const single = bundleDecisionSystemPrompt(false)
+    const batch = bundleDecisionSystemPrompt(true)
+
+    for (const prompt of [single, batch]) {
+      expect(prompt).toContain('same underlying story')
+      expect(prompt).toContain('same narrow real-world entity and activity')
+      expect(prompt).toContain(
+        'notification template, broad category, wording, or time window alone',
+      )
+      expect(prompt).toContain('require a discriminating combination')
+      expect(prompt).toContain('one or more carrier parcels')
+      expect(prompt).toContain('candidate need not match the seed directly')
+      expect(prompt).toContain('Different provider roles are not a conflict')
+      expect(prompt).toContain('Prefer a concrete lifecycle over a recurring series')
+      expect(prompt).toContain('Never group generic card notifications with each other')
+      expect(prompt).toContain('unique compatible charge event within minutes')
+      expect(prompt).toContain('several items or parcels')
+      expect(prompt).toContain('continuous unresolved incident across successive SHAs or providers')
+      expect(prompt).toContain('commission start to completion to review')
+      expect(prompt).toContain("one repository's same change or bounded failure episode")
+      expect(prompt).toContain('return each included ID at most once')
+      expect(prompt).toContain('latest state or activity')
+      expect(prompt).toContain(
+        'Write title, currentState, summary, and linkEvidence in concise German',
+      )
+      expect(prompt).toContain('Avoid generic titles')
+      expect(prompt).toContain('Never invent a missing fact')
+    }
+    expect(single).toContain('Never return seed IDs')
+    expect(single).toContain('submit_bundle_decision exactly once')
+    expect(batch).toContain('Evaluate every supplied cohort independently')
+    expect(batch).toContain('Candidate IDs may only be returned within their own cohort')
+    expect(batch).toContain('submit_bundle_decision_batch exactly once')
+  })
+
   it('keeps the OAuth record below DATA_DIR and verifies writable storage', () => {
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'inbox-walk-codex-'))
     temporaryDirectories.push(directory)

@@ -198,8 +198,8 @@ function analysisStatus(analysis: ReviewSnapshot['analysis']) {
     return 'Die angefangene Codex-Analyse wartet auf eine erneute Anmeldung.'
   }
   if (analysis.phase === 'indexing') return 'Nachrichten werden für die Analyse vorbereitet …'
-  if (analysis.phase === 'deciding') return 'Codex prüft mögliche Zusammenhänge …'
-  if (analysis.phase === 'reconciling') return 'Neue Zusammenhänge werden noch einmal abgeglichen …'
+  if (analysis.phase === 'deciding') return 'Codex analysiert alle Nachrichten gemeinsam …'
+  if (analysis.phase === 'reconciling') return 'Vollständigkeit der Gruppierung wird geprüft …'
   if (analysis.phase === 'finalizing') return 'Storys werden fertiggestellt …'
   if (analysis.phase === 'fallback') return 'Sichere Einzelansicht wird vorbereitet …'
   if (analysis.phase === 'grouping') return 'Zusammengehörige Nachrichten werden gebündelt …'
@@ -1731,9 +1731,12 @@ function App() {
           type="button"
           className="brand-button"
           onClick={() => setOverviewOpen(true)}
-          aria-label="Nachrichtenübersicht öffnen"
+          aria-label={`Nachrichtenübersicht öffnen · Inbox Walk v${__APP_VERSION__}`}
         >
-          <span>Inbox Walk</span>
+          <span className="brand-name">
+            <span>Inbox Walk</span>
+            <span className="app-version">v{__APP_VERSION__}</span>
+          </span>
           <span className="counter">
             Story {index + 1} / {bundles.length} · {emails.length} Nachrichten
           </span>
@@ -2050,9 +2053,11 @@ function runProgressText(run: ReviewRunSummary) {
   }
   const phase = analysisStatus(run.analysis).replace(/ …$/, '')
   const progress =
-    run.analysis.totalEmailCount > 0
-      ? `${phase} · ${run.analysis.processedEmailCount} von ${run.analysis.totalEmailCount}`
-      : phase
+    run.analysis.phase === 'deciding' && run.analysis.totalEmailCount > 0
+      ? `${phase} · ${run.analysis.totalEmailCount} Nachrichten`
+      : run.analysis.totalEmailCount > 0
+        ? `${phase} · ${run.analysis.processedEmailCount} von ${run.analysis.totalEmailCount}`
+        : phase
   if (run.analysis.callCount === 0) return progress
   return `${progress} · ${run.analysis.callCount} ${run.analysis.callCount === 1 ? 'Codex-Aufruf' : 'Codex-Aufrufe'}`
 }
@@ -2191,7 +2196,10 @@ function ReviewSetup({
     <>
       <main className="setup-page">
         <header className="setup-header">
-          <h1>Inbox Walk</h1>
+          <h1 className="setup-brand" aria-label={`Inbox Walk v${__APP_VERSION__}`}>
+            <span>Inbox Walk</span>
+            <span className="app-version">v{__APP_VERSION__}</span>
+          </h1>
           <button type="button" className="button secondary" onClick={onSettings}>
             Einstellungen
           </button>
@@ -2724,8 +2732,9 @@ function SettingsDialog({
             <div>
               <h3 id="settings-codex-title">Codex</h3>
               <p>
-                Codex prüft vor dem Öffnen jeder Runde, welche Nachrichten zu derselben Story
-                gehören. Modell und Denkaufwand gelten für neue Analysen und Antwortentwürfe.
+                Codex analysiert alle gespeicherten Zusammenfassungen einer neuen Runde gemeinsam
+                und ordnet jede Nachricht einer Story oder der Einzelansicht zu. Modell und
+                Denkaufwand gelten für neue Analysen und Antwortentwürfe.
               </p>
             </div>
             <span className={`connection-state ${authConfigured ? 'connected' : ''}`}>
