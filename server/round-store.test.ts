@@ -155,6 +155,20 @@ const partialFinalizeResult: FinalizeResult = {
   untouched: 0,
 }
 
+const completedFinalizeResult: FinalizeResult = {
+  actionFailed: [],
+  failed: [],
+  finalized: true,
+  keptUnread: 1,
+  markedRead: 1,
+  mode: 'demo',
+  processed: 2,
+  remaining: 0,
+  rescuedFromSpam: 0,
+  taggedForUnsubscribe: 1,
+  untouched: 0,
+}
+
 describe('SQLite review round store', () => {
   it('supports an in-memory store for isolated API tests', () => {
     const store = createRoundStore(':memory:')
@@ -601,6 +615,161 @@ describe('SQLite review round store', () => {
     })
     expect(store.delete('background-round')).toBe(true)
     expect(store.get('background-round')).toBeNull()
+    store.close()
+  })
+
+  it('reopens a finalized round for reanalysis while preserving reply drafts', () => {
+    const store = createRoundStore(':memory:')
+    store.create({
+      analysis: {
+        callCount: 1,
+        engine: 'codex',
+        model: 'gpt-5.6-sol',
+        phase: 'complete',
+        processedEmailCount: emails.length,
+        progress: 1,
+        status: 'complete',
+        thinkingLevel: 'low',
+        totalEmailCount: emails.length,
+      },
+      csrfToken: 'finalized-csrf',
+      emails,
+      filters,
+      generation: 4,
+      id: 'finalized-round',
+      imageToken: 'finalized-image',
+      mailboxes: [],
+      mode: 'demo',
+      runStatus: 'ready',
+    })
+    store.saveBundleRun('finalized-round', {
+      ...bundleRun(),
+      snapshotId: 'finalized-round',
+    })
+    store.saveBundlePartition(
+      'finalized-round',
+      'global-partition',
+      {
+        standaloneEmailIds: [],
+        stories: [
+          {
+            currentState: 'Abgeschlossen',
+            emailIds: ['mail-1', 'mail-2'],
+            kind: 'conversation',
+            linkEvidence: ['Gleicher Vorgang'],
+            membershipConfidence: 0.9,
+            summary: 'Zwei zusammengehörige Nachrichten.',
+            title: 'Konkreter Vorgang',
+          },
+        ],
+      },
+      4,
+    )
+    store.updateUserState('finalized-round', 0, {
+      bundleGroups: [['mail-1', 'mail-2']],
+      index: 1,
+      keptUnreadIds: ['mail-1'],
+      processedIds: ['mail-1', 'mail-2'],
+      replyDrafts: { 'mail-1': replyDraft },
+      secondaryActionIds: ['mail-2'],
+      selectedMemberId: 'mail-2',
+    })
+    store.saveFinalization('finalized-round', {
+      actionFailed: [],
+      failed: [],
+      finalizeIds: ['mail-1', 'mail-2'],
+      keepUnreadIds: ['mail-1'],
+      result: completedFinalizeResult,
+      secondaryActionIds: ['mail-2'],
+      secondaryActionSucceededIds: ['mail-2'],
+      state: 'finalized',
+      succeededIds: ['mail-1'],
+    })
+
+    expect(store.list()).toEqual([
+      expect.objectContaining({
+        id: 'finalized-round',
+        reanalyzable: true,
+        reviewStatus: 'finalized',
+      }),
+    ])
+
+    const restarted = store.reanalyze('finalized-round', {
+      callCount: 0,
+      phase: 'indexing',
+      processedEmailCount: 0,
+      progress: 0,
+      status: 'pending',
+    })
+
+    expect(restarted).toMatchObject({
+      bundleRun: null,
+      finalization: {
+        actionFailed: [],
+        failed: [],
+        finalizeIds: [],
+        keepUnreadIds: [],
+        result: null,
+        secondaryActionIds: [],
+        secondaryActionSucceededIds: [],
+        state: 'active',
+        succeededIds: [],
+      },
+      generation: 5,
+      runStatus: 'analyzing',
+      status: 'active',
+      userState: {
+        bundleGroups: [],
+        index: 0,
+        keptUnreadIds: [],
+        processedIds: [],
+        replyDrafts: { 'mail-1': replyDraft },
+        revision: 2,
+        secondaryActionIds: [],
+        selectedMemberId: null,
+      },
+    })
+    expect(store.getBundlePartition('finalized-round', 'global-partition', 5)).toBeNull()
+    store.close()
+  })
+
+  it('does not erase an inconsistent finalized round without a completion result', () => {
+    const store = createRoundStore(':memory:')
+    store.create({
+      csrfToken: 'inconsistent-csrf',
+      emails,
+      filters,
+      id: 'inconsistent-finalized-round',
+      imageToken: 'inconsistent-image',
+      mailboxes: [],
+      mode: 'demo',
+      runStatus: 'ready',
+      status: 'finalized',
+    })
+
+    expect(store.list()).toEqual([
+      expect.objectContaining({
+        id: 'inconsistent-finalized-round',
+        reanalyzable: false,
+        reviewStatus: 'finalized',
+      }),
+    ])
+    expect(() =>
+      store.reanalyze('inconsistent-finalized-round', {
+        phase: 'indexing',
+        status: 'pending',
+      }),
+    ).toThrowError(
+      expect.objectContaining({
+        code: 'ROUND_REANALYSIS_CONFLICT',
+      }),
+    )
+    expect(store.get('inconsistent-finalized-round')).toMatchObject({
+      finalization: { result: null, state: 'finalized' },
+      generation: 0,
+      runStatus: 'ready',
+      status: 'finalized',
+    })
     store.close()
   })
 

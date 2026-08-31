@@ -2,7 +2,7 @@
 
 ## Production contract
 
-- Release described by this source tree: `v0.9.0`
+- Release described by this source tree: `v0.9.1`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -61,7 +61,7 @@ model exhausts its context or output length, the run remains stored and reports
 that condition separately; choose a narrower time range or another available
 model and reanalyze the same round.
 
-## Upgrade to v0.9.0
+## Upgrade to v0.9.1
 
 No manual database migration is required. Startup upgrades
 `inbox-walk.sqlite` from schema v4 through v7 before accepting requests.
@@ -70,6 +70,11 @@ missing messages is marked failed, and its stale grouping result and Codex
 checkpoints are removed. `CODEX_BUNDLE_MAX_CALLS` is no longer read and can be
 removed from local configuration. `CODEX_BUNDLE_TIMEOUT_MS` is optional and
 defaults to `1800000`.
+
+`v0.9.1` lets completed rounds start a fresh Codex analysis of their frozen
+snapshot. The restart clears the old review decisions and finalization result
+but keeps reply drafts. It does not change the mailbox again until the reopened
+round is reviewed and explicitly finalized.
 
 Upgrading from `v0.8.0` or `v0.8.1` requires no schema migration. Explicitly
 reanalyze any round that failed with a candidate-membership error under an older

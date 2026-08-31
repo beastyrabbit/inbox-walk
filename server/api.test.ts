@@ -306,6 +306,91 @@ describe('demo API contract', () => {
     expect(roundStore.get(id)).toBeNull()
   })
 
+  it('reanalyzes a finalized round and preserves its reply drafts', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const emailId = created.body.emails.find((email) => email.id === 'demo-human')?.id
+    expect(emailId).toBeDefined()
+    if (!emailId) return
+    const replyEditor = {
+      bodyText: 'Antwortentwurf bleibt erhalten.',
+      cc: [],
+      identityId: 'demo-identity',
+      revisionInstruction: '',
+      roughNotes: 'Nach der Reanalyse weiterbearbeiten.',
+      subject: 'Re: Projektstatus',
+      to: [{ email: 'alex@example.com', name: 'Alex' }],
+    }
+    const savedState = await json<ReviewSnapshot['userState']>(
+      `/api/reviews/${created.body.snapshotId}/state`,
+      post(
+        {
+          revision: created.body.userState.revision,
+          state: {
+            bundleGroups: [],
+            index: 0,
+            keptUnreadIds: [emailId],
+            processedIds: [emailId],
+            replyDrafts: { [emailId]: replyEditor },
+            secondaryActionIds: [],
+            selectedMemberId: emailId,
+          },
+        },
+        created.body.csrfToken,
+      ),
+    )
+    expect(savedState.response.status).toBe(200)
+    const finalized = await json<FinalizeResult>(
+      `/api/reviews/${created.body.snapshotId}/finalize`,
+      post(
+        {
+          finalizeIds: [emailId],
+          keepUnreadIds: [emailId],
+          revision: savedState.body.revision,
+          secondaryActionIds: [],
+        },
+        created.body.csrfToken,
+      ),
+    )
+    expect(finalized.body.finalized).toBe(true)
+
+    const before = await json<{ runs: ReviewRunSummary[] }>('/api/reviews')
+    expect(before.body.runs.find((run) => run.id === created.body.snapshotId)).toMatchObject({
+      reanalyzable: true,
+      reviewStatus: 'finalized',
+      status: 'ready',
+    })
+
+    const restarted = await json<ReviewRunSummary>(
+      `/api/reviews/${created.body.snapshotId}/reanalyze`,
+      post({}, created.body.csrfToken),
+    )
+    expect(restarted.response.status).toBe(202)
+    expect(restarted.body).toMatchObject({
+      reanalyzable: false,
+      reviewStatus: 'active',
+      status: 'analyzing',
+    })
+    await waitForApiJobs()
+    const reopened = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    expect(reopened.body.finalization).toEqual({
+      result: null,
+      selectionLocked: false,
+      status: 'active',
+    })
+    expect(reopened.body.userState).toMatchObject({
+      bundleGroups: [],
+      index: 0,
+      keptUnreadIds: [],
+      processedIds: [],
+      replyDrafts: { [emailId]: replyEditor },
+      secondaryActionIds: [],
+      selectedMemberId: null,
+    })
+  })
+
   it('generates a durable background run ID when the client omits one', async () => {
     const response = await fetch(
       `${baseUrl}/api/reviews`,

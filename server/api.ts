@@ -1251,9 +1251,6 @@ function reanalyzeReview(
   const previousJobs = [snapshotJobs.get(roundId), bundleJobs.get(roundId)].filter(
     (job): job is Promise<void> => Boolean(job),
   )
-  jobControllers
-    .get(roundId)
-    ?.controller.abort(new DOMException('Review analysis superseded.', 'AbortError'))
   let restarted: StoredReviewRound | null
   try {
     restarted = store.reanalyze(roundId, {
@@ -1283,6 +1280,9 @@ function reanalyzeReview(
   if (!restarted) {
     throw new ApiHttpError(409, 'ROUND_REANALYSIS_CONFLICT', 'Die Runde wurde bereits geändert.')
   }
+  jobControllers
+    .get(roundId)
+    ?.controller.abort(new DOMException('Review analysis superseded.', 'AbortError'))
   snapshots.delete(roundId)
   if (previousJobs.length > 0) {
     const transitionEpoch = jobLifecycleEpoch

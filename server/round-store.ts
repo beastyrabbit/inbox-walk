@@ -224,7 +224,7 @@ export class RoundReanalysisConflictError extends Error {
   readonly code = 'ROUND_REANALYSIS_CONFLICT'
 
   constructor(readonly roundId: string) {
-    super(`Review round ${roundId} already contains review progress or is finalized.`)
+    super(`Review round ${roundId} has a locked or inconsistent finalization state.`)
     this.name = 'RoundReanalysisConflictError'
   }
 }
@@ -257,14 +257,23 @@ function reanalysisAllowed(
   emailCount: number,
   finalization: StoredRoundFinalization,
 ) {
-  return (
-    (runStatus === 'ready' || (runStatus === 'failed' && emailCount > 0)) &&
+  const canRestartRun = runStatus === 'ready' || (runStatus === 'failed' && emailCount > 0)
+  const untouchedFinalization =
     reviewStatus === 'active' &&
     finalization.state === 'active' &&
     finalization.finalizeIds.length === 0 &&
     finalization.keepUnreadIds.length === 0 &&
-    finalization.secondaryActionIds.length === 0
-  )
+    finalization.secondaryActionIds.length === 0 &&
+    finalization.succeededIds.length === 0 &&
+    finalization.secondaryActionSucceededIds.length === 0 &&
+    finalization.failed.length === 0 &&
+    finalization.actionFailed.length === 0 &&
+    finalization.result === null
+  const completedFinalization =
+    reviewStatus === 'finalized' &&
+    finalization.state === 'finalized' &&
+    finalization.result?.finalized === true
+  return canRestartRun && (untouchedFinalization || completedFinalization)
 }
 
 export function isStoredReviewRoundReanalyzable(round: StoredReviewRound) {
@@ -1018,18 +1027,33 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
   `)
   const beginReanalysisRow = database.prepare(`
     UPDATE review_round SET
-      run_status = 'analyzing', generation = generation + 1,
+      status = 'active', run_status = 'analyzing', generation = generation + 1,
       analysis_status = ?, analysis_phase = ?, analysis_progress = ?,
       analysis_engine = ?, analysis_model = ?, analysis_thinking_level = ?, analysis_call_count = ?,
       analysis_processed_email_count = ?, analysis_total_email_count = ?,
       analysis_error = ?, analysis_updated_at = ?, updated_at = ?
-    WHERE round_id = ? AND run_status IN ('ready', 'failed')
+    WHERE round_id = ? AND generation = ? AND run_status = ? AND status = ?
   `)
   const resetUserStateForReanalysis = database.prepare(`
     UPDATE review_round_user_state SET
       revision = revision + 1, current_index = 0, bundle_groups_json = '[]',
       selected_member_id = NULL, updated_at = ?
     WHERE round_id = ?
+  `)
+  const resetFinalizedUserStateForReanalysis = database.prepare(`
+    UPDATE review_round_user_state SET
+      revision = revision + 1, current_index = 0, bundle_groups_json = '[]',
+      processed_ids_json = '[]', kept_unread_ids_json = '[]',
+      secondary_action_ids_json = '[]', selected_member_id = NULL, updated_at = ?
+    WHERE round_id = ?
+  `)
+  const resetFinalizationForReanalysis = database.prepare(`
+    UPDATE review_round_finalization SET
+      state = 'active', finalize_ids_json = '[]', keep_unread_ids_json = '[]',
+      secondary_action_ids_json = '[]', succeeded_ids_json = '[]',
+      secondary_action_succeeded_ids_json = '[]', failed_json = '[]',
+      action_failed_json = '[]', result_json = NULL, updated_at = ?
+    WHERE round_id = ? AND state = ?
   `)
   const pruneExpiredRounds = database.prepare(`
     DELETE FROM review_round
@@ -1514,6 +1538,14 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       validateAnalysis(analysis)
       const now = new Date().toISOString()
       const started = transaction(() => {
+        const latest = get(roundId)
+        if (
+          !latest ||
+          latest.generation !== current.generation ||
+          !isStoredReviewRoundReanalyzable(latest)
+        ) {
+          return false
+        }
         const result = beginReanalysisRow.run(
           analysis.status,
           analysis.phase,
@@ -1528,11 +1560,28 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
           now,
           now,
           roundId,
+          latest.generation,
+          latest.runStatus,
+          latest.status,
         )
         if (Number(result.changes) !== 1) return false
+        const finalizationReset = resetFinalizationForReanalysis.run(
+          now,
+          roundId,
+          latest.finalization.state,
+        )
+        if (Number(finalizationReset.changes) !== 1) {
+          throw new RoundReanalysisConflictError(roundId)
+        }
         deleteBundleRun.run(roundId)
         deleteBundleDecisions.run(roundId)
-        resetUserStateForReanalysis.run(now, roundId)
+        const userStateReset =
+          latest.status === 'finalized'
+            ? resetFinalizedUserStateForReanalysis.run(now, roundId)
+            : resetUserStateForReanalysis.run(now, roundId)
+        if (Number(userStateReset.changes) !== 1) {
+          throw new RoundReanalysisConflictError(roundId)
+        }
         return true
       })
       return started ? get(roundId) : null

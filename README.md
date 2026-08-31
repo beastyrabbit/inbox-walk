@@ -17,7 +17,7 @@ Fastmail.
 - Creates a stored run as soon as **Runde starten** is clicked and shows fetch and analysis progress in the rounds table.
 - Enables **Runde öffnen** only after the complete Codex result is stored.
 - Gives every round a stable URL and restores its snapshot, analysis, decisions, and finalization after a browser refresh or app restart.
-- Deletes rounds from the table, cancels abortable fetch or analysis work, and can reanalyze the same frozen snapshot without discarding review decisions or drafts. Reply generation and draft storage block deletion immediately. Finalization blocks it after taking the durable selection lock; if deletion wins the earlier mailbox-context race, finalization stops before changing the mailbox.
+- Deletes rounds from the table, cancels abortable fetch or analysis work, and can reanalyze the same frozen snapshot. An active round keeps its review decisions and drafts. Reanalyzing a completed round clears its old decisions and completion result but keeps reply drafts. Reply generation and draft storage block deletion immediately. Finalization blocks it after taking the durable selection lock; if deletion wins the earlier mailbox-context race, finalization stops before changing the mailbox.
 - Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
 - Can omit messages deliberately kept unread in an earlier round using a small local SQLite history.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
@@ -131,7 +131,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-This source tree describes release `v0.9.0`. Production releases are deployed at
+This source tree describes release `v0.9.1`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

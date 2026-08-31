@@ -4,7 +4,7 @@ Last updated: 2026-08-31
 
 ## Release
 
-`v0.9.0` is the release described by this source tree. Forgejo publishes its
+`v0.9.1` is the release described by this source tree. Forgejo publishes its
 immutable image, and Flux deploys the pinned tag through kub-homelab to
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
@@ -15,6 +15,7 @@ immutable image, and Flux deploys the pinned tag through kub-homelab to
 - [x] Per-original keep-unread controls while Codex owns automatic story grouping.
 - [x] Durable review rounds with immediate IDs, stable URLs, visible backend progress, and ready-to-open gating.
 - [x] Round deletion that cancels active backend work, plus reanalysis of the same frozen snapshot.
+- [x] Safe reanalysis of completed rounds with a fresh review state and preserved reply drafts.
 - [x] Persisted bundle analysis, review decisions, drafts, and finalization across reloads and restarts.
 - [x] Null-safe Fastmail address normalization and resilient gateway error handling.
 - [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.

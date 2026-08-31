@@ -32,7 +32,7 @@ If a body cannot be loaded, that message is protected as unread automatically.
 7. Keep later incoming mail outside the round. Analyze it in a new round.
 8. In live mode, fail visibly when Codex is unavailable or times out. Never silently downgrade the run to local or singleton analysis.
 9. Cover every message in the frozen snapshot. Do not stop analysis at an arbitrary provider-call count.
-10. Deleting a run aborts active snapshot or Codex analysis work. Reply generation and draft storage block deletion immediately. Finalization blocks deletion after it acquires the durable selection lock; if deletion wins before that lock, finalization stops before changing the mailbox. Reanalysis preserves review decisions and drafts unless finalization has already locked the round.
+10. Deleting a run aborts active snapshot or Codex analysis work. Reply generation and draft storage block deletion immediately. Finalization blocks deletion after it acquires the durable selection lock; if deletion wins before that lock, finalization stops before changing the mailbox. Reanalysis of an active round preserves review decisions and drafts. Reanalysis of a completed round reopens it, clears its decisions and finalization result, and preserves reply drafts.
 
 ## Reply contract
 

@@ -837,6 +837,30 @@ test('requires confirmation before finalizing the fixed snapshot', async ({ page
   await expect(page.getByText('Neue Nachrichten seit dem Start')).toBeVisible()
   await page.getByRole('button', { name: 'Änderungen speichern' }).click()
   await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+
+  await page.getByRole('button', { name: 'Runden' }).click()
+  const completed = page.getByRole('row').filter({ hasText: 'Abgeschlossen' }).first()
+  const completedId = await completed.getAttribute('id')
+  expect(completedId).not.toBeNull()
+  if (!completedId) return
+  const completedRow = page.locator(`#${completedId}`)
+  const reanalyze = completedRow.getByRole('button', { name: 'Mit Codex neu analysieren' })
+  await expect(reanalyze).toBeEnabled()
+  const restartedRequest = page.waitForResponse(
+    (response) =>
+      response.request().method() === 'POST' &&
+      /\/api\/reviews\/[^/]+\/reanalyze$/.test(new URL(response.url()).pathname),
+  )
+  await reanalyze.click()
+  const restarted = await restartedRequest
+  expect(restarted.status()).toBe(202)
+  await expect(restarted.json()).resolves.toMatchObject({
+    reviewStatus: 'active',
+    status: 'analyzing',
+  })
+  await expect(completedRow.getByRole('button', { name: 'Runde öffnen' })).toBeEnabled({
+    timeout: 15_000,
+  })
 })
 
 test('can finalize only messages already confirmed with Weiter', async ({ page }) => {
@@ -1133,6 +1157,18 @@ test('selects the Codex model and thinking level in settings', async ({ page }) 
   await page.getByRole('button', { name: 'Einstellungen' }).click()
 
   await expect(page.getByRole('heading', { name: 'Einstellungen' })).toBeVisible()
+  expect(
+    await page
+      .getByLabel('Modell')
+      .locator('option')
+      .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)),
+  ).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])
+  expect(
+    await page
+      .getByLabel('Denkaufwand')
+      .locator('option')
+      .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)),
+  ).toEqual(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
   await expect(page.getByLabel('Modell')).toHaveValue('gpt-5.6-sol')
   await page.getByLabel('Modell').selectOption('gpt-5.6-terra')
   await page.getByLabel('Denkaufwand').selectOption('xhigh')
