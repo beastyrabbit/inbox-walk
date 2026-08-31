@@ -82,6 +82,10 @@ only work without a durable checkpoint may be repeated. Reloading or opening
 a finished round does not run Codex again. Only **Neu analysieren** starts a new
 analysis generation on the same snapshot. Every message in the snapshot is
 covered; there is no per-round provider-call cutoff.
+Each Codex batch is checked against the exact candidate IDs before any decision
+is checkpointed. If cohorts reference IDs outside their own candidates, valid
+cohorts stay saved and each invalid cohort is retried once in an isolated
+request. A second invalid answer fails visibly and is never stored or accepted.
 If a started Codex run later needs a new login, it fails visibly instead of
 silently changing engines. Reconnect Codex and rerun the analysis on the same
 frozen snapshot.
@@ -127,7 +131,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-This source tree describes release `v0.8.0`. Production releases are deployed at
+This source tree describes release `v0.8.1`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

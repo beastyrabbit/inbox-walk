@@ -10,6 +10,7 @@ import { createRoundStore } from './round-store.ts'
 const directories: string[] = []
 
 afterEach(() => {
+  vi.restoreAllMocks()
   for (const directory of directories.splice(0)) rmSync(directory, { force: true, recursive: true })
 })
 
@@ -325,5 +326,512 @@ describe('persisted Codex bundle decisions', () => {
     expect(replayProvider).not.toHaveBeenCalled()
     expect(replay.callCount()).toBe(1)
     reopened.close()
+  })
+
+  it('retries only invalid batch cohorts before checkpointing and then isolates them', async () => {
+    const path = databasePath()
+    const secondSeed = email('seed-2')
+    const secondCandidate = email('candidate-2')
+    const thirdSeed = email('seed-3')
+    const thirdCandidate = email('candidate-3')
+    const cohorts: BundleDecisionCohort[] = [
+      { ...input, cohortId: 'cohort-1' },
+      {
+        candidates: [secondCandidate],
+        cohortId: 'cohort-2',
+        examples: [],
+        seed: [secondSeed],
+      },
+      {
+        candidates: [thirdCandidate],
+        cohortId: 'cohort-3',
+        examples: [],
+        seed: [thirdSeed],
+      },
+    ]
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate, secondSeed, secondCandidate, thirdSeed, thirdCandidate],
+      filters,
+      generation: 4,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const batchProvider = vi.fn(async (missing: readonly BundleDecisionCohort[]) =>
+      missing.map((cohort) => ({
+        ...decision,
+        cohortId: cohort.cohortId,
+        includedEmailIds:
+          cohort.cohortId === 'cohort-1' ? cohort.candidates.map(({ id }) => id) : ['candidate'],
+      })),
+    )
+    const singleProvider = vi.fn(async (cohort: BundleDecisionInput) => ({
+      ...decision,
+      includedEmailIds: cohort.candidates.map(({ id }) => id),
+    }))
+    const retryLog = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: singleProvider,
+      decideBatch: batchProvider,
+      generation: 4,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store,
+    })
+
+    await expect(checkpointed.decideBatch(cohorts)).resolves.toMatchObject([
+      { cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { cohortId: 'cohort-2', includedEmailIds: ['candidate-2'] },
+      { cohortId: 'cohort-3', includedEmailIds: ['candidate-3'] },
+    ])
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(batchProvider.mock.calls[0]?.[0]).toHaveLength(3)
+    expect(singleProvider).toHaveBeenCalledTimes(2)
+    expect(checkpointed.callCount()).toBe(3)
+    expect(
+      retryLog.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>),
+    ).toEqual([
+      {
+        event: 'bundle_decision_contract_retry',
+        generation: 4,
+        invalidCohortCount: 2,
+        roundId: 'round',
+        scope: 'batch',
+      },
+      {
+        event: 'bundle_decision_contract_recovered',
+        generation: 4,
+        invalidCohortCount: 2,
+        roundId: 'round',
+        scope: 'batch',
+      },
+    ])
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const replayBatch = vi.fn(async () => [])
+    const replaySingle = vi.fn(async () => decision)
+    const replay = createCheckpointedBundleDecider({
+      decide: replaySingle,
+      decideBatch: replayBatch,
+      generation: 4,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: () => {},
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(replay.decideBatch(cohorts)).resolves.toMatchObject([
+      { cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { cohortId: 'cohort-2', includedEmailIds: ['candidate-2'] },
+      { cohortId: 'cohort-3', includedEmailIds: ['candidate-3'] },
+    ])
+    expect(replayBatch).not.toHaveBeenCalled()
+    expect(replaySingle).not.toHaveBeenCalled()
+    expect(replay.callCount()).toBe(3)
+    reopened.close()
+  })
+
+  it('fails closed after bounded invalid decisions without poisoning the checkpoint', async () => {
+    const path = databasePath()
+    const secondSeed = email('seed-2')
+    const secondCandidate = email('candidate-2')
+    const cohorts: BundleDecisionCohort[] = [
+      { ...input, cohortId: 'cohort-1' },
+      {
+        candidates: [secondCandidate],
+        cohortId: 'cohort-2',
+        examples: [],
+        seed: [secondSeed],
+      },
+    ]
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate, secondSeed, secondCandidate],
+      filters,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const invalid = { ...decision, includedEmailIds: ['seed'] }
+    const batchProvider = vi.fn(async () => [
+      { ...decision, cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { ...invalid, cohortId: 'cohort-2' },
+    ])
+    const singleProvider = vi.fn(async () => invalid)
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: singleProvider,
+      decideBatch: batchProvider,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store,
+    })
+
+    await expect(checkpointed.decideBatch(cohorts)).rejects.toThrow('outside its candidate set')
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(singleProvider).toHaveBeenCalledOnce()
+    expect(checkpointed.callCount()).toBe(2)
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const validBatch = vi.fn(async (missing: readonly BundleDecisionCohort[]) =>
+      missing.map((cohort) => ({
+        ...decision,
+        cohortId: cohort.cohortId,
+        includedEmailIds: cohort.candidates.map(({ id }) => id),
+      })),
+    )
+    const resumed = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: validBatch,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => reopened.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(resumed.decideBatch(cohorts)).resolves.toMatchObject([
+      { cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { cohortId: 'cohort-2', includedEmailIds: ['candidate-2'] },
+    ])
+    expect(validBatch).toHaveBeenCalledOnce()
+    expect(validBatch.mock.calls[0]?.[0]).toHaveLength(1)
+    expect(validBatch.mock.calls[0]?.[0]?.[0]?.cohortId).toBe('cohort-2')
+    expect(resumed.callCount()).toBe(3)
+    reopened.close()
+  })
+
+  it('keeps valid batch checkpoints when the isolated retry loses authentication', async () => {
+    const path = databasePath()
+    const secondSeed = email('seed-2')
+    const secondCandidate = email('candidate-2')
+    const cohorts: BundleDecisionCohort[] = [
+      { ...input, cohortId: 'cohort-1' },
+      {
+        candidates: [secondCandidate],
+        cohortId: 'cohort-2',
+        examples: [],
+        seed: [secondSeed],
+      },
+    ]
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate, secondSeed, secondCandidate],
+      filters,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const authError = new Error('authentication expired')
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const batchProvider = vi.fn(async () => [
+      { ...decision, cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { ...decision, cohortId: 'cohort-2', includedEmailIds: ['candidate'] },
+    ])
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => {
+        throw authError
+      }),
+      decideBatch: batchProvider,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallRolledBack: (callCount) => store.updateAnalysis('round', { callCount }),
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      shouldRollbackCall: (error) => error === authError,
+      store,
+    })
+
+    await expect(checkpointed.decideBatch(cohorts)).rejects.toBe(authError)
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(checkpointed.callCount()).toBe(1)
+    expect(store.get('round')?.analysis.callCount).toBe(1)
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const remainingProvider = vi.fn(async (missing: readonly BundleDecisionCohort[]) =>
+      missing.map((cohort) => ({
+        ...decision,
+        cohortId: cohort.cohortId,
+        includedEmailIds: cohort.candidates.map(({ id }) => id),
+      })),
+    )
+    const resumed = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: remainingProvider,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => reopened.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(resumed.decideBatch(cohorts)).resolves.toHaveLength(2)
+    expect(remainingProvider).toHaveBeenCalledOnce()
+    expect(remainingProvider.mock.calls[0]?.[0]).toHaveLength(1)
+    expect(remainingProvider.mock.calls[0]?.[0]?.[0]?.cohortId).toBe('cohort-2')
+    expect(resumed.callCount()).toBe(2)
+    reopened.close()
+  })
+
+  it('rejects one invalid direct decision without retrying or checkpointing it', async () => {
+    const path = databasePath()
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate],
+      filters,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const provider = vi.fn(async () => ({ ...decision, includedEmailIds: ['seed'] }))
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: provider,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store,
+    })
+
+    await expect(checkpointed.decide(input)).rejects.toThrow('outside its candidate set')
+    expect(provider).toHaveBeenCalledOnce()
+    expect(checkpointed.callCount()).toBe(1)
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const validProvider = vi.fn(async () => decision)
+    const resumed = createCheckpointedBundleDecider({
+      decide: validProvider,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => reopened.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(resumed.decide(input)).resolves.toEqual(decision)
+    expect(validProvider).toHaveBeenCalledOnce()
+    expect(resumed.callCount()).toBe(2)
+    reopened.close()
+  })
+
+  it('does not checkpoint a batch when its signal is aborted before validation', async () => {
+    const path = databasePath()
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate],
+      filters,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const controller = new AbortController()
+    const batchProvider = vi.fn(async () => {
+      controller.abort(new DOMException('Cancelled', 'AbortError'))
+      return [{ ...decision, cohortId: 'cohort-1' }]
+    })
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: batchProvider,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store,
+    })
+    const cohort: BundleDecisionCohort = { ...input, cohortId: 'cohort-1' }
+
+    await expect(checkpointed.decideBatch([cohort], controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(checkpointed.callCount()).toBe(1)
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const resumedBatch = vi.fn(async () => [{ ...decision, cohortId: 'cohort-1' }])
+    const resumed = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: resumedBatch,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: () => {},
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(resumed.decideBatch([cohort])).resolves.toHaveLength(1)
+    expect(resumedBatch).toHaveBeenCalledOnce()
+    reopened.close()
+  })
+
+  it('does not retry when the analysis generation changes during a batch call', async () => {
+    const path = databasePath()
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate],
+      filters,
+      generation: 1,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const batchProvider = vi.fn(async () => {
+      store.reanalyze('round', {
+        callCount: 0,
+        phase: 'indexing',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+      })
+      return [{ ...decision, cohortId: 'cohort-1', includedEmailIds: ['seed'] }]
+    })
+    const singleProvider = vi.fn(async () => decision)
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: singleProvider,
+      decideBatch: batchProvider,
+      generation: 1,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => {
+        const updated = store.updateAnalysis('round', { callCount }, 1)
+        if (!updated) throw new Error('The analysis generation was superseded.')
+      },
+      roundId: 'round',
+      store,
+    })
+    const cohort: BundleDecisionCohort = { ...input, cohortId: 'cohort-1' }
+
+    await expect(checkpointed.decideBatch([cohort])).rejects.toThrow('generation was superseded')
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(singleProvider).not.toHaveBeenCalled()
+    expect(store.get('round')?.generation).toBe(2)
+    store.close()
+  })
+
+  it('keeps valid checkpoints when the isolated retry is aborted', async () => {
+    const path = databasePath()
+    const secondSeed = email('seed-2')
+    const secondCandidate = email('candidate-2')
+    const cohorts: BundleDecisionCohort[] = [
+      { ...input, cohortId: 'cohort-1' },
+      {
+        candidates: [secondCandidate],
+        cohortId: 'cohort-2',
+        examples: [],
+        seed: [secondSeed],
+      },
+    ]
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate, secondSeed, secondCandidate],
+      filters,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const controller = new AbortController()
+    const batchProvider = vi.fn(async () => [
+      { ...decision, cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { ...decision, cohortId: 'cohort-2', includedEmailIds: ['candidate'] },
+    ])
+    const singleProvider = vi.fn(async () => {
+      controller.abort(new DOMException('Cancelled', 'AbortError'))
+      return { ...decision, includedEmailIds: ['candidate-2'] }
+    })
+    vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: singleProvider,
+      decideBatch: batchProvider,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store,
+    })
+
+    await expect(checkpointed.decideBatch(cohorts, controller.signal)).rejects.toMatchObject({
+      name: 'AbortError',
+    })
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(singleProvider).toHaveBeenCalledOnce()
+    expect(checkpointed.callCount()).toBe(2)
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const remainingProvider = vi.fn(async (missing: readonly BundleDecisionCohort[]) =>
+      missing.map((cohort) => ({
+        ...decision,
+        cohortId: cohort.cohortId,
+        includedEmailIds: cohort.candidates.map(({ id }) => id),
+      })),
+    )
+    const resumed = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: remainingProvider,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => reopened.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(resumed.decideBatch(cohorts)).resolves.toHaveLength(2)
+    expect(remainingProvider).toHaveBeenCalledOnce()
+    expect(remainingProvider.mock.calls[0]?.[0]).toHaveLength(1)
+    expect(remainingProvider.mock.calls[0]?.[0]?.[0]?.cohortId).toBe('cohort-2')
+    expect(resumed.callCount()).toBe(3)
+    reopened.close()
+  })
+
+  it('rejects a legacy poisoned checkpoint without another provider call', async () => {
+    const poisoned = { ...decision, includedEmailIds: ['seed'] }
+    const provider = vi.fn(async () => decision)
+    const getBundleDecision = vi.fn(() => poisoned)
+    const saveBundleDecision = vi.fn(() => decision)
+    const checkpointed = createCheckpointedBundleDecider({
+      decide: provider,
+      initialCallCount: 1,
+      model: 'gpt-5.6-sol',
+      onCallStarted: () => {},
+      roundId: 'round',
+      store: { getBundleDecision, saveBundleDecision },
+    })
+
+    await expect(checkpointed.decide(input)).rejects.toThrow('outside its candidate set')
+    expect(getBundleDecision).toHaveBeenCalledOnce()
+    expect(provider).not.toHaveBeenCalled()
+    expect(saveBundleDecision).not.toHaveBeenCalled()
   })
 })

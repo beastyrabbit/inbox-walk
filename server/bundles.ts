@@ -73,6 +73,23 @@ export interface BundleDecisionResult extends BundleDecision {
   cohortId: string
 }
 
+export class BundleDecisionCandidateError extends Error {
+  constructor() {
+    super('Bundle decision contains an ID outside its candidate set.')
+    this.name = 'BundleDecisionCandidateError'
+  }
+}
+
+export function assertBundleDecisionCandidateMembership(
+  candidates: readonly Pick<ReviewEmailSummary, 'id'>[],
+  includedEmailIds: readonly string[],
+) {
+  const permitted = new Set(candidates.map((email) => email.id))
+  if (includedEmailIds.some((id) => !permitted.has(id))) {
+    throw new BundleDecisionCandidateError()
+  }
+}
+
 export type DecideBundle = (
   input: BundleDecisionInput,
   signal?: AbortSignal,
@@ -815,10 +832,7 @@ export async function buildReviewBundles(
         const roots = cohortRoots.get(cohort.cohortId)
         const decision = decisionsByCohort.get(cohort.cohortId)
         if (!roots || !decision) throw new Error('Bundle cohort disappeared before finalization.')
-        const permitted = new Set(cohort.candidates.map((email) => email.id))
-        if (decision.includedEmailIds.some((id) => !permitted.has(id))) {
-          throw new Error('Bundle decision contains an ID outside its candidate set.')
-        }
+        assertBundleDecisionCandidateMembership(cohort.candidates, decision.includedEmailIds)
         const acceptedRoots = new Set(decision.includedEmailIds.map((id) => union.find(id)))
         const considered = consideredRoots.get(roots.seedRoot) ?? new Set<string>()
         for (const root of roots.candidateRoots) considered.add(root)

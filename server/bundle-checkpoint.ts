@@ -7,6 +7,7 @@ import type {
   DecideBundle,
   DecideBundleBatch,
 } from './bundles.ts'
+import { assertBundleDecisionCandidateMembership, BundleDecisionCandidateError } from './bundles.ts'
 import type { RoundStore } from './round-store.ts'
 
 export interface CheckpointedBundleDecider {
@@ -65,6 +66,7 @@ export function createCheckpointedBundleDecider(options: {
     )
 
   const saveDecision = (input: BundleDecisionInput, decision: BundleDecision) => {
+    assertBundleDecisionCandidateMembership(input.candidates, decision.includedEmailIds)
     const saved = options.store.saveBundleDecision(
       options.roundId,
       decisionKey(input, options.model),
@@ -72,16 +74,56 @@ export function createCheckpointedBundleDecider(options: {
       options.generation,
     )
     if (!saved) throw new Error('The Codex decision could not be persisted.')
+    assertBundleDecisionCandidateMembership(input.candidates, saved.includedEmailIds)
     return saved
+  }
+
+  const reportContractEvent = (
+    event: 'bundle_decision_contract_retry' | 'bundle_decision_contract_recovered',
+    invalidCohortCount: number,
+  ) => {
+    process.stderr.write(
+      `${JSON.stringify({
+        event,
+        generation: options.generation ?? null,
+        invalidCohortCount,
+        roundId: options.roundId,
+        scope: 'batch',
+      })}\n`,
+    )
   }
 
   const decideOne: DecideBundle = async (input, signal) => {
     signal?.throwIfAborted()
     const cached = loadDecision(input)
-    if (cached) return cached
+    if (cached) {
+      assertBundleDecisionCandidateMembership(input.candidates, cached.includedEmailIds)
+      return cached
+    }
     const decision = await callProvider(() => options.decide(input, signal))
     signal?.throwIfAborted()
     return saveDecision(input, decision)
+  }
+
+  const returnedByCohort = (
+    cohorts: readonly BundleDecisionCohort[],
+    returned: readonly BundleDecisionResult[] | undefined,
+  ) => {
+    if (!returned) throw new Error('The Codex batch provider returned no decisions.')
+    const decisions = new Map<string, BundleDecisionResult>()
+    for (const decision of returned) {
+      if (
+        !cohorts.some((cohort) => cohort.cohortId === decision.cohortId) ||
+        decisions.has(decision.cohortId)
+      ) {
+        throw new Error('The Codex batch provider returned an unknown or duplicate cohort ID.')
+      }
+      decisions.set(decision.cohortId, decision)
+    }
+    if (decisions.size !== cohorts.length) {
+      throw new Error('The Codex batch provider did not decide every uncached cohort.')
+    }
+    return decisions
   }
 
   const decideBatch: DecideBundleBatch = async (cohorts, signal) => {
@@ -95,32 +137,36 @@ export function createCheckpointedBundleDecider(options: {
       }
       seenCohortIds.add(cohort.cohortId)
       const cached = loadDecision(cohort)
-      if (cached) decisions.set(cohort.cohortId, cached)
-      else missing.push(cohort)
+      if (cached) {
+        assertBundleDecisionCandidateMembership(cohort.candidates, cached.includedEmailIds)
+        decisions.set(cohort.cohortId, cached)
+      } else missing.push(cohort)
     }
 
     if (missing.length > 0 && options.decideBatch) {
       const batchProvider = options.decideBatch
       const returned = await callProvider(() => batchProvider(missing, signal))
       signal?.throwIfAborted()
-      if (!returned) throw new Error('The Codex batch provider returned no decisions.')
-      const returnedByCohort = new Map<string, BundleDecisionResult>()
-      for (const decision of returned) {
-        if (
-          !missing.some((cohort) => cohort.cohortId === decision.cohortId) ||
-          returnedByCohort.has(decision.cohortId)
-        ) {
-          throw new Error('The Codex batch provider returned an unknown or duplicate cohort ID.')
-        }
-        returnedByCohort.set(decision.cohortId, decision)
-      }
-      if (returnedByCohort.size !== missing.length) {
-        throw new Error('The Codex batch provider did not decide every uncached cohort.')
-      }
+      const batchDecisions = returnedByCohort(missing, returned)
+      const invalid: BundleDecisionCohort[] = []
       for (const cohort of missing) {
-        const decision = returnedByCohort.get(cohort.cohortId)
+        const decision = batchDecisions.get(cohort.cohortId)
         if (!decision) throw new Error('The Codex batch decision disappeared before persistence.')
+        try {
+          assertBundleDecisionCandidateMembership(cohort.candidates, decision.includedEmailIds)
+        } catch (error) {
+          if (!(error instanceof BundleDecisionCandidateError)) throw error
+          invalid.push(cohort)
+          continue
+        }
         decisions.set(cohort.cohortId, saveDecision(cohort, decision))
+      }
+      if (invalid.length > 0) {
+        reportContractEvent('bundle_decision_contract_retry', invalid.length)
+        for (const cohort of invalid) {
+          decisions.set(cohort.cohortId, await decideOne(cohort, signal))
+        }
+        reportContractEvent('bundle_decision_contract_recovered', invalid.length)
       }
     } else {
       for (const cohort of missing) {

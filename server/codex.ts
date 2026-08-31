@@ -339,7 +339,10 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
 
 const bundleToolSchema = Type.Object(
   {
-    includedEmailIds: Type.Array(Type.String({ maxLength: 512 }), { maxItems: 10_000 }),
+    includedEmailIds: Type.Array(Type.String({ maxLength: 512 }), {
+      description: 'Only exact IDs from candidates; never return an ID from seed.',
+      maxItems: 10_000,
+    }),
     kind: Type.Union([
       Type.Literal('development_workstream'),
       Type.Literal('order_delivery'),
@@ -362,7 +365,11 @@ const bundleBatchToolSchema = Type.Object(
       Type.Object(
         {
           cohortId: Type.String({ maxLength: 100 }),
-          includedEmailIds: Type.Array(Type.String({ maxLength: 512 }), { maxItems: 10_000 }),
+          includedEmailIds: Type.Array(Type.String({ maxLength: 512 }), {
+            description:
+              'Only exact IDs from the candidates array in this same cohort; never return an ID from seed or another cohort.',
+            maxItems: 10_000,
+          }),
           kind: Type.Union([
             Type.Literal('development_workstream'),
             Type.Literal('order_delivery'),
@@ -394,6 +401,7 @@ function bundlePrompt(input: BundleDecisionInput) {
     threadId: email.threadId,
   })
   return JSON.stringify({
+    allowedIncludedEmailIds: input.candidates.map((email) => email.id),
     seed: input.seed.map(summary),
     candidates: input.candidates.map(summary),
     confirmedExamples: input.examples,

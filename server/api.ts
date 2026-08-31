@@ -2157,7 +2157,9 @@ function startBundleJob(
         process.stderr.write(
           `${JSON.stringify({
             event: 'bundle_analysis_failed',
+            generation: jobContext.expectedGeneration ?? snapshot.generation,
             message: error instanceof Error ? error.message : 'unknown',
+            roundId: snapshotId,
           })}\n`,
         )
         snapshot.bundleRun = undefined

@@ -2,7 +2,7 @@
 
 ## Production contract
 
-- Release described by this source tree: `v0.8.0`
+- Release described by this source tree: `v0.8.1`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -48,6 +48,12 @@ round's provider calls.
 Every message in a frozen round is covered by bundle analysis. Completed
 decisions are checkpointed for restart recovery; there is no per-round call
 cutoff.
+Batch decisions are validated against each cohort's candidate allowlist before
+they are checkpointed. Valid cohorts remain durable when other cohorts violate
+that contract. Each invalid cohort gets one isolated provider retry; a second
+invalid response fails the run without saving or accepting the bad decision.
+A batch can contain up to eight cohorts, so a fully invalid batch can add up to
+eight isolated calls before the run either recovers or fails closed.
 The inference timeout applies to one provider request. A timeout marks the
 stored run failed; it does not truncate the snapshot or switch to a local
 result. The same snapshot remains available for explicit reanalysis.
@@ -60,6 +66,10 @@ Complete rounds remain available. A legacy round whose frozen snapshot is
 missing messages is marked failed, and its stale grouping result and Codex
 checkpoints are removed. `CODEX_BUNDLE_MAX_CALLS` is no longer read and can be
 removed from local configuration.
+
+Upgrading from `v0.8.0` requires no schema migration. Explicitly reanalyze any
+round that failed with a candidate-membership error under `v0.8.0`; reanalysis
+increments its generation and atomically removes the old decision checkpoints.
 
 `bundle-learning.sqlite` can retain hashed relationship signals created by
 older releases. It does not store message bodies, previews, or attachment

@@ -4,7 +4,7 @@ Last updated: 2026-08-31
 
 ## Release
 
-`v0.8.0` is the release described by this source tree. Forgejo publishes its
+`v0.8.1` is the release described by this source tree. Forgejo publishes its
 immutable image, and Flux deploys the pinned tag through kub-homelab to
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
@@ -30,6 +30,7 @@ immutable image, and Flux deploys the pinned tag through kub-homelab to
 - [x] Full-thread assisted replies with automatic all-attachment handling.
 - [x] Codex connection, Sol/Terra/Luna model selection, and thinking level in Settings.
 - [x] Complete snapshot analysis without a per-round provider-call cutoff.
+- [x] Candidate-allowlisted Codex checkpoints with an isolated retry for an invalid batch cohort.
 - [x] Editable and revisable reply text with selectable identity and recipients.
 - [x] Verified Fastmail draft construction with no send-mail path.
 - [x] Unit, API, security-contract, desktop, and mobile browser tests.
