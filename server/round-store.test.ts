@@ -99,7 +99,7 @@ function databaseArtifacts(databasePath: string) {
 function createRound(databasePath: string) {
   const store = createRoundStore(databasePath)
   const round = store.create({
-    bundleCallLimit: 17,
+    analysis: { model: 'gpt-5.6-sol', thinkingLevel: 'xhigh' },
     bundleExamples: [rawBundleExample],
     csrfToken: 'csrf-token',
     emails,
@@ -107,9 +107,8 @@ function createRound(databasePath: string) {
     id: 'round-1',
     imageToken: 'image-token',
     mailboxes: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }],
-    missingIds: ['gone-mail'],
     mode: 'demo',
-    totalBeforeLimit: 3,
+    totalBeforeLimit: 2,
     truncated: false,
   })
   return { round, store }
@@ -178,15 +177,16 @@ describe('SQLite review round store', () => {
     const { round, store } = createRound(databasePath)
 
     expect(round.id).toBe('round-1')
-    expect(round.bundleCallLimit).toBe(17)
     expect(round.bundleExamples).toEqual([storedBundleExample])
     expect(round.analysis).toMatchObject({
       callCount: 0,
+      model: 'gpt-5.6-sol',
       phase: 'queued',
       processedEmailCount: 0,
       progress: 0,
       status: 'pending',
       totalEmailCount: 2,
+      thinkingLevel: 'xhigh',
     })
     expect(round.userState).toEqual({
       bundleGroups: [],
@@ -198,6 +198,13 @@ describe('SQLite review round store', () => {
       secondaryActionIds: [],
       selectedMemberId: null,
     })
+    expect(store.list()).toEqual([
+      expect.objectContaining({
+        id: 'round-1',
+        incompleteSnapshot: false,
+        reanalyzable: true,
+      }),
+    ])
 
     store.updateAnalysis('round-1', {
       callCount: 3,
@@ -230,13 +237,13 @@ describe('SQLite review round store', () => {
       state: 'active',
       succeededIds: [],
     })
+    expect(store.list()).toEqual([expect.objectContaining({ id: 'round-1', reanalyzable: false })])
     store.close()
 
     const reopened = createRoundStore(databasePath)
     const restored = reopened.get('round-1')
     expect(restored).not.toBeNull()
     expect(restored).toMatchObject({
-      bundleCallLimit: 17,
       bundleRun: bundleRun(),
       bundleExamples: [storedBundleExample],
       csrfToken: 'csrf-token',
@@ -245,15 +252,16 @@ describe('SQLite review round store', () => {
       id: 'round-1',
       imageToken: 'image-token',
       mailboxes: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }],
-      missingIds: ['gone-mail'],
+      missingIds: [],
       mode: 'demo',
-      totalBeforeLimit: 3,
+      totalBeforeLimit: 2,
       truncated: false,
     })
     expect(restored?.analysis).toMatchObject({
       callCount: 3,
       engine: 'codex',
       model: 'gpt-5.6-sol',
+      thinkingLevel: 'xhigh',
       phase: 'complete',
       processedEmailCount: 2,
       progress: 1,
@@ -292,7 +300,6 @@ describe('SQLite review round store', () => {
     legacy.exec(`
       DROP TABLE review_round_bundle_decision;
       ALTER TABLE review_round DROP COLUMN bundle_examples_json;
-      ALTER TABLE review_round DROP COLUMN bundle_call_limit;
       UPDATE inbox_walk_round_store_schema SET version = 1 WHERE singleton = 1;
     `)
     legacy.close()
@@ -310,7 +317,6 @@ describe('SQLite review round store', () => {
     expect(migrated.saveBundleDecision('round-1', 'decision-key', decision)).toEqual(decision)
     expect(migrated.getBundleDecision('round-1', 'decision-key')).toEqual(decision)
     expect(migrated.get('round-1')?.bundleExamples).toEqual([])
-    expect(migrated.get('round-1')?.bundleCallLimit).toBe(64)
     migrated.close()
 
     const inspected = new DatabaseSync(databasePath)
@@ -322,8 +328,238 @@ describe('SQLite review round store', () => {
             .get() as { version: number | bigint }
         ).version,
       ),
-    ).toBe(4)
+    ).toBe(7)
+    expect(
+      (
+        inspected.prepare('PRAGMA table_info(review_round)').all() as unknown as Array<{
+          name: string
+        }>
+      ).some(({ name }) => name === 'bundle_call_limit'),
+    ).toBe(false)
     inspected.close()
+  })
+
+  it('keeps incomplete snapshots failed even when callers try to make them ready', () => {
+    const store = createRoundStore(':memory:')
+    const incomplete = store.create({
+      analysis: {
+        phase: 'complete',
+        processedEmailCount: emails.length,
+        progress: 1,
+        status: 'complete',
+        totalEmailCount: emails.length,
+      },
+      csrfToken: 'incomplete-csrf',
+      emails,
+      filters,
+      id: 'incomplete-round',
+      imageToken: 'incomplete-image',
+      mailboxes: [],
+      missingIds: ['gone-mail'],
+      mode: 'demo',
+      runStatus: 'ready',
+      totalBeforeLimit: 3,
+    })
+
+    expect(incomplete).toMatchObject({
+      bundleRun: null,
+      runStatus: 'failed',
+      analysis: {
+        phase: 'failed',
+        status: 'pending',
+      },
+    })
+    expect(store.list()).toEqual([
+      expect.objectContaining({
+        id: 'incomplete-round',
+        incompleteSnapshot: true,
+        reanalyzable: false,
+      }),
+    ])
+
+    expect(
+      store.saveBundleRun('incomplete-round', {
+        ...bundleRun(),
+        snapshotId: 'incomplete-round',
+      }),
+    ).toBeNull()
+    expect(store.get('incomplete-round')).toMatchObject({
+      bundleRun: null,
+      runStatus: 'failed',
+      analysis: {
+        phase: 'failed',
+        status: 'pending',
+      },
+    })
+
+    expect(
+      store.updateRunStatus('incomplete-round', incomplete.generation, 'ready', {
+        phase: 'complete',
+        status: 'complete',
+      }),
+    ).toMatchObject({
+      runStatus: 'failed',
+      analysis: {
+        phase: 'failed',
+        status: 'pending',
+      },
+    })
+    store.close()
+  })
+
+  it('migrates incomplete v6 snapshots to a fail-closed lifecycle state', () => {
+    const databasePath = createDatabasePath()
+    const { store } = createRound(databasePath)
+    store.saveBundleRun('round-1', bundleRun())
+    store.saveBundleDecision('round-1', 'stale-decision', {
+      currentState: 'Ready',
+      includedEmailIds: ['mail-2'],
+      kind: 'conversation',
+      linkEvidence: ['same conversation'],
+      membershipConfidence: 0.9,
+      summary: 'Related messages.',
+      title: 'Conversation',
+    })
+    store.close()
+
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec(`
+      UPDATE review_round
+      SET
+        missing_ids_json = '["gone-mail"]',
+        run_status = 'ready',
+        analysis_status = 'complete',
+        analysis_phase = 'complete',
+        analysis_error = NULL
+      WHERE round_id = 'round-1';
+      UPDATE inbox_walk_round_store_schema SET version = 6 WHERE singleton = 1;
+    `)
+    legacy.close()
+
+    const migrated = createRoundStore(databasePath)
+    expect(migrated.get('round-1')).toMatchObject({
+      bundleRun: null,
+      missingIds: ['gone-mail'],
+      runStatus: 'failed',
+      analysis: {
+        phase: 'failed',
+        status: 'pending',
+      },
+    })
+    expect(migrated.list()).toEqual([
+      expect.objectContaining({ id: 'round-1', reanalyzable: false, runStatus: 'failed' }),
+    ])
+    expect(migrated.getBundleDecision('round-1', 'stale-decision')).toBeNull()
+    migrated.close()
+  })
+
+  it('migrates v4 lifecycle state without exposing incomplete analysis as ready', () => {
+    const databasePath = createDatabasePath()
+    const store = createRoundStore(databasePath)
+    store.create({
+      csrfToken: 'pending-csrf',
+      emails: [emails[0] as ReviewEmailSummary],
+      filters,
+      id: 'pending-round',
+      imageToken: 'pending-image',
+      mailboxes: [],
+      mode: 'demo',
+    })
+    store.create({
+      csrfToken: 'ready-csrf',
+      emails,
+      filters,
+      id: 'ready-round',
+      imageToken: 'ready-image',
+      mailboxes: [],
+      mode: 'demo',
+    })
+    store.saveBundleRun('ready-round', { ...bundleRun(), snapshotId: 'ready-round' })
+    store.close()
+
+    const legacy = new DatabaseSync(databasePath)
+    legacy.exec(`
+      ALTER TABLE review_round DROP COLUMN analysis_thinking_level;
+      ALTER TABLE review_round DROP COLUMN generation;
+      ALTER TABLE review_round DROP COLUMN run_status;
+      UPDATE inbox_walk_round_store_schema SET version = 4 WHERE singleton = 1;
+    `)
+    legacy.close()
+
+    const migrated = createRoundStore(databasePath)
+    expect(migrated.get('ready-round')?.runStatus).toBe('ready')
+    expect(migrated.get('pending-round')?.runStatus).toBe('analyzing')
+    migrated.close()
+  })
+
+  it('atomically populates, resets, and deletes a generation-guarded background run', () => {
+    const store = createRoundStore(':memory:')
+    const stub = store.create({
+      analysis: { phase: 'queued', totalEmailCount: 0 },
+      csrfToken: 'background-csrf',
+      emails: [],
+      filters,
+      generation: 1,
+      id: 'background-round',
+      imageToken: 'background-image',
+      mailboxes: [],
+      mode: 'demo',
+      runStatus: 'queued',
+    })
+    expect(stub.runStatus).toBe('queued')
+    expect(
+      store.populate('background-round', 0, {
+        analysis: {},
+        emails,
+        mailboxes: [],
+      }),
+    ).toBeNull()
+    const populated = store.populate('background-round', 1, {
+      analysis: {
+        phase: 'indexing',
+        status: 'pending',
+        totalEmailCount: emails.length,
+      },
+      emails,
+      mailboxes: [{ id: 'inbox', name: 'Inbox' }],
+    })
+    expect(populated).toMatchObject({ generation: 1, runStatus: 'analyzing' })
+    store.saveBundleRun(
+      'background-round',
+      { ...bundleRun(), snapshotId: 'background-round' },
+      {},
+      1,
+    )
+    const withProgress = store.updateUserState('background-round', 0, {
+      bundleGroups: [['mail-1'], ['mail-2']],
+      index: 1,
+      keptUnreadIds: ['mail-1'],
+      processedIds: ['mail-1'],
+      replyDrafts: { 'mail-1': replyDraft },
+      secondaryActionIds: [],
+      selectedMemberId: 'mail-1',
+    })
+    expect(withProgress.userState.revision).toBe(1)
+    const restarted = store.reanalyze('background-round', {
+      callCount: 0,
+      phase: 'indexing',
+      processedEmailCount: 0,
+      progress: 0,
+      status: 'pending',
+    })
+    expect(restarted).toMatchObject({ generation: 2, runStatus: 'analyzing' })
+    expect(restarted?.userState.bundleGroups).toEqual([])
+    expect(restarted?.userState).toMatchObject({
+      index: 0,
+      keptUnreadIds: ['mail-1'],
+      processedIds: ['mail-1'],
+      replyDrafts: { 'mail-1': replyDraft },
+      revision: 2,
+      selectedMemberId: null,
+    })
+    expect(store.delete('background-round')).toBe(true)
+    expect(store.get('background-round')).toBeNull()
+    store.close()
   })
 
   it('normalizes null address names from legacy persisted rounds and reply drafts', () => {

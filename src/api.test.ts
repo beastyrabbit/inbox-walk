@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, ClientApiError } from './api.ts'
+import { defaultReviewFilters, type ReviewRunSummary } from './shared.ts'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -105,5 +106,158 @@ describe('API response handling', () => {
       code: 'NETWORK_ERROR',
       retryable: true,
     })
+  })
+})
+
+describe('round lifecycle API', () => {
+  const run: ReviewRunSummary = {
+    analysis: {
+      callCount: 0,
+      engine: 'codex',
+      model: 'gpt-5.6-sol',
+      phase: 'queued',
+      processedEmailCount: 0,
+      progress: 0,
+      status: 'pending',
+      thinkingLevel: 'high',
+      totalEmailCount: 0,
+    },
+    createdAt: '2026-08-31T10:00:00.000Z',
+    csrfToken: 'csrf-round-1',
+    emailCount: 0,
+    filters: defaultReviewFilters,
+    generation: 1,
+    id: 'round-1',
+    mode: 'live',
+    reanalyzable: false,
+    reviewStatus: 'active',
+    status: 'queued',
+    updatedAt: '2026-08-31T10:00:00.000Z',
+  }
+
+  it('creates an idempotent run with the client-generated ID', async () => {
+    const fetchMock = vi.fn(async () =>
+      Promise.resolve(
+        new Response(JSON.stringify(run), {
+          status: 202,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.createReview(run.id, defaultReviewFilters)).resolves.toEqual(run)
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/reviews',
+      expect.objectContaining({
+        body: JSON.stringify({ id: run.id, filters: defaultReviewFilters }),
+        keepalive: true,
+        method: 'POST',
+      }),
+    )
+  })
+
+  it('resumes a legacy stable snapshot by its exact message IDs', async () => {
+    const id = '550e8400-e29b-41d4-a716-446655440000'
+    const resumed = {
+      csrfToken: 'csrf-migrated',
+      id,
+    }
+    const fetchMock = vi.fn(async () =>
+      Promise.resolve(
+        new Response(JSON.stringify(resumed), {
+          status: 202,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.resumeReview(id, ['mail-1', 'mail-2'], defaultReviewFilters)).resolves.toEqual(
+      resumed,
+    )
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/reviews/resume',
+      expect.objectContaining({
+        body: JSON.stringify({
+          id,
+          emailIds: ['mail-1', 'mail-2'],
+          filters: defaultReviewFilters,
+        }),
+        method: 'POST',
+      }),
+    )
+  })
+
+  it('lists compact runs without loading review snapshots', async () => {
+    respond(JSON.stringify({ runs: [run] }))
+
+    await expect(api.reviewRuns()).resolves.toEqual({ runs: [run] })
+  })
+
+  it('deletes a run with its CSRF token and accepts an empty 204 response', async () => {
+    const fetchMock = vi.fn(async () => Promise.resolve(new Response(null, { status: 204 })))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.deleteReview(run)).resolves.toBeUndefined()
+    expect(fetchMock).toHaveBeenCalledWith(`/api/reviews/${run.id}`, {
+      method: 'DELETE',
+      headers: { 'X-Inbox-Walk-CSRF': run.csrfToken },
+    })
+  })
+
+  it('starts a fresh Codex analysis for the persisted run', async () => {
+    const next = {
+      ...run,
+      analysis: { ...run.analysis, phase: 'indexing', status: 'running' as const },
+      generation: 2,
+      status: 'analyzing' as const,
+    }
+    const fetchMock = vi.fn(async () =>
+      Promise.resolve(
+        new Response(JSON.stringify(next), {
+          status: 202,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.reanalyzeReview(run)).resolves.toEqual(next)
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/reviews/${run.id}/reanalyze`,
+      expect.objectContaining({
+        method: 'POST',
+        headers: expect.objectContaining({ 'X-Inbox-Walk-CSRF': run.csrfToken }),
+      }),
+    )
+  })
+
+  it('saves model and thinking level together', async () => {
+    const settings = {
+      configured: true,
+      model: 'gpt-5.6-terra' as const,
+      source: 'stored' as const,
+      thinkingLevel: 'xhigh' as const,
+    }
+    const fetchMock = vi.fn(async () =>
+      Promise.resolve(
+        new Response(JSON.stringify(settings), {
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetchMock)
+
+    await expect(api.updateCodexSettings(settings.model, settings.thinkingLevel)).resolves.toEqual(
+      settings,
+    )
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/settings/codex',
+      expect.objectContaining({
+        body: JSON.stringify({ model: settings.model, thinkingLevel: settings.thinkingLevel }),
+        method: 'PUT',
+      }),
+    )
   })
 })

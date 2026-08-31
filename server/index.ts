@@ -3,7 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, normalize, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
-import { createApiMiddleware, waitForApiJobs } from './api.ts'
+import { abortApiJobs, createApiMiddleware, waitForApiJobs } from './api.ts'
 import { createBundleStore } from './bundle-store.ts'
 import { ensureCodexStorageReady } from './codex.ts'
 import { createReviewHistory } from './review-history.ts'
@@ -169,6 +169,7 @@ function shutdown(signal: string) {
   if (shuttingDown) return
   shuttingDown = true
   process.stdout.write(`Inbox Walk received ${signal}; shutting down\n`)
+  abortApiJobs()
   server.close((error) => {
     void waitForApiJobs().finally(() => {
       reviewHistory.close()

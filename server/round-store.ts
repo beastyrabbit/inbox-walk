@@ -21,18 +21,30 @@ const { DatabaseSync } = createRequire(import.meta.url)(
   'node:sqlite',
 ) as typeof import('node:sqlite')
 
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 7
 const MAX_STORED_ROUNDS = 200
 const MAX_BUNDLE_EXAMPLES = 100
 const MAX_BUNDLE_EXAMPLE_SIGNALS = 100
 const ROUND_PRUNE_INTERVAL_MS = 60 * 1000
 const REVIEW_CONFIRMED_BUNDLE_REASON = 'Vom Nutzer im Review bestätigt.'
+const INCOMPLETE_SNAPSHOT_ERROR =
+  'Der gespeicherte Nachrichtensnapshot ist unvollständig und kann nicht analysiert werden.'
 
 export type ReviewRoundStatus = 'active' | 'finalizing' | 'finalized'
+export type ReviewRunStatus = 'queued' | 'fetching' | 'analyzing' | 'ready' | 'failed'
+export type StoredCodexThinkingLevel =
+  | 'off'
+  | 'minimal'
+  | 'low'
+  | 'medium'
+  | 'high'
+  | 'xhigh'
+  | 'max'
 export type RoundAnalysisStatus = ReviewAnalysisStatus
 export type RoundAnalysisEngine = ReviewAnalysisEngine
 
 export interface StoredRoundAnalysis extends ReviewAnalysisState {
+  thinkingLevel?: StoredCodexThinkingLevel
   updatedAt: string
 }
 
@@ -78,18 +90,19 @@ export type RoundFinalizationUpdate = Partial<Omit<StoredRoundFinalization, 'upd
 
 export interface StoredReviewRound {
   analysis: StoredRoundAnalysis
-  bundleCallLimit: number
   bundleExamples: BundleExample[]
   bundleRun: ReviewBundleRun | null
   createdAt: string
   csrfToken: string
   emails: ReviewEmailSummary[]
   filters: ReviewFilters
+  generation: number
   id: string
   imageToken: string
   mailboxes: MailboxOption[]
   missingIds: string[]
   mode: 'demo' | 'live'
+  runStatus: ReviewRunStatus
   finalization: StoredRoundFinalization
   status: ReviewRoundStatus
   totalBeforeLimit: number
@@ -100,44 +113,103 @@ export interface StoredReviewRound {
 
 export interface CreateReviewRoundInput {
   analysis?: Partial<Omit<StoredRoundAnalysis, 'updatedAt'>>
-  bundleCallLimit?: number
   bundleExamples?: BundleExample[]
   csrfToken: string
   emails: ReviewEmailSummary[]
   filters: ReviewFilters
+  generation?: number
   id?: string
   imageToken: string
   mailboxes: MailboxOption[]
   missingIds?: string[]
   mode: 'demo' | 'live'
+  runStatus?: ReviewRunStatus
   status?: ReviewRoundStatus
   totalBeforeLimit?: number
   truncated?: boolean
   userState?: Partial<Omit<StoredRoundUserState, 'revision'>>
 }
 
+export interface PopulateReviewRoundInput {
+  analysis: RoundAnalysisUpdate
+  emails: ReviewEmailSummary[]
+  mailboxes: MailboxOption[]
+  missingIds?: string[]
+  totalBeforeLimit?: number
+  truncated?: boolean
+}
+
+export interface StoredReviewRunSummary {
+  analysis: StoredRoundAnalysis
+  createdAt: string
+  csrfToken: string
+  emailCount: number
+  filters: ReviewFilters
+  generation: number
+  id: string
+  incompleteSnapshot: boolean
+  mode: 'demo' | 'live'
+  reanalyzable: boolean
+  reviewStatus: ReviewRoundStatus
+  runStatus: ReviewRunStatus
+  updatedAt: string
+}
+
 export interface RoundStore {
   close(): void
   create(input: CreateReviewRoundInput): StoredReviewRound
-  getBundleDecision(roundId: string, decisionKey: string): BundleDecision | null
+  delete(roundId: string): boolean
+  getBundleDecision(
+    roundId: string,
+    decisionKey: string,
+    expectedGeneration?: number,
+  ): BundleDecision | null
   get(roundId: string): StoredReviewRound | null
+  list(): StoredReviewRunSummary[]
+  populate(
+    roundId: string,
+    expectedGeneration: number,
+    input: PopulateReviewRoundInput,
+  ): StoredReviewRound | null
+  reanalyze(roundId: string, analysis: RoundAnalysisUpdate): StoredReviewRound | null
   saveBundleRun(
     roundId: string,
     bundleRun: ReviewBundleRun,
     analysis?: RoundAnalysisUpdate,
+    expectedGeneration?: number,
   ): StoredReviewRound | null
   saveBundleDecision(
     roundId: string,
     decisionKey: string,
     decision: BundleDecision,
+    expectedGeneration?: number,
   ): BundleDecision | null
   saveFinalization(roundId: string, finalization: RoundFinalizationUpdate): StoredReviewRound | null
-  updateAnalysis(roundId: string, analysis: RoundAnalysisUpdate): StoredReviewRound | null
+  updateAnalysis(
+    roundId: string,
+    analysis: RoundAnalysisUpdate,
+    expectedGeneration?: number,
+  ): StoredReviewRound | null
+  updateRunStatus(
+    roundId: string,
+    expectedGeneration: number,
+    status: ReviewRunStatus,
+    analysis?: RoundAnalysisUpdate,
+  ): StoredReviewRound | null
   updateUserState(
     roundId: string,
     expectedRevision: number,
     state: RoundUserStateUpdate,
   ): StoredReviewRound
+}
+
+export class RoundReanalysisConflictError extends Error {
+  readonly code = 'ROUND_REANALYSIS_CONFLICT'
+
+  constructor(readonly roundId: string) {
+    super(`Review round ${roundId} already contains review progress or is finalized.`)
+    this.name = 'RoundReanalysisConflictError'
+  }
 }
 
 export class RoundNotFoundError extends Error {
@@ -162,6 +234,29 @@ export class RoundRevisionConflictError extends Error {
   }
 }
 
+function reanalysisAllowed(
+  runStatus: ReviewRunStatus,
+  reviewStatus: ReviewRoundStatus,
+  emailCount: number,
+  finalization: StoredRoundFinalization,
+) {
+  return (
+    (runStatus === 'ready' || (runStatus === 'failed' && emailCount > 0)) &&
+    reviewStatus === 'active' &&
+    finalization.state === 'active' &&
+    finalization.finalizeIds.length === 0 &&
+    finalization.keepUnreadIds.length === 0 &&
+    finalization.secondaryActionIds.length === 0
+  )
+}
+
+export function isStoredReviewRoundReanalyzable(round: StoredReviewRound) {
+  return (
+    round.missingIds.length === 0 &&
+    reanalysisAllowed(round.runStatus, round.status, round.emails.length, round.finalization)
+  )
+}
+
 interface RoundRow {
   analysis_call_count: number | bigint
   analysis_engine: RoundAnalysisEngine
@@ -171,18 +266,20 @@ interface RoundRow {
   analysis_processed_email_count: number | bigint
   analysis_progress: number
   analysis_status: RoundAnalysisStatus
+  analysis_thinking_level: StoredCodexThinkingLevel | null
   analysis_total_email_count: number | bigint
   analysis_updated_at: string
-  bundle_call_limit: number | bigint
   bundle_examples_json: string
   created_at: string
   csrf_token: string
   filters_json: string
+  generation: number | bigint
   image_token: string
   mailboxes_json: string
   missing_ids_json: string
   mode: 'demo' | 'live'
   round_id: string
+  run_status: ReviewRunStatus
   status: ReviewRoundStatus
   total_before_limit: number | bigint
   truncated: number | bigint
@@ -603,6 +700,129 @@ function runMigration(database: InstanceType<typeof DatabaseSync>) {
         UPDATE inbox_walk_round_store_schema SET version = 4 WHERE singleton = 1;
       `)
       database.exec('COMMIT')
+      version = 4
+    } catch (error) {
+      database.exec('ROLLBACK')
+      throw error
+    }
+  }
+
+  if (version < 5) {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      const columns = new Set(
+        (
+          database.prepare('PRAGMA table_info(review_round)').all() as unknown as Array<{
+            name: string
+          }>
+        ).map(({ name }) => name),
+      )
+      if (!columns.has('run_status')) {
+        database.exec(`
+          ALTER TABLE review_round
+            ADD COLUMN run_status TEXT NOT NULL DEFAULT 'ready'
+            CHECK (run_status IN ('queued', 'fetching', 'analyzing', 'ready', 'failed'));
+        `)
+      }
+      if (!columns.has('generation')) {
+        database.exec(`
+          ALTER TABLE review_round
+            ADD COLUMN generation INTEGER NOT NULL DEFAULT 0
+            CHECK (generation >= 0);
+        `)
+      }
+      if (!columns.has('analysis_thinking_level')) {
+        database.exec(`
+          ALTER TABLE review_round
+            ADD COLUMN analysis_thinking_level TEXT
+            CHECK (
+              analysis_thinking_level IS NULL OR
+              analysis_thinking_level IN ('off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+            );
+        `)
+      }
+      database.exec(`
+        DELETE FROM review_bundle_run
+        WHERE round_id IN (
+          SELECT round_id FROM review_round WHERE json_array_length(missing_ids_json) > 0
+        );
+
+        DELETE FROM review_round_bundle_decision
+        WHERE round_id IN (
+          SELECT round_id FROM review_round WHERE json_array_length(missing_ids_json) > 0
+        );
+
+        UPDATE review_round
+        SET run_status = CASE
+          WHEN analysis_status = 'complete' AND EXISTS (
+            SELECT 1 FROM review_bundle_run WHERE review_bundle_run.round_id = review_round.round_id
+          ) THEN 'ready'
+          WHEN EXISTS (
+            SELECT 1 FROM review_round_message WHERE review_round_message.round_id = review_round.round_id
+          ) THEN 'analyzing'
+          ELSE 'failed'
+        END;
+      `)
+      database.exec('UPDATE inbox_walk_round_store_schema SET version = 5 WHERE singleton = 1')
+      database.exec('COMMIT')
+      version = 5
+    } catch (error) {
+      database.exec('ROLLBACK')
+      throw error
+    }
+  }
+  if (version < 6) {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      const columns = new Set(
+        (
+          database.prepare('PRAGMA table_info(review_round)').all() as unknown as Array<{
+            name: string
+          }>
+        ).map(({ name }) => name),
+      )
+      if (columns.has('bundle_call_limit')) {
+        database.exec('ALTER TABLE review_round DROP COLUMN bundle_call_limit')
+      }
+      database.exec('UPDATE inbox_walk_round_store_schema SET version = 6 WHERE singleton = 1')
+      database.exec('COMMIT')
+      version = 6
+    } catch (error) {
+      database.exec('ROLLBACK')
+      throw error
+    }
+  }
+  if (version < 7) {
+    database.exec('BEGIN IMMEDIATE')
+    try {
+      database.exec(`
+        DELETE FROM review_bundle_run
+        WHERE round_id IN (
+          SELECT round_id FROM review_round WHERE json_array_length(missing_ids_json) > 0
+        );
+
+        DELETE FROM review_round_bundle_decision
+        WHERE round_id IN (
+          SELECT round_id FROM review_round WHERE json_array_length(missing_ids_json) > 0
+        );
+
+        UPDATE review_round
+        SET
+          run_status = 'failed',
+          analysis_status = 'pending',
+          analysis_phase = 'failed',
+          analysis_error = COALESCE(
+            analysis_error,
+            'Der gespeicherte Nachrichtensnapshot ist unvollständig.'
+          ),
+          analysis_updated_at = datetime('now'),
+          updated_at = datetime('now')
+        WHERE json_array_length(missing_ids_json) > 0;
+
+        UPDATE inbox_walk_round_store_schema SET version = 7 WHERE singleton = 1;
+      `)
+      database.exec('COMMIT')
+      version = 7
     } catch (error) {
       database.exec('ROLLBACK')
       throw error
@@ -632,12 +852,13 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     INSERT INTO review_round (
       round_id, mode, status, filters_json, mailboxes_json, csrf_token, image_token,
       total_before_limit, truncated, missing_ids_json, bundle_examples_json,
-      bundle_call_limit,
+      run_status, generation,
       analysis_status, analysis_phase,
-      analysis_progress, analysis_engine, analysis_model, analysis_call_count,
+      analysis_progress, analysis_engine, analysis_model, analysis_thinking_level,
+      analysis_call_count,
       analysis_processed_email_count, analysis_total_email_count, analysis_error,
       analysis_updated_at, created_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `)
   const insertMessage = database.prepare(`
     INSERT INTO review_round_message (
@@ -690,10 +911,18 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
   const updateAnalysisRow = database.prepare(`
     UPDATE review_round SET
       analysis_status = ?, analysis_phase = ?, analysis_progress = ?,
-      analysis_engine = ?, analysis_model = ?, analysis_call_count = ?,
+      analysis_engine = ?, analysis_model = ?, analysis_thinking_level = ?, analysis_call_count = ?,
       analysis_processed_email_count = ?, analysis_total_email_count = ?,
       analysis_error = ?, analysis_updated_at = ?, updated_at = ?
     WHERE round_id = ?
+  `)
+  const updateAnalysisRowForGeneration = database.prepare(`
+    UPDATE review_round SET
+      analysis_status = ?, analysis_phase = ?, analysis_progress = ?,
+      analysis_engine = ?, analysis_model = ?, analysis_thinking_level = ?, analysis_call_count = ?,
+      analysis_processed_email_count = ?, analysis_total_email_count = ?,
+      analysis_error = ?, analysis_updated_at = ?, updated_at = ?
+    WHERE round_id = ? AND generation = ?
   `)
   const upsertBundleRun = database.prepare(`
     INSERT INTO review_bundle_run(round_id, run_json, created_at, updated_at)
@@ -727,6 +956,48 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     'UPDATE review_round SET status = ?, updated_at = ? WHERE round_id = ?',
   )
   const touchRound = database.prepare('UPDATE review_round SET updated_at = ? WHERE round_id = ?')
+  const deleteRound = database.prepare('DELETE FROM review_round WHERE round_id = ?')
+  const deleteMessages = database.prepare('DELETE FROM review_round_message WHERE round_id = ?')
+  const deleteBundleRun = database.prepare('DELETE FROM review_bundle_run WHERE round_id = ?')
+  const deleteBundleDecisions = database.prepare(
+    'DELETE FROM review_round_bundle_decision WHERE round_id = ?',
+  )
+  const selectRoundSummaries = database.prepare(`
+    SELECT review_round.*, COUNT(review_round_message.email_id) AS email_count
+    FROM review_round
+    LEFT JOIN review_round_message USING (round_id)
+    GROUP BY review_round.round_id
+    ORDER BY julianday(review_round.created_at) DESC, review_round.rowid DESC
+  `)
+  const updateRunStatusRow = database.prepare(`
+    UPDATE review_round SET run_status = ?, updated_at = ?
+    WHERE round_id = ? AND generation = ?
+  `)
+  const populateRoundRow = database.prepare(`
+    UPDATE review_round SET
+      mailboxes_json = ?, total_before_limit = ?, truncated = ?, missing_ids_json = ?,
+      run_status = ?,
+      analysis_status = ?, analysis_phase = ?, analysis_progress = ?,
+      analysis_engine = ?, analysis_model = ?, analysis_thinking_level = ?, analysis_call_count = ?,
+      analysis_processed_email_count = ?, analysis_total_email_count = ?,
+      analysis_error = ?, analysis_updated_at = ?, updated_at = ?
+    WHERE round_id = ? AND generation = ? AND run_status IN ('queued', 'fetching')
+  `)
+  const beginReanalysisRow = database.prepare(`
+    UPDATE review_round SET
+      run_status = 'analyzing', generation = generation + 1,
+      analysis_status = ?, analysis_phase = ?, analysis_progress = ?,
+      analysis_engine = ?, analysis_model = ?, analysis_thinking_level = ?, analysis_call_count = ?,
+      analysis_processed_email_count = ?, analysis_total_email_count = ?,
+      analysis_error = ?, analysis_updated_at = ?, updated_at = ?
+    WHERE round_id = ? AND run_status IN ('ready', 'failed')
+  `)
+  const resetUserStateForReanalysis = database.prepare(`
+    UPDATE review_round_user_state SET
+      revision = revision + 1, current_index = 0, bundle_groups_json = '[]',
+      selected_member_id = NULL, updated_at = ?
+    WHERE round_id = ?
+  `)
   const pruneExpiredRounds = database.prepare(`
     DELETE FROM review_round
     WHERE
@@ -800,6 +1071,7 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     engine: row.analysis_engine,
     ...(row.analysis_error === null ? {} : { error: row.analysis_error }),
     ...(row.analysis_model === null ? {} : { model: row.analysis_model }),
+    ...(row.analysis_thinking_level === null ? {} : { thinkingLevel: row.analysis_thinking_level }),
     phase: row.analysis_phase,
     processedEmailCount: Number(row.analysis_processed_email_count),
     progress: row.analysis_progress,
@@ -860,7 +1132,6 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     const bundle = selectBundleRun.get(roundId) as { run_json: string } | undefined
     return {
       analysis: readAnalysis(row),
-      bundleCallLimit: Number(row.bundle_call_limit),
       bundleExamples: cleanBundleExamples(jsonParse<unknown>(row.bundle_examples_json)),
       bundleRun: bundle ? jsonParse<ReviewBundleRun>(bundle.run_json) : null,
       createdAt: row.created_at,
@@ -873,6 +1144,8 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       mailboxes: jsonParse<MailboxOption[]>(row.mailboxes_json),
       missingIds: jsonParse<string[]>(row.missing_ids_json),
       mode: row.mode,
+      generation: Number(row.generation),
+      runStatus: row.run_status,
       status: row.status,
       totalBeforeLimit: Number(row.total_before_limit),
       truncated: Boolean(row.truncated),
@@ -886,6 +1159,7 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     row: RoundRow,
     patch: RoundAnalysisUpdate,
     now: string,
+    expectedGeneration?: number,
   ) => {
     const { updatedAt: _updatedAt, ...current } = readAnalysis(row)
     const { error, ...rest } = patch
@@ -893,12 +1167,15 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     if (error === null) delete next.error
     else if (error !== undefined) next.error = error
     validateAnalysis(next)
-    updateAnalysisRow.run(
+    const statement =
+      expectedGeneration === undefined ? updateAnalysisRow : updateAnalysisRowForGeneration
+    const result = statement.run(
       next.status,
       next.phase,
       next.progress,
       next.engine,
       next.model ?? null,
+      next.thinkingLevel ?? null,
       next.callCount,
       next.processedEmailCount,
       next.totalEmailCount,
@@ -906,7 +1183,9 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       now,
       now,
       roundId,
+      ...(expectedGeneration === undefined ? [] : [expectedGeneration]),
     )
+    return Number(result.changes) === 1
   }
 
   let closed = false
@@ -946,26 +1225,45 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       }
       const totalBeforeLimit = input.totalBeforeLimit ?? emails.length
       assertNonNegativeInteger(totalBeforeLimit, 'Total before limit')
-      const bundleExamples = cleanBundleExamples(input.bundleExamples ?? [])
-      const bundleCallLimit = input.bundleCallLimit ?? 64
-      if (!Number.isSafeInteger(bundleCallLimit) || bundleCallLimit < 1 || bundleCallLimit > 512) {
-        throw new RangeError('Bundle call limit must be an integer between 1 and 512.')
+      const missingIds = [...(input.missingIds ?? [])]
+      const uniqueMissingIds = new Set<string>()
+      for (const missingId of missingIds) {
+        assertNonEmpty(missingId, 'Missing email ID')
+        if (emailIds.has(missingId)) {
+          throw new TypeError(`Email ID ${missingId} cannot be both present and missing.`)
+        }
+        if (uniqueMissingIds.has(missingId)) {
+          throw new TypeError(`Review round contains duplicate missing email ID ${missingId}.`)
+        }
+        uniqueMissingIds.add(missingId)
       }
+      const bundleExamples = cleanBundleExamples(input.bundleExamples ?? [])
       const now = new Date().toISOString()
       const analysis: Omit<StoredRoundAnalysis, 'updatedAt'> = {
         callCount: input.analysis?.callCount ?? 0,
         engine: input.analysis?.engine ?? 'heuristic',
         ...(input.analysis?.error === undefined ? {} : { error: input.analysis.error }),
         ...(input.analysis?.model === undefined ? {} : { model: input.analysis.model }),
+        ...(input.analysis?.thinkingLevel === undefined
+          ? {}
+          : { thinkingLevel: input.analysis.thinkingLevel }),
         phase: input.analysis?.phase ?? 'queued',
         processedEmailCount: input.analysis?.processedEmailCount ?? 0,
         progress: input.analysis?.progress ?? 0,
         status: input.analysis?.status ?? 'pending',
         totalEmailCount: input.analysis?.totalEmailCount ?? emails.length,
       }
+      if (missingIds.length > 0) {
+        analysis.error ??= INCOMPLETE_SNAPSHOT_ERROR
+        analysis.phase = 'failed'
+        analysis.status = 'pending'
+      }
       validateAnalysis(analysis)
       const userState = initialUserState(input.userState)
       const status = input.status ?? 'active'
+      const runStatus = missingIds.length > 0 ? 'failed' : (input.runStatus ?? 'ready')
+      const generation = input.generation ?? 0
+      assertNonNegativeInteger(generation, 'Review run generation')
       const pruned = transaction(() => {
         insertRound.run(
           id,
@@ -977,14 +1275,16 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
           input.imageToken,
           totalBeforeLimit,
           input.truncated ? 1 : 0,
-          JSON.stringify(input.missingIds ?? []),
+          JSON.stringify(missingIds),
           JSON.stringify(bundleExamples),
-          bundleCallLimit,
+          runStatus,
+          generation,
           analysis.status,
           analysis.phase,
           analysis.progress,
           analysis.engine,
           analysis.model ?? null,
+          analysis.thinkingLevel ?? null,
           analysis.callCount,
           analysis.processedEmailCount,
           analysis.totalEmailCount,
@@ -1030,21 +1330,177 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       if (!created) throw new Error(`Failed to read newly created review round ${id}.`)
       return created
     },
-    getBundleDecision(roundId, decisionKey) {
+    delete(roundId) {
+      const deleted = transaction(() => Number(deleteRound.run(roundId).changes) === 1)
+      if (deleted) checkpointDeletedPages()
+      return deleted
+    },
+    getBundleDecision(roundId, decisionKey, expectedGeneration) {
       assertNonEmpty(decisionKey, 'Bundle decision key')
+      if (expectedGeneration !== undefined) {
+        const row = selectRound.get(roundId) as RoundRow | undefined
+        if (!row || Number(row.generation) !== expectedGeneration) return null
+      }
       const row = selectBundleDecision.get(roundId, decisionKey) as
         | { decision_json: string }
         | undefined
       return row ? cleanBundleDecision(jsonParse<BundleDecision>(row.decision_json)) : null
     },
     get,
-    saveBundleDecision(roundId, decisionKey, decision) {
+    list() {
+      return (
+        selectRoundSummaries.all() as unknown as Array<RoundRow & { email_count: number | bigint }>
+      ).map((row) => {
+        const emailCount = Number(row.email_count)
+        const finalization = readFinalization(row.round_id)
+        const incompleteSnapshot = jsonParse<string[]>(row.missing_ids_json).length > 0
+        return {
+          analysis: readAnalysis(row),
+          createdAt: row.created_at,
+          csrfToken: row.csrf_token,
+          emailCount,
+          filters: jsonParse<ReviewFilters>(row.filters_json),
+          generation: Number(row.generation),
+          id: row.round_id,
+          incompleteSnapshot,
+          mode: row.mode,
+          reanalyzable:
+            !incompleteSnapshot &&
+            reanalysisAllowed(row.run_status, row.status, emailCount, finalization),
+          reviewStatus: row.status,
+          runStatus: row.run_status,
+          updatedAt: row.updated_at,
+        }
+      })
+    },
+    populate(roundId, expectedGeneration, input) {
+      assertNonNegativeInteger(expectedGeneration, 'Expected generation')
+      const emails = input.emails.map(cleanSummary)
+      const ids = new Set<string>()
+      for (const email of emails) {
+        if (ids.has(email.id))
+          throw new TypeError(`Review round contains duplicate email ID ${email.id}.`)
+        ids.add(email.id)
+      }
+      const current = selectRound.get(roundId) as RoundRow | undefined
+      if (!current || Number(current.generation) !== expectedGeneration) return null
+      const now = new Date().toISOString()
+      const missingIds = [...(input.missingIds ?? [])]
+      const uniqueMissingIds = new Set<string>()
+      for (const missingId of missingIds) {
+        assertNonEmpty(missingId, 'Missing email ID')
+        if (ids.has(missingId)) {
+          throw new TypeError(`Email ID ${missingId} cannot be both present and missing.`)
+        }
+        if (uniqueMissingIds.has(missingId)) {
+          throw new TypeError(`Review round contains duplicate missing email ID ${missingId}.`)
+        }
+        uniqueMissingIds.add(missingId)
+      }
+      const { updatedAt: _updatedAt, ...storedAnalysis } = readAnalysis(current)
+      const { error, ...analysisRest } = input.analysis
+      const analysis = { ...storedAnalysis, ...analysisRest }
+      if (error === null) delete analysis.error
+      else if (error !== undefined) analysis.error = error
+      if (missingIds.length > 0) {
+        analysis.error ??= INCOMPLETE_SNAPSHOT_ERROR
+        analysis.phase = 'failed'
+        analysis.status = 'pending'
+      }
+      validateAnalysis(analysis)
+      const totalBeforeLimit = input.totalBeforeLimit ?? emails.length
+      const saved = transaction(() => {
+        const result = populateRoundRow.run(
+          JSON.stringify(input.mailboxes.map(cleanMailbox)),
+          totalBeforeLimit,
+          input.truncated ? 1 : 0,
+          JSON.stringify(missingIds),
+          missingIds.length > 0 ? 'failed' : 'analyzing',
+          analysis.status,
+          analysis.phase,
+          analysis.progress,
+          analysis.engine,
+          analysis.model ?? null,
+          analysis.thinkingLevel ?? null,
+          analysis.callCount,
+          analysis.processedEmailCount,
+          analysis.totalEmailCount,
+          analysis.error ?? null,
+          now,
+          now,
+          roundId,
+          expectedGeneration,
+        )
+        if (Number(result.changes) !== 1) return false
+        deleteMessages.run(roundId)
+        for (const [ordinal, email] of emails.entries()) {
+          insertMessage.run(
+            roundId,
+            email.id,
+            ordinal,
+            email.threadId,
+            email.subject,
+            email.receivedAt,
+            JSON.stringify(email.from),
+            JSON.stringify(email.to),
+            email.preview,
+            JSON.stringify(email.mailboxNames),
+            email.hasAttachment ? 1 : 0,
+            email.isNewsletter ? 1 : 0,
+          )
+        }
+        return true
+      })
+      return saved ? get(roundId) : null
+    },
+    reanalyze(roundId, analysisPatch) {
+      const current = get(roundId)
+      if (!current) return null
+      if (!isStoredReviewRoundReanalyzable(current)) {
+        throw new RoundReanalysisConflictError(roundId)
+      }
+      const row = selectRound.get(roundId) as unknown as RoundRow
+      const { updatedAt: _updatedAt, ...storedAnalysis } = readAnalysis(row)
+      const { error, ...analysisRest } = analysisPatch
+      const analysis = { ...storedAnalysis, ...analysisRest }
+      if (error === null) delete analysis.error
+      else if (error !== undefined) analysis.error = error
+      validateAnalysis(analysis)
+      const now = new Date().toISOString()
+      const started = transaction(() => {
+        const result = beginReanalysisRow.run(
+          analysis.status,
+          analysis.phase,
+          analysis.progress,
+          analysis.engine,
+          analysis.model ?? null,
+          analysis.thinkingLevel ?? null,
+          analysis.callCount,
+          analysis.processedEmailCount,
+          analysis.totalEmailCount,
+          analysis.error ?? null,
+          now,
+          now,
+          roundId,
+        )
+        if (Number(result.changes) !== 1) return false
+        deleteBundleRun.run(roundId)
+        deleteBundleDecisions.run(roundId)
+        resetUserStateForReanalysis.run(now, roundId)
+        return true
+      })
+      return started ? get(roundId) : null
+    },
+    saveBundleDecision(roundId, decisionKey, decision, expectedGeneration) {
       assertNonEmpty(decisionKey, 'Bundle decision key')
       const clean = cleanBundleDecision(decision)
       const now = new Date().toISOString()
       const saved = transaction(() => {
         const row = selectRound.get(roundId) as RoundRow | undefined
         if (!row) return false
+        if (expectedGeneration !== undefined && Number(row.generation) !== expectedGeneration) {
+          return false
+        }
         insertBundleDecision.run(roundId, decisionKey, JSON.stringify(clean), now)
         touchRound.run(now, roundId)
         return true
@@ -1057,7 +1513,7 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
         ? cleanBundleDecision(jsonParse<BundleDecision>(persisted.decision_json))
         : null
     },
-    saveBundleRun(roundId, bundleRun, analysisPatch = {}) {
+    saveBundleRun(roundId, bundleRun, analysisPatch = {}, expectedGeneration) {
       if (bundleRun.snapshotId !== roundId) {
         throw new TypeError('Bundle run snapshot ID must match the review round ID.')
       }
@@ -1066,8 +1522,27 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       const saved = transaction(() => {
         const row = selectRound.get(roundId) as RoundRow | undefined
         if (!row) return false
+        if (expectedGeneration !== undefined && Number(row.generation) !== expectedGeneration) {
+          return false
+        }
+        if (jsonParse<string[]>(row.missing_ids_json).length > 0) {
+          deleteBundleRun.run(roundId)
+          writeAnalysis(
+            roundId,
+            row,
+            {
+              error: INCOMPLETE_SNAPSHOT_ERROR,
+              phase: 'failed',
+              status: 'pending',
+            },
+            now,
+            expectedGeneration,
+          )
+          updateRunStatusRow.run('failed', now, roundId, Number(row.generation))
+          return false
+        }
         upsertBundleRun.run(roundId, JSON.stringify(run), now, now)
-        writeAnalysis(
+        const wrote = writeAnalysis(
           roundId,
           row,
           {
@@ -1080,7 +1555,10 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
             status: analysisPatch.status ?? 'complete',
           },
           now,
+          expectedGeneration,
         )
+        if (!wrote) return false
+        updateRunStatusRow.run('ready', now, roundId, Number(row.generation))
         return true
       })
       return saved ? get(roundId) : null
@@ -1127,13 +1605,38 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       })
       return saved ? get(roundId) : null
     },
-    updateAnalysis(roundId, patch) {
+    updateAnalysis(roundId, patch, expectedGeneration) {
       const now = new Date().toISOString()
       const updated = transaction(() => {
         const row = selectRound.get(roundId) as RoundRow | undefined
         if (!row) return false
-        writeAnalysis(roundId, row, patch, now)
-        return true
+        if (expectedGeneration !== undefined && Number(row.generation) !== expectedGeneration) {
+          return false
+        }
+        return writeAnalysis(roundId, row, patch, now, expectedGeneration)
+      })
+      return updated ? get(roundId) : null
+    },
+    updateRunStatus(roundId, expectedGeneration, status, analysisPatch = {}) {
+      assertNonNegativeInteger(expectedGeneration, 'Expected generation')
+      const now = new Date().toISOString()
+      const updated = transaction(() => {
+        const row = selectRound.get(roundId) as RoundRow | undefined
+        if (!row || Number(row.generation) !== expectedGeneration) return false
+        const incomplete = jsonParse<string[]>(row.missing_ids_json).length > 0
+        const nextStatus = incomplete ? 'failed' : status
+        const nextAnalysis = incomplete
+          ? {
+              ...analysisPatch,
+              error: analysisPatch.error ?? INCOMPLETE_SNAPSHOT_ERROR,
+              phase: 'failed',
+              status: 'pending' as const,
+            }
+          : analysisPatch
+        if (!writeAnalysis(roundId, row, nextAnalysis, now, expectedGeneration)) return false
+        return (
+          Number(updateRunStatusRow.run(nextStatus, now, roundId, expectedGeneration).changes) === 1
+        )
       })
       return updated ? get(roundId) : null
     },

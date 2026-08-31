@@ -320,8 +320,8 @@ describe('Fastmail JMAP adapter', () => {
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual({ Authorization: 'Bearer secret-token' })
   })
 
-  it('freezes every matching message when the snapshot contains more than 250 IDs', async () => {
-    const ids = Array.from({ length: 301 }, (_, index) => `mail-${index}`)
+  it('freezes every matching message when the server caps query pages below the requested size', async () => {
+    const ids = Array.from({ length: 501 }, (_, index) => `mail-${index}`)
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       if (String(input).includes('/jmap/session')) {
         return new Response(
@@ -345,12 +345,14 @@ describe('Fastmail JMAP adapter', () => {
       }
       if (method === 'Email/query') {
         const position = Number(arguments_?.position ?? 0)
-        const limit = Number(arguments_?.limit ?? 250)
+        const requestedLimit = Number(arguments_?.limit ?? 250)
+        const limit = Math.min(requestedLimit, 100)
         return jmapResponse([
           [
             'Email/query',
             {
-              ids: limit === 1 ? ids.slice(0, 1) : ids.slice(position, position + limit),
+              ids: ids.slice(position, position + limit),
+              ...(limit === requestedLimit ? {} : { limit }),
               queryState: 'stable-state',
               total: ids.length,
             },
@@ -385,10 +387,10 @@ describe('Fastmail JMAP adapter', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const snapshot = await fetchUnreadSnapshot('secret-token')
-    expect(snapshot.emails).toHaveLength(301)
+    expect(snapshot.emails).toHaveLength(501)
     expect(snapshot.emails.map((email) => email.id)).toEqual(ids)
     expect(snapshot.truncated).toBe(false)
-    expect(snapshot.totalBeforeLimit).toBe(301)
+    expect(snapshot.totalBeforeLimit).toBe(501)
   })
 
   it('does not classify message body blobs as attachments', async () => {

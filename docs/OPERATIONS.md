@@ -1,8 +1,8 @@
 # Operations
 
-## Current deployment
+## Production contract
 
-- Release: `v0.7.1`
+- Release described by this source tree: `v0.8.0`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -15,9 +15,8 @@
 - Readiness: `GET /readyz`
 - Required live secret: `FASTMAIL_JMAP_TOKEN`
 - Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `codex-settings.json`, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
-- Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
+- Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `CODEX_THINKING_LEVEL=high`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
 - Inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
-- Bundle-call limit: `CODEX_BUNDLE_MAX_CALLS=64`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
 
 The process refuses to start in live mode unless the Fastmail credential is
@@ -46,13 +45,25 @@ Run one Inbox Walk application replica against this SQLite volume. Process-local
 job ownership prevents duplicate Codex work inside that replica; the persisted
 decision checkpoints handle restarts. Multiple replicas do not coordinate one
 round's provider calls.
-The app freezes the resolved bundle-call limit with each new round. Changing
-`CODEX_BUNDLE_MAX_CALLS` affects later rounds, not an analysis resumed after a
-restart.
+Every message in a frozen round is covered by bundle analysis. Completed
+decisions are checkpointed for restart recovery; there is no per-round call
+cutoff.
+The inference timeout applies to one provider request. A timeout marks the
+stored run failed; it does not truncate the snapshot or switch to a local
+result. The same snapshot remains available for explicit reanalysis.
 
-`bundle-learning.sqlite` stores hashed relationship signals from explicit merge,
-split, and confirmation actions. It does not store message bodies, previews, or
-attachment content. The app retains at most 1,000 relationship labels.
+## Upgrade from v0.7.1
+
+No manual database migration is required. Startup upgrades
+`inbox-walk.sqlite` from schema v4 through v7 before accepting requests.
+Complete rounds remain available. A legacy round whose frozen snapshot is
+missing messages is marked failed, and its stale grouping result and Codex
+checkpoints are removed. `CODEX_BUNDLE_MAX_CALLS` is no longer read and can be
+removed from local configuration.
+
+`bundle-learning.sqlite` can retain hashed relationship signals created by
+older releases. It does not store message bodies, previews, or attachment
+content. Current releases do not expose manual relationship-label controls.
 
 ## Deployment path
 
@@ -79,8 +90,9 @@ curl -fsS http://127.0.0.1:3000/api/review/options \
 
 Check `/api/auth/codex/status` for the non-secret configured flag and model. Do
 not inspect or print `/data/pi/auth.json`; reconnect from the app when OAuth can
-no longer refresh. The Codex dialog stores its Sol, Terra, or Luna selection in
-`/data/codex-settings.json`; `CODEX_MODEL` remains the startup default. For the
+no longer refresh. The settings dialog stores the Codex model and thinking
+level in `/data/codex-settings.json`; `CODEX_MODEL` and
+`CODEX_THINKING_LEVEL` remain startup defaults. For the
 review persistence, inspect schema and aggregate counts only rather than
 printing message IDs, subjects, previews, addresses, or editor text.
 

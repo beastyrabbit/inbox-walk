@@ -3,6 +3,7 @@ import type {
   CodexAuthStatus,
   CodexLoginState,
   CodexModelId,
+  CodexThinkingLevel,
   DraftResult,
   FinalizeResult,
   MailAddress,
@@ -11,9 +12,12 @@ import type {
   ReviewFilters,
   ReviewOptions,
   ReviewRoundUserState,
+  ReviewRunSummary,
   ReviewSnapshot,
   ThreadContext,
 } from './shared.ts'
+
+export type CodexSettings = CodexAuthStatus
 
 export class ClientApiError extends Error {
   constructor(
@@ -63,6 +67,7 @@ function apiErrorFrom(body: unknown): ApiError['error'] | undefined {
 }
 
 async function payload<T>(response: Response): Promise<T> {
+  if (response.status === 204 || response.status === 205) return undefined as T
   let rawBody: string
   try {
     rawBody = await response.text()
@@ -147,6 +152,21 @@ async function post<T>(url: string, body: unknown, csrfToken?: string, persistOn
   })
 }
 
+async function put<T>(url: string, body: unknown) {
+  return request<T>(url, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+}
+
+async function remove(url: string, csrfToken: string) {
+  return request<void>(url, {
+    method: 'DELETE',
+    headers: { 'X-Inbox-Walk-CSRF': csrfToken },
+  })
+}
+
 export const api = {
   async codexStatus() {
     return request<CodexAuthStatus>('/api/auth/codex/status')
@@ -154,8 +174,11 @@ export const api = {
   async startCodexLogin() {
     return post<{ id: string }>('/api/auth/codex/start', {})
   },
-  async selectCodexModel(model: CodexModelId) {
-    return post<CodexAuthStatus>('/api/auth/codex/model', { model })
+  async codexSettings() {
+    return request<CodexSettings>('/api/settings/codex')
+  },
+  async updateCodexSettings(model: CodexModelId, thinkingLevel: CodexThinkingLevel) {
+    return put<CodexSettings>('/api/settings/codex', { model, thinkingLevel })
   },
   async codexLoginState(id: string) {
     return request<CodexLoginState>(`/api/auth/codex/${encodeURIComponent(id)}`)
@@ -163,32 +186,31 @@ export const api = {
   async options() {
     return request<ReviewOptions>('/api/review/options')
   },
-  async createReview(filters: ReviewFilters) {
-    return post<ReviewSnapshot>('/api/reviews', { filters })
+  async reviewRuns() {
+    return request<{ runs: ReviewRunSummary[] }>('/api/reviews')
+  },
+  async createReview(id: string, filters: ReviewFilters) {
+    return post<ReviewRunSummary>('/api/reviews', { id, filters }, undefined, true)
+  },
+  async resumeReview(id: string, emailIds: string[], filters: ReviewFilters) {
+    return post<ReviewRunSummary>('/api/reviews/resume', { id, emailIds, filters })
   },
   async review(roundId: string) {
     return request<ReviewSnapshot>(`/api/reviews/${encodeURIComponent(roundId)}`)
   },
-  async resumeReview(emailIds: string[], filters: ReviewFilters) {
-    return post<ReviewSnapshot>('/api/reviews/resume', { emailIds, filters })
+  async deleteReview(run: Pick<ReviewRunSummary, 'csrfToken' | 'id'>) {
+    return remove(`/api/reviews/${encodeURIComponent(run.id)}`, run.csrfToken)
+  },
+  async reanalyzeReview(run: Pick<ReviewRunSummary, 'csrfToken' | 'id'>) {
+    return post<ReviewRunSummary>(
+      `/api/reviews/${encodeURIComponent(run.id)}/reanalyze`,
+      {},
+      run.csrfToken,
+    )
   },
   async email(snapshotId: string, emailId: string) {
     return request<ReviewEmail>(
       `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}`,
-    )
-  },
-  async bundles(snapshot: Pick<ReviewSnapshot, 'csrfToken' | 'snapshotId'>) {
-    return post<ReviewSnapshot>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundles`,
-      {},
-      snapshot.csrfToken,
-    )
-  },
-  async continueWithoutCodex(snapshot: Pick<ReviewSnapshot, 'csrfToken' | 'snapshotId'>) {
-    return post<ReviewSnapshot>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundles/fallback`,
-      {},
-      snapshot.csrfToken,
     )
   },
   async updateReviewState(
@@ -201,21 +223,6 @@ export const api = {
       { revision, state },
       snapshot.csrfToken,
       true,
-    )
-  },
-  async bundleLabel(
-    snapshot: ReviewSnapshot,
-    body: {
-      anchorEmailIds: string[]
-      candidateEmailIds: string[]
-      label: 'merge' | 'split'
-      reason?: string
-    },
-  ) {
-    return post<{ recorded: boolean }>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/bundle-labels`,
-      body,
-      snapshot.csrfToken,
     )
   },
   async thread(snapshotId: string, threadId: string, emailId: string) {

@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from 'vitest'
 import type { ReviewEmailSummary } from '../src/shared.ts'
 import {
   type BundleBuildProgress,
+  type BundleDecisionCohort,
+  type BundleDecisionResult,
   buildReviewBundles,
   extractBundleSignals,
   hashLearningSignal,
@@ -135,17 +137,283 @@ describe('contextual bundle builder', () => {
     )
   })
 
+  it.each([379, 500])(
+    'analyzes and assigns all %i messages without a per-round call cutoff',
+    async (messageCount) => {
+      const emails = Array.from({ length: messageCount }, (_, index) => {
+        const story = Math.floor(index / 8)
+        const email = mail(
+          `mail-${index.toString().padStart(3, '0')}`,
+          `Status zu Vorgang projekt${story.toString().padStart(3, '0')}`,
+          `Neuer Schritt für projekt${story.toString().padStart(3, '0')}`,
+        )
+        email.receivedAt = new Date(Date.UTC(2026, 7, 1) + index * 60_000).toISOString()
+        return email
+      })
+      const analyzedSeeds = new Set<string>()
+      const absorbedCandidates = new Set<string>()
+      const decideBatch = vi.fn(async (cohorts: readonly BundleDecisionCohort[]) =>
+        cohorts.map((cohort): BundleDecisionResult => {
+          for (const seed of cohort.seed) {
+            expect(absorbedCandidates.has(seed.id)).toBe(false)
+            analyzedSeeds.add(seed.id)
+          }
+          for (const candidate of cohort.candidates) absorbedCandidates.add(candidate.id)
+          return {
+            cohortId: cohort.cohortId,
+            currentState: 'Aktuell',
+            includedEmailIds: cohort.candidates.map((candidate) => candidate.id),
+            kind: 'conversation',
+            linkEvidence: ['Lokaler Projektbezug'],
+            membershipConfidence: 0.98,
+            summary: 'Zusammengehörige Statusmeldungen.',
+            title: 'Projektstatus',
+          }
+        }),
+      )
+
+      const run = await buildReviewBundles(`snapshot-${messageCount}`, emails, undefined, [], {
+        decideBatch,
+        engine: 'codex',
+      })
+
+      validateBundlePartition(
+        emails.map((email) => email.id),
+        run.bundles,
+      )
+      expect(run.bundles.flatMap((bundle) => bundle.emailIds)).toHaveLength(messageCount)
+      expect(new Set(run.bundles.flatMap((bundle) => bundle.emailIds)).size).toBe(messageCount)
+      expect(analyzedSeeds.size + absorbedCandidates.size).toBe(messageCount)
+      expect(decideBatch.mock.calls.length).toBeLessThanOrEqual(Math.ceil(messageCount / 8))
+      expect(decideBatch.mock.calls.length).toBeLessThan(10)
+    },
+  )
+
+  it('batches candidate-free roots so Codex still analyzes every message', async () => {
+    const emails = Array.from({ length: 17 }, (_, index) => {
+      const email = mail(`solo-${index}`, `Einmalige Meldung ${index}`, `Ohne Verbindung ${index}`)
+      email.receivedAt = new Date(Date.UTC(2026, 7, 1) + index * 60_000).toISOString()
+      return email
+    })
+    const seedIds: string[] = []
+    const decideBatch = vi.fn(async (cohorts: readonly BundleDecisionCohort[]) =>
+      cohorts.map((cohort): BundleDecisionResult => {
+        seedIds.push(...cohort.seed.map((email) => email.id))
+        return {
+          cohortId: cohort.cohortId,
+          currentState: 'Einzeln',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Eigenständige Nachricht.',
+          title: cohort.seed[0]?.subject ?? 'Nachricht',
+        }
+      }),
+    )
+
+    const run = await buildReviewBundles('standalone-snapshot', emails, undefined, [], {
+      decideBatch,
+    })
+
+    expect(seedIds).toHaveLength(17)
+    expect(new Set(seedIds).size).toBe(17)
+    expect(decideBatch).toHaveBeenCalledTimes(3)
+    expect(run.bundles).toHaveLength(17)
+  })
+
+  it('shows Codex a nearby cross-provider relationship without exact or lexical overlap', async () => {
+    const github = mail('github', 'Change accepted', 'Review completed successfully')
+    github.receivedAt = '2026-08-24T10:00:00Z'
+    github.from = [{ name: 'GitHub', email: 'notifications@github.com' }]
+    const railway = mail('railway', 'Production rollout healthy', 'Service is live')
+    railway.receivedAt = '2026-08-24T10:08:00Z'
+    railway.from = [{ name: 'Railway', email: 'notify@railway.app' }]
+    const githubSignals = extractBundleSignals(github)
+    const railwaySignals = extractBundleSignals(railway)
+    expect(githubSignals.provider).toBe('GitHub')
+    expect(railwaySignals.provider).toBe('Railway')
+    expect(githubSignals.exactKeys.filter((key) => railwaySignals.exactKeys.includes(key))).toEqual(
+      [],
+    )
+    expect(
+      githubSignals.searchTerms.filter((term) => railwaySignals.searchTerms.includes(term)),
+    ).toEqual([])
+
+    const decideBatch = vi.fn(async (cohorts: readonly BundleDecisionCohort[]) =>
+      cohorts.map(
+        (cohort): BundleDecisionResult => ({
+          cohortId: cohort.cohortId,
+          includedEmailIds: cohort.candidates.map((candidate) => candidate.id),
+          kind: 'development_workstream',
+          title: 'Accepted change rollout',
+          currentState: 'Healthy',
+          summary: 'The accepted change was rolled out successfully.',
+          linkEvidence: ['Nearby cross-provider events'],
+          membershipConfidence: 0.9,
+        }),
+      ),
+    )
+
+    const run = await buildReviewBundles(
+      'cross-source-snapshot',
+      [github, railway],
+      undefined,
+      [],
+      {
+        decideBatch,
+      },
+    )
+
+    expect(decideBatch).toHaveBeenCalledOnce()
+    expect(decideBatch.mock.calls[0]?.[0]?.[0]).toMatchObject({
+      candidates: [{ id: 'railway' }],
+      seed: [{ id: 'github' }],
+    })
+    expect(run.bundles.map((bundle) => bundle.emailIds)).toEqual([['github', 'railway']])
+  })
+
+  it('bounds cross-provider recall work for 500 unrelated nearby messages', async () => {
+    const messageCount = 500
+    const emails = Array.from({ length: messageCount }, (_, index) => {
+      const email = mail(
+        `independent-${index.toString().padStart(3, '0')}`,
+        `Activity ${index.toString().padStart(3, '0')}`,
+        `Opaque event ${index.toString().padStart(3, '0')}`,
+      )
+      email.receivedAt = new Date(Date.UTC(2026, 7, 24, 10) + index * 60_000).toISOString()
+      email.from =
+        index % 2 === 0
+          ? [{ name: 'GitHub', email: 'notifications@github.com' }]
+          : [{ name: 'Railway', email: 'notify@railway.app' }]
+      return email
+    })
+    const analyzedSeedIds: string[] = []
+    let candidateCount = 0
+    let cohortCount = 0
+    const decideBatch = vi.fn(async (cohorts: readonly BundleDecisionCohort[]) => {
+      cohortCount += cohorts.length
+      return cohorts.map((cohort): BundleDecisionResult => {
+        analyzedSeedIds.push(...cohort.seed.map((email) => email.id))
+        candidateCount += cohort.candidates.length
+        return {
+          cohortId: cohort.cohortId,
+          currentState: 'Separate',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Independent event.',
+          title: cohort.seed[0]?.subject ?? 'Activity',
+        }
+      })
+    })
+
+    const run = await buildReviewBundles('independent-cross-provider', emails, undefined, [], {
+      decideBatch,
+    })
+
+    validateBundlePartition(
+      emails.map((email) => email.id),
+      run.bundles,
+    )
+    expect(run.bundles).toHaveLength(messageCount)
+    expect(analyzedSeedIds).toHaveLength(messageCount)
+    expect(new Set(analyzedSeedIds).size).toBe(messageCount)
+    expect(cohortCount).toBe(messageCount)
+    expect(candidateCount).toBeLessThanOrEqual(messageCount * 8)
+    expect(decideBatch.mock.calls.length).toBeLessThanOrEqual(Math.ceil(messageCount / 4))
+  })
+
+  it('keeps each Codex cohort bounded when lexical recall is broad', async () => {
+    const topics = Array.from(
+      { length: 12 },
+      (_, index) => `topic${index.toString().padStart(4, '0')}`,
+    )
+    const seed = mail('seed', topics.join(' '), 'Seed event')
+    seed.receivedAt = '2026-08-24T10:00:00Z'
+    const emails = [
+      seed,
+      ...topics.flatMap((topic, topicIndex) =>
+        Array.from({ length: 4 }, (_, candidateIndex) => {
+          const candidate = mail(
+            `candidate-${topicIndex}-${candidateIndex}`,
+            `${topic} update-${candidateIndex}`,
+            `Distinct event ${topicIndex}-${candidateIndex}`,
+          )
+          candidate.receivedAt = new Date(
+            Date.UTC(2026, 7, 24, 10) + (topicIndex * 4 + candidateIndex + 1) * 60_000,
+          ).toISOString()
+          return candidate
+        }),
+      ),
+    ]
+    const cohortSizes: number[] = []
+    const seedCandidateIds: string[] = []
+    const decideBatch = vi.fn(async (cohorts: readonly BundleDecisionCohort[]) =>
+      cohorts.map((cohort): BundleDecisionResult => {
+        cohortSizes.push(cohort.candidates.length)
+        if (cohort.seed.some((email) => email.id === 'seed')) {
+          seedCandidateIds.push(...cohort.candidates.map((email) => email.id))
+        }
+        return {
+          cohortId: cohort.cohortId,
+          currentState: 'Separate',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Separate events.',
+          title: 'Separate event',
+        }
+      }),
+    )
+
+    await buildReviewBundles('broad-lexical-snapshot', emails, undefined, [], { decideBatch })
+
+    expect(new Set(seedCandidateIds).size).toBe(48)
+    expect(Math.max(...cohortSizes)).toBe(24)
+  })
+
+  it('aborts without returning a partial bundle run', async () => {
+    const controller = new AbortController()
+    const emails = [
+      mail('1', 'August electricity invoice', 'Electricity account notice'),
+      mail('2', 'August electricity reminder', 'Electricity account notice'),
+    ]
+    const decideBatch = vi.fn(async (_cohorts, signal?: AbortSignal) => {
+      controller.abort(new DOMException('Cancelled by user.', 'AbortError'))
+      signal?.throwIfAborted()
+      return []
+    })
+
+    await expect(
+      buildReviewBundles('aborted-snapshot', emails, undefined, [], {
+        decideBatch,
+        signal: controller.signal,
+      }),
+    ).rejects.toMatchObject({ name: 'AbortError' })
+    expect(decideBatch).toHaveBeenCalledOnce()
+  })
+
   it('keeps conflicting repositories separate even when their wording is similar', async () => {
     const emails = [
       mail('1', '[team/alpha] production failed', 'Railway deployment production failed'),
       mail('2', '[team/beta] production failed', 'Railway deployment production failed'),
     ]
-    const decide = vi.fn(async () => {
-      throw new Error('Conflicting candidates must not reach Codex')
-    })
+    const decide = vi.fn(async (input) => ({
+      includedEmailIds: [],
+      kind: 'standalone' as const,
+      title: input.seed[0]?.subject ?? 'Deployment',
+      currentState: 'Open',
+      summary: 'Separate repository scope.',
+      linkEvidence: [],
+      membershipConfidence: 1,
+    }))
     const run = await buildReviewBundles('snapshot', emails, decide)
     expect(run.bundles.map((bundle) => bundle.emailIds)).toEqual([['1'], ['2']])
-    expect(decide).not.toHaveBeenCalled()
+    expect(decide).toHaveBeenCalledTimes(2)
+    expect(decide.mock.calls.every(([input]) => input.candidates.length === 0)).toBe(true)
   })
 
   it('keeps different repository scopes separate even when a commit-like value is shared', async () => {

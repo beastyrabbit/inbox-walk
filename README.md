@@ -13,9 +13,11 @@ Fastmail.
 
 - Loads every matching unread incoming message into a stable, paginated JMAP snapshot.
 - Bundles related threads, repository activity, deployments, orders, and carrier updates while keeping every original inspectable.
-- Learns only from explicit bundle corrections and gives Codex at most two confirmed positive and two confirmed negative examples per decision.
-- Opens every new round with a dedicated selection page instead of loading mail immediately.
+- Can reuse a bounded set of hashed relationship examples retained from older releases without exposing message content.
+- Creates a stored run as soon as **Runde starten** is clicked and shows fetch and analysis progress in the rounds table.
+- Enables **Runde öffnen** only after the complete Codex result is stored.
 - Gives every round a stable URL and restores its snapshot, analysis, decisions, and finalization after a browser refresh or app restart.
+- Deletes rounds from the table, cancels abortable fetch or analysis work, and can reanalyze the same frozen snapshot without discarding review decisions or drafts. Reply generation and draft storage block deletion immediately. Finalization blocks it after taking the durable selection lock; if deletion wins the earlier mailbox-context race, finalization stops before changing the mailbox.
 - Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
 - Can omit messages deliberately kept unread in an earlier round using a small local SQLite history.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
@@ -53,36 +55,40 @@ but cannot mark messages read or create Fastmail drafts. Live mode never falls
 back to sample data.
 
 The app reuses an existing Pi `openai-codex` login from
-`~/.pi/agent/auth.json` during local development. Otherwise, choose **Codex
-anmelden** in the app and complete the OpenAI device-code flow. The rotating
+`~/.pi/agent/auth.json` during local development. Otherwise, open
+**Einstellungen**, choose **Mit ChatGPT verbinden**, and complete the OpenAI
+device-code flow. The rotating
 OAuth record stays server-side and is never returned by the API.
 Choosing **Neu anmelden** while using that local fallback also refreshes the
 workstation's shared Pi login; set `DATA_DIR` to an app-specific directory if
 you want isolated local credentials.
 
-The Codex dialog also selects the model used for new bundle decisions and reply
-drafts. Sol is the deployment default; Sol, Terra, and Luna can be selected in
-the UI without restarting the app. The choice is stored in
+The settings menu selects the model and thinking level used for new bundle
+decisions and reply drafts. Sol is the deployment default; Sol, Terra, and Luna
+can be selected without restarting the app. The choices are stored together in
 `DATA_DIR/codex-settings.json`.
 
-Connect Codex on the selection screen before starting a round. The app first
-freezes the round, then asks Codex to judge only plausible relationships found
-by the local index. It does not run again when you open a message. Later mail is
-not added to the frozen round. The bounded, hashed learning-example corpus is
-also frozen with the round and reused after a restart. A new round gets a new
-analysis.
+Connect Codex in the settings menu before starting a round. The app stores the
+run first, freezes every matching summary, and rebuilds its local relationship
+index for that snapshot. Exact IDs and same-thread links are joined locally.
+Codex then checks every remaining story seed against broad text and
+cross-provider time candidates. A message accepted into an earlier story does
+not need a second seed check. Opening a message never starts analysis. Later
+mail is not added to the frozen round.
 
-Each completed Codex decision is checkpointed in SQLite. A browser reload keeps
-the current job running. After a process crash, the app replays saved decisions
-and may repeat only the provider call that was still open. A finished analysis
-is never run again. `CODEX_BUNDLE_MAX_CALLS` limits provider calls per round and
-defaults to 64. The resolved limit is frozen with the round, so a configuration
-change during a restart cannot change an in-progress analysis. Reaching the
-limit falls back to the safe individual-message view.
-If a started Codex run later needs a new login, the saved round waits instead
-of silently changing engines. You can reconnect Codex or explicitly finish
-that round in the safe individual-message view; that choice is persisted and
-Codex will not restart for the round.
+Codex decisions are checkpointed in SQLite as the run accepts them. A browser reload keeps
+the current job running. After a process crash, the app replays saved decisions;
+only work without a durable checkpoint may be repeated. Reloading or opening
+a finished round does not run Codex again. Only **Neu analysieren** starts a new
+analysis generation on the same snapshot. Every message in the snapshot is
+covered; there is no per-round provider-call cutoff.
+If a started Codex run later needs a new login, it fails visibly instead of
+silently changing engines. Reconnect Codex and rerun the analysis on the same
+frozen snapshot.
+
+`CODEX_INFERENCE_TIMEOUT_MS` limits one Codex request, not the number of messages
+in a round. The default is five minutes. If a request has not finished by then,
+the run becomes **Fehlgeschlagen** and remains available for a fresh analysis.
 
 `DATA_DIR/inbox-walk.sqlite` stores review rounds with their fixed IDs, filters,
 mail summaries, frozen hashed learning examples, bundle-analysis status, Codex
@@ -121,7 +127,7 @@ publishes it to `git.heerlab.com/beasty/inbox-walk`.
 
 ## Production
 
-The current usable release is `v0.7.1`, deployed at
+This source tree describes release `v0.8.0`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

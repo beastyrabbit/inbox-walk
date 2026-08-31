@@ -1,7 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
-import { api, blobUrl, ClientApiError } from './api.ts'
-import { clearCheckpoint, loadCheckpoint, saveCheckpoint } from './checkpoint.ts'
+import { api, blobUrl, ClientApiError, type CodexSettings } from './api.ts'
+import {
+  clearCheckpoint,
+  loadCheckpoint,
+  saveCheckpoint,
+  stageCheckpointMigration,
+} from './checkpoint.ts'
 import { emailDocument } from './email-document.ts'
 import {
   clampIndex,
@@ -12,11 +17,12 @@ import {
 import {
   type CodexLoginState,
   type CodexModelId,
+  type CodexThinkingLevel,
   codexModels,
   type DraftResult,
   defaultReviewFilters,
   type FinalizeResult,
-  type LoadedReviewCheckpoint,
+  type LegacyReviewCheckpoint,
   type MailAddress,
   type ReplyEditorState,
   type ReplyProposal,
@@ -26,6 +32,7 @@ import {
   type ReviewFilters,
   type ReviewOptions,
   type ReviewRoundUserState,
+  type ReviewRunSummary,
   type ReviewSnapshot,
   type ThreadContext,
 } from './shared.ts'
@@ -177,6 +184,15 @@ function setRoundUrl(roundId: string | null, replace = false) {
   window.history[replace ? 'replaceState' : 'pushState']({}, '', next)
 }
 
+function clearCheckpointForRound(roundId: string) {
+  try {
+    const checkpoint = loadCheckpoint()
+    if (checkpoint?.version === 7 && checkpoint.roundId === roundId) clearCheckpoint()
+  } catch {
+    // Never discard a legacy checkpoint just because a URL points to an expired round.
+  }
+}
+
 function analysisStatus(analysis: ReviewSnapshot['analysis']) {
   if (analysis.phase === 'waiting_for_codex') {
     return 'Die angefangene Codex-Analyse wartet auf eine erneute Anmeldung.'
@@ -199,6 +215,75 @@ function analysisOrigin(analysis: ReviewSnapshot['analysis']) {
   }
   if (analysis.engine === 'heuristic') return 'Lokale Analyse'
   return label ? `Codex · ${label}` : 'Codex'
+}
+
+function newestRunsFirst(runs: ReviewRunSummary[]) {
+  return [...runs].sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))
+}
+
+function replaceRun(runs: ReviewRunSummary[], next: ReviewRunSummary) {
+  return newestRunsFirst([next, ...runs.filter((run) => run.id !== next.id)])
+}
+
+function legacyMigrationState(
+  checkpoint: LegacyReviewCheckpoint,
+  snapshot: ReviewSnapshot,
+): ReviewStateUpdate {
+  const available = new Set(snapshot.emails.map((email) => email.id))
+  if (available.size === 0) {
+    throw new Error(
+      'Keine Nachricht der alten Runde ist noch verfügbar. Der alte Rundenstand bleibt im Browser erhalten.',
+    )
+  }
+
+  const statefulIds = [
+    ...checkpoint.keptUnreadIds,
+    ...checkpoint.processedIds,
+    ...checkpoint.secondaryActionIds,
+    ...Object.keys(checkpoint.replyDrafts),
+  ]
+  if (statefulIds.some((id) => !available.has(id))) {
+    throw new Error(
+      'Mindestens eine Nachricht mit einer Entscheidung oder einem Entwurf ist nicht mehr verfügbar. Der alte Rundenstand bleibt im Browser erhalten.',
+    )
+  }
+
+  const bundleGroups = checkpoint.bundleGroups
+    .map((group) => group.filter((id) => available.has(id)))
+    .filter((group) => group.length > 0)
+  if (checkpoint.bundleGroups.length > 0) {
+    const groupedIds = bundleGroups.flat()
+    if (groupedIds.length !== available.size || new Set(groupedIds).size !== available.size) {
+      throw new Error(
+        'Die gespeicherten Storys der alten Runde sind unvollständig. Der alte Rundenstand bleibt im Browser erhalten.',
+      )
+    }
+  }
+
+  const byId = new Map(snapshot.emails.map((email) => [email.id, email]))
+  if (
+    snapshot.filters.spam === 'exclude' &&
+    checkpoint.secondaryActionIds.some((id) => !byId.get(id)?.isNewsletter)
+  ) {
+    throw new Error(
+      'Eine gespeicherte Newsletter-Aktion kann nicht mehr sicher zugeordnet werden. Der alte Rundenstand bleibt im Browser erhalten.',
+    )
+  }
+
+  return {
+    bundleGroups: checkpoint.bundleGroups.length > 0 ? bundleGroups : [],
+    index: clampIndex(
+      checkpoint.index,
+      checkpoint.bundleGroups.length ||
+        snapshot.bundleRun?.bundles.length ||
+        snapshot.emails.length,
+    ),
+    keptUnreadIds: checkpoint.keptUnreadIds,
+    processedIds: checkpoint.processedIds,
+    replyDrafts: checkpoint.replyDrafts,
+    secondaryActionIds: checkpoint.secondaryActionIds,
+    selectedMemberId: null,
+  }
 }
 
 function useFocusRegion<T extends HTMLElement>(trap: boolean) {
@@ -240,14 +325,14 @@ function useFocusRegion<T extends HTMLElement>(trap: boolean) {
 
 function App() {
   const [options, setOptions] = useState<ReviewOptions | null>(null)
+  const [codexSettings, setCodexSettings] = useState<CodexSettings | null>(null)
+  const [runs, setRuns] = useState<ReviewRunSummary[]>([])
   const [filters, setFilters] = useState<ReviewFilters>(defaultReviewFilters)
-  const [checkpoint, setCheckpoint] = useState<LoadedReviewCheckpoint | null>(null)
   const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null)
   const [bundleRun, setBundleRun] = useState<ReviewBundleRun | null>(null)
   const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
   const [index, setIndex] = useState(0)
   const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null)
-  const [confirmedBundleIds, setConfirmedBundleIds] = useState<Set<string>>(new Set())
   const [keptUnread, setKeptUnread] = useState<Set<string>>(new Set())
   const [processedIds, setProcessedIds] = useState<Set<string>>(new Set())
   const [secondaryActionIds, setSecondaryActionIds] = useState<Set<string>>(new Set())
@@ -259,12 +344,16 @@ function App() {
   const [overviewOpen, setOverviewOpen] = useState(false)
   const [replyOpen, setReplyOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
-  const [mergeOpen, setMergeOpen] = useState(false)
-  const [codexLoginOpen, setCodexLoginOpen] = useState(false)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [settingsError, setSettingsError] = useState<string | null>(null)
+  const [deleteRun, setDeleteRun] = useState<ReviewRunSummary | null>(null)
   const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
   const [codexLoginBusy, setCodexLoginBusy] = useState(false)
-  const [codexModelBusy, setCodexModelBusy] = useState(false)
-  const [codexFallbackBusy, setCodexFallbackBusy] = useState(false)
+  const [codexSettingsBusy, setCodexSettingsBusy] = useState(false)
+  const [runActionIds, setRunActionIds] = useState<Set<string>>(new Set())
+  const [deletingRunIds, setDeletingRunIds] = useState<Set<string>>(new Set())
+  const [migrationRoundId, setMigrationRoundId] = useState<string | null>(null)
+  const [creatingRun, setCreatingRun] = useState(false)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
   const [replyLoading, setReplyLoading] = useState(false)
@@ -273,11 +362,11 @@ function App() {
   const [stateConflict, setStateConflict] = useState(false)
   const [statePersistenceFailed, setStatePersistenceFailed] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [runStatusError, setRunStatusError] = useState<string | null>(null)
   const [result, setResult] = useState<FinalizeResult | null>(null)
   const restoredRef = useRef(false)
   const activeRoundIdRef = useRef<string | null>(null)
   const activeSnapshotRef = useRef<ReviewSnapshot | null>(null)
-  const codexFallbackRequestedRef = useRef(false)
   const stateRevisionRef = useRef(0)
   const persistedStateRef = useRef('')
   const persistedCoreStateRef = useRef('')
@@ -286,9 +375,12 @@ function App() {
   const stateSavePromiseRef = useRef<Promise<void> | null>(null)
   const stateSaveTimerRef = useRef<number | null>(null)
   const stateSaveFailedRef = useRef(false)
+  const creatingRunRef = useRef(false)
+  const legacyMigrationRef = useRef<LegacyReviewCheckpoint | null>(null)
 
   const emails = snapshot?.emails ?? []
   const bundles = bundleRun?.bundles ?? []
+  const hasActiveRun = runs.some((run) => ['queued', 'fetching', 'analyzing'].includes(run.status))
   const currentBundle = bundles[index]
   const summary = currentBundle
     ? (emails.find(
@@ -305,10 +397,6 @@ function App() {
   const isSecondaryActionMarked = summary ? secondaryActionIds.has(summary.id) : false
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
-  const analysisPollTarget =
-    snapshot && !bundleRun && snapshot.analysis.status !== 'complete' && !codexFallbackBusy
-      ? `${snapshot.snapshotId}\0${snapshot.csrfToken}\0${options?.codex.configured ? 'codex-ready' : 'codex-missing'}`
-      : null
   const finalizedEmailIds = useMemo(
     () => emails.map((item) => item.id).filter((id) => processedIds.has(id)),
     [emails, processedIds],
@@ -334,9 +422,6 @@ function App() {
     setStateConflict(false)
     setStatePersistenceFailed(false)
     stateSaveFailedRef.current = false
-    if (activeRoundIdRef.current !== nextSnapshot.snapshotId) {
-      codexFallbackRequestedRef.current = false
-    }
     activeRoundIdRef.current = nextSnapshot.snapshotId
     activeSnapshotRef.current = nextSnapshot
     const state = nextSnapshot.userState
@@ -373,7 +458,6 @@ function App() {
     persistedCoreStateRef.current = coreStateFingerprint
     desiredStateRef.current = stateFingerprint
     desiredCoreStateRef.current = coreStateFingerprint
-    setCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
     saveCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
     restoredRef.current = true
     if (nextBundleRun?.fallback) {
@@ -473,63 +557,36 @@ function App() {
     return !stateSaveFailedRef.current && desiredStateRef.current === persistedStateRef.current
   }, [clearStateSaveTimer, triggerStateSave])
 
-  const applyAnalysisProgress = useCallback((nextSnapshot: ReviewSnapshot) => {
-    setSnapshot((current) => {
-      if (!current || current.snapshotId !== nextSnapshot.snapshotId) return current
-      const next = { ...current, analysis: nextSnapshot.analysis }
-      activeSnapshotRef.current = next
-      return next
-    })
-    setStatus(analysisStatus(nextSnapshot.analysis))
-  }, [])
-
   const closeReply = useCallback(() => {
     setReplyOpen(false)
     void flushState()
   }, [flushState])
 
-  const startReview = useCallback(
-    async (nextFilters: ReviewFilters, resume: LoadedReviewCheckpoint | null = null) => {
+  const refreshRuns = useCallback(async () => {
+    const response = await api.reviewRuns()
+    setRunStatusError(null)
+    setRuns((current) => {
+      if (!creatingRunRef.current) return response.runs
+      const persistedIds = new Set(response.runs.map((run) => run.id))
+      const pending = current.filter((run) => !run.csrfToken && !persistedIds.has(run.id))
+      return newestRunsFirst([...response.runs, ...pending])
+    })
+    return response.runs
+  }, [])
+
+  const openReview = useCallback(
+    async (roundId: string, replaceUrl = false) => {
       setLoading(true)
       setError(null)
-      setStatus(resume ? 'Offene Runde wird geladen …' : 'Postfach wird abgefragt …')
+      setStatus('Runde wird geöffnet …')
       try {
-        let nextSnapshot: ReviewSnapshot
-        if (resume?.version === 7) {
-          nextSnapshot = await api.review(resume.roundId)
-        } else if (resume?.version === 6 && resume.emailIds.length > 0) {
-          nextSnapshot = await api.resumeReview(resume.emailIds, resume.filters)
-          const available = new Set(nextSnapshot.emails.map((item) => item.id))
-          const availableGroups = resume.bundleGroups.map((group) =>
-            group.filter((id) => available.has(id)),
-          )
-          const groupsCoverRound =
-            availableGroups.flat().length === available.size &&
-            new Set(availableGroups.flat()).size === available.size
-          const migrated = await api.updateReviewState(nextSnapshot, 0, {
-            bundleGroups: groupsCoverRound
-              ? availableGroups.filter((group) => group.length > 0)
-              : [],
-            index: resume.index,
-            keptUnreadIds: resume.keptUnreadIds.filter((id) => available.has(id)),
-            processedIds: resume.processedIds.filter((id) => available.has(id)),
-            replyDrafts: Object.fromEntries(
-              Object.entries(resume.replyDrafts).filter(([id]) => available.has(id)),
-            ),
-            secondaryActionIds: resume.secondaryActionIds.filter(
-              (id) =>
-                available.has(id) &&
-                (nextSnapshot.filters.spam === 'only' ||
-                  nextSnapshot.emails.some((item) => item.id === id && item.isNewsletter)),
-            ),
-            selectedMemberId: null,
-          })
-          nextSnapshot = { ...nextSnapshot, userState: migrated }
-        } else {
-          nextSnapshot = await api.createReview(nextFilters)
+        const nextSnapshot = await api.review(roundId)
+        if (!nextSnapshot.bundleRun) {
+          setRoundUrl(null, true)
+          await refreshRuns()
+          return
         }
-        setRoundUrl(nextSnapshot.snapshotId, resume?.version === 7)
-        setConfirmedBundleIds(new Set())
+        setRoundUrl(nextSnapshot.snapshotId, replaceUrl)
         setDetails({})
         setThreadContexts({})
         setReplyProposals({})
@@ -538,19 +595,74 @@ function App() {
         setReplyOpen(false)
         applySnapshot(nextSnapshot)
       } catch (cause) {
-        if (
-          resume?.version === 7 &&
-          cause instanceof ClientApiError &&
-          cause.code === 'REVIEW_EXPIRED'
-        ) {
-          clearCheckpoint()
-          setCheckpoint(null)
-          setRoundUrl(null, true)
+        if (cause instanceof ClientApiError) {
+          if (['REVIEW_EXPIRED', 'ROUND_NOT_FOUND'].includes(cause.code)) {
+            clearCheckpointForRound(roundId)
+          }
+          if (
+            [
+              'REVIEW_EXPIRED',
+              'ROUND_NOT_FOUND',
+              'ROUND_NOT_READY',
+              'ROUND_SNAPSHOT_INCOMPLETE',
+              'REVIEW_NOT_READY',
+            ].includes(cause.code)
+          ) {
+            setRoundUrl(null, true)
+          }
+        }
+        try {
+          await refreshRuns()
+        } catch {
+          setRunStatusError('Der aktuelle Rundenstatus konnte nicht geladen werden.')
         }
         setError(errorMessage(cause))
         setStatus('Runde konnte nicht geladen werden.')
       } finally {
         setLoading(false)
+      }
+    },
+    [applySnapshot, refreshRuns],
+  )
+
+  const finishLegacyMigration = useCallback(
+    async (roundId: string) => {
+      const legacy = legacyMigrationRef.current
+      if (!legacy || legacy.migrationRoundId !== roundId) return
+      setRunActionIds((current) => new Set(current).add(roundId))
+      setError(null)
+      setStatus('Alter Rundenstand wird wiederhergestellt …')
+      try {
+        const resumed = await api.review(roundId)
+        const desired = legacyMigrationState(legacy, resumed)
+        const current = { ...resumed.userState, revision: undefined }
+        const migratedState =
+          stableReviewStateJson(current) === stableReviewStateJson(desired)
+            ? resumed.userState
+            : resumed.userState.revision === 0
+              ? await api.updateReviewState(resumed, 0, desired)
+              : (() => {
+                  throw new Error(
+                    'Die bereits gespeicherte Runde hat einen anderen Stand. Der alte Rundenstand bleibt im Browser erhalten.',
+                  )
+                })()
+        if (!saveCheckpoint({ version: 7, roundId })) {
+          throw new Error(
+            'Die neue Runden-ID konnte nicht im Browser gespeichert werden. Der alte Rundenstand bleibt erhalten.',
+          )
+        }
+        legacyMigrationRef.current = null
+        setRoundUrl(roundId, true)
+        applySnapshot({ ...resumed, userState: migratedState })
+      } catch (cause) {
+        setError(`Der alte Rundenstand konnte nicht übertragen werden. ${errorMessage(cause)}`)
+        setStatus('Alter Rundenstand konnte nicht wiederhergestellt werden.')
+      } finally {
+        setRunActionIds((current) => {
+          const next = new Set(current)
+          next.delete(roundId)
+          return next
+        })
       }
     },
     [applySnapshot],
@@ -566,39 +678,163 @@ function App() {
   useEffect(() => {
     let active = true
     void (async () => {
-      const savedCheckpoint = loadCheckpoint()
       const pathRoundId = roundIdFromPath()
-      const [loadedOptions, loadedRound] = await Promise.allSettled([
-        api.options(),
-        pathRoundId ? api.review(pathRoundId) : Promise.resolve(null),
-      ])
+      let legacyCheckpoint: LegacyReviewCheckpoint | null = null
+      let checkpointError: string | null = null
+      if (!pathRoundId) {
+        try {
+          const saved = loadCheckpoint()
+          if (saved?.version === 6) legacyCheckpoint = saved
+        } catch (cause) {
+          checkpointError = errorMessage(cause)
+        }
+      }
+      const [loadedOptions, loadedRuns, loadedRound, loadedCodexSettings] =
+        await Promise.allSettled([
+          api.options(),
+          api.reviewRuns(),
+          pathRoundId ? api.review(pathRoundId) : Promise.resolve(null),
+          api.codexSettings(),
+        ])
       if (!active) return
-      if (loadedOptions.status === 'fulfilled') setOptions(loadedOptions.value)
-      else setError(errorMessage(loadedOptions.reason))
-      setCheckpoint(savedCheckpoint)
-      if (savedCheckpoint?.version === 6) setFilters(savedCheckpoint.filters)
+      if (loadedOptions.status === 'fulfilled') {
+        setOptions(loadedOptions.value)
+      } else setError(errorMessage(loadedOptions.reason))
+      if (loadedCodexSettings.status === 'fulfilled') {
+        setCodexSettings(loadedCodexSettings.value)
+      } else if (loadedOptions.status === 'fulfilled') {
+        setCodexSettings(loadedOptions.value.codex)
+      }
+      if (loadedRuns.status === 'fulfilled') setRuns(loadedRuns.value.runs)
+      else setError(errorMessage(loadedRuns.reason))
+      if (checkpointError) setError(checkpointError)
       if (loadedRound.status === 'fulfilled' && loadedRound.value) {
-        applySnapshot(loadedRound.value)
-        setRoundUrl(loadedRound.value.snapshotId, true)
+        if (loadedRound.value.bundleRun) {
+          applySnapshot(loadedRound.value)
+          setRoundUrl(loadedRound.value.snapshotId, true)
+        } else {
+          setRoundUrl(null, true)
+        }
       } else if (loadedRound.status === 'rejected') {
         if (
           loadedRound.reason instanceof ClientApiError &&
-          loadedRound.reason.code === 'REVIEW_EXPIRED'
+          ['REVIEW_EXPIRED', 'ROUND_NOT_FOUND'].includes(loadedRound.reason.code)
         ) {
-          if (savedCheckpoint?.version === 7 && savedCheckpoint.roundId === pathRoundId) {
-            clearCheckpoint()
-            setCheckpoint(null)
-          }
+          if (pathRoundId) clearCheckpointForRound(pathRoundId)
           setRoundUrl(null, true)
+        } else if (
+          loadedRound.reason instanceof ClientApiError &&
+          ['ROUND_NOT_READY', 'ROUND_SNAPSHOT_INCOMPLETE', 'REVIEW_NOT_READY'].includes(
+            loadedRound.reason.code,
+          )
+        ) {
+          setRoundUrl(null, true)
+        } else {
+          setError(errorMessage(loadedRound.reason))
         }
-        setError(errorMessage(loadedRound.reason))
+      }
+      if (!pathRoundId && legacyCheckpoint) {
+        legacyMigrationRef.current = legacyCheckpoint
+        setFilters(legacyCheckpoint.filters)
+        setStatus('Alter Rundenstand wird einmalig sicher gespeichert …')
+        try {
+          if (legacyCheckpoint.emailIds.length === 0) {
+            throw new Error(
+              'Der alte Rundenstand enthält keine Snapshot-IDs und kann nicht sicher übertragen werden. Er bleibt im Browser erhalten.',
+            )
+          }
+          let stagedCheckpoint = legacyCheckpoint
+          let migrationId = legacyCheckpoint.migrationRoundId
+          if (!migrationId) {
+            migrationId = crypto.randomUUID()
+            const staged = stageCheckpointMigration(legacyCheckpoint, migrationId)
+            if (!staged) {
+              throw new Error(
+                'Die Übertragung konnte nicht im Browser vorgemerkt werden. Der alte Rundenstand bleibt erhalten.',
+              )
+            }
+            stagedCheckpoint = staged
+            legacyMigrationRef.current = staged
+          }
+          const listedMigration =
+            migrationId && loadedRuns.status === 'fulfilled'
+              ? loadedRuns.value.runs.some((run) => run.id === migrationId)
+              : false
+          if (!listedMigration) {
+            await api.resumeReview(migrationId, stagedCheckpoint.emailIds, stagedCheckpoint.filters)
+          }
+          if (!active) return
+          setMigrationRoundId(migrationId ?? null)
+          setStatus('Die alte Runde wird analysiert und danach wiederhergestellt …')
+          await refreshRuns().catch(() => undefined)
+        } catch (cause) {
+          if (active) {
+            setError(`Der alte Rundenstand konnte nicht übertragen werden. ${errorMessage(cause)}`)
+          }
+        }
       }
       setLoading(false)
     })()
     return () => {
       active = false
     }
-  }, [applySnapshot])
+  }, [applySnapshot, refreshRuns])
+
+  useEffect(() => {
+    if (snapshot || (!migrationRoundId && !hasActiveRun)) return
+    let active = true
+    let polling = false
+    const poll = async () => {
+      if (polling) return
+      polling = true
+      try {
+        const response = await api.reviewRuns()
+        if (active) {
+          setRunStatusError(null)
+          setRuns((current) => {
+            if (!creatingRunRef.current) return response.runs
+            const persistedIds = new Set(response.runs.map((run) => run.id))
+            const pending = current.filter((run) => !run.csrfToken && !persistedIds.has(run.id))
+            return newestRunsFirst([...response.runs, ...pending])
+          })
+        }
+      } catch {
+        if (active) {
+          setRunStatusError(
+            'Der Rundenstatus kann gerade nicht aktualisiert werden. Der letzte Stand bleibt sichtbar.',
+          )
+        }
+      } finally {
+        polling = false
+      }
+    }
+    const timer = window.setInterval(() => void poll(), 1_000)
+    return () => {
+      active = false
+      window.clearInterval(timer)
+    }
+  }, [hasActiveRun, migrationRoundId, snapshot])
+
+  useEffect(() => {
+    if (!migrationRoundId || snapshot) return
+    const migrated = runs.find((run) => run.id === migrationRoundId)
+    if (!migrated) return
+    if (migrated.status === 'failed') {
+      setMigrationRoundId(null)
+      setError(
+        migrated.analysis.error ||
+          'Der alte Rundenstand wurde gespeichert, aber seine Analyse ist fehlgeschlagen.',
+      )
+      return
+    }
+    if (migrated.status !== 'ready') return
+    setMigrationRoundId(null)
+    if (legacyMigrationRef.current?.migrationRoundId === migrated.id) {
+      void finishLegacyMigration(migrated.id)
+    } else {
+      void openReview(migrated.id, true)
+    }
+  }, [finishLegacyMigration, migrationRoundId, openReview, runs, snapshot])
 
   useEffect(() => {
     let generation = 0
@@ -617,12 +853,18 @@ function App() {
         activeRoundIdRef.current = null
         activeSnapshotRef.current = null
         setError(null)
+        setSnapshot(null)
+        setBundleRun(null)
+        setDetails({})
+        setThreadContexts({})
+        setReplyProposals({})
+        setDraftResults({})
+        setResult(null)
+        setView('review')
+        setOverviewOpen(false)
+        setReplyOpen(false)
         if (!roundId) {
-          setSnapshot(null)
-          setBundleRun(null)
-          setResult(null)
-          setView('review')
-          setCheckpoint(loadCheckpoint())
+          void refreshRuns().catch(() => undefined)
           return
         }
         setLoading(true)
@@ -630,7 +872,19 @@ function App() {
           const round = await api.review(roundId)
           if (generation === currentGeneration) applySnapshot(round)
         } catch (cause) {
-          if (generation === currentGeneration) setError(errorMessage(cause))
+          if (generation === currentGeneration) {
+            if (
+              cause instanceof ClientApiError &&
+              ['REVIEW_EXPIRED', 'ROUND_NOT_FOUND'].includes(cause.code)
+            ) {
+              clearCheckpointForRound(roundId)
+            }
+            setRoundUrl(null, true)
+            setError(errorMessage(cause))
+            await refreshRuns().catch(() =>
+              setRunStatusError('Der aktuelle Rundenstatus konnte nicht geladen werden.'),
+            )
+          }
         } finally {
           if (generation === currentGeneration) setLoading(false)
         }
@@ -638,7 +892,7 @@ function App() {
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [applySnapshot, flushState])
+  }, [applySnapshot, flushState, refreshRuns])
 
   useEffect(() => {
     if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
@@ -655,24 +909,7 @@ function App() {
           const auth = await api.codexStatus()
           if (!active) return
           setOptions((current) => (current ? { ...current, codex: auth } : current))
-          const resumableSnapshot = activeSnapshotRef.current
-          if (
-            auth.configured &&
-            !codexFallbackRequestedRef.current &&
-            resumableSnapshot?.analysis.phase === 'waiting_for_codex' &&
-            resumableSnapshot.analysis.status === 'pending'
-          ) {
-            try {
-              const resumed = await api.bundles(resumableSnapshot)
-              if (!active) return
-              applySnapshot(resumed)
-            } catch (cause) {
-              if (active) {
-                setError(errorMessage(cause))
-                setStatus('Codex ist verbunden, aber die Analyse konnte nicht fortgesetzt werden.')
-              }
-            }
-          }
+          setCodexSettings(auth)
           if (active) setCodexLogin(next)
           return
         }
@@ -698,47 +935,7 @@ function App() {
       active = false
       window.clearInterval(timer)
     }
-  }, [applySnapshot, codexLoginId, codexLoginStatus])
-
-  useEffect(() => {
-    if (!analysisPollTarget || codexFallbackRequestedRef.current) return
-    const [analysisRoundId, analysisCsrfToken] = analysisPollTarget.split('\0')
-    if (!analysisRoundId || !analysisCsrfToken) return
-    let active = true
-    let timer = 0
-    void (async () => {
-      try {
-        if (codexFallbackRequestedRef.current) return
-        let nextSnapshot = await api.bundles({
-          csrfToken: analysisCsrfToken,
-          snapshotId: analysisRoundId,
-        })
-        while (
-          active &&
-          nextSnapshot.analysis.status !== 'complete' &&
-          nextSnapshot.analysis.phase !== 'waiting_for_codex' &&
-          !(nextSnapshot.analysis.status === 'pending' && nextSnapshot.analysis.error)
-        ) {
-          applyAnalysisProgress(nextSnapshot)
-          await new Promise<void>((resolve) => {
-            timer = window.setTimeout(resolve, 500)
-          })
-          if (!active) return
-          nextSnapshot = await api.review(analysisRoundId)
-        }
-        if (active) applySnapshot(nextSnapshot)
-      } catch (cause) {
-        if (active) {
-          setError(errorMessage(cause))
-          setStatus('Der Analysestatus konnte nicht geladen werden. Die Runde bleibt erhalten.')
-        }
-      }
-    })()
-    return () => {
-      active = false
-      window.clearTimeout(timer)
-    }
-  }, [analysisPollTarget, applyAnalysisProgress, applySnapshot])
+  }, [codexLoginId, codexLoginStatus])
 
   useLayoutEffect(() => {
     if (
@@ -903,13 +1100,14 @@ function App() {
       if (event.ctrlKey || event.metaKey || event.altKey) return
       if (submitting) return
       if (event.key === 'Escape') {
+        if (settingsOpen || deleteRun) return
         if (helpOpen) setHelpOpen(false)
-        else if (mergeOpen) setMergeOpen(false)
         else if (replyOpen) closeReply()
         else if (overviewOpen) setOverviewOpen(false)
         else if (view === 'confirm' && !snapshot?.finalization.selectionLocked) setView('review')
         return
       }
+      if (settingsOpen || deleteRun || helpOpen || replyOpen || overviewOpen) return
       if (replyLoading) return
       if (isTypingTarget(event.target)) return
       if (event.key === '?') {
@@ -935,15 +1133,16 @@ function App() {
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [
+    deleteRun,
     helpOpen,
     closeReply,
-    mergeOpen,
     next,
     openReply,
     overviewOpen,
     previous,
     replyLoading,
     replyOpen,
+    settingsOpen,
     snapshot?.finalization.selectionLocked,
     submitting,
     toggleCurrent,
@@ -1082,29 +1281,89 @@ function App() {
   }
 
   async function startNewReview() {
-    clearCheckpoint()
-    setCheckpoint(null)
-    restoredRef.current = false
-    activeRoundIdRef.current = null
-    activeSnapshotRef.current = null
-    setRoundUrl(null, true)
-    await startReview(filters, null)
+    if (creatingRunRef.current) return
+    creatingRunRef.current = true
+    setCreatingRun(true)
+    const id = crypto.randomUUID()
+    const now = new Date().toISOString()
+    const optimistic: ReviewRunSummary = {
+      analysis: {
+        callCount: 0,
+        engine: options?.mode === 'demo' ? 'heuristic' : 'codex',
+        model: codexSettings?.model ?? options?.codex.model,
+        phase: 'queued',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+        thinkingLevel: codexSettings?.thinkingLevel ?? options?.codex.thinkingLevel,
+        totalEmailCount: 0,
+      },
+      createdAt: now,
+      csrfToken: '',
+      emailCount: 0,
+      filters,
+      generation: 0,
+      id,
+      mode: options?.mode ?? 'live',
+      reanalyzable: false,
+      reviewStatus: 'active',
+      status: 'queued',
+      updatedAt: now,
+    }
+    setRuns((current) => replaceRun(current, optimistic))
+    setRunActionIds((current) => new Set(current).add(id))
+    setError(null)
+    window.requestAnimationFrame(() => {
+      document.getElementById(`run-${id}`)?.scrollIntoView({ block: 'center' })
+    })
+    try {
+      const created = await api.createReview(id, filters)
+      setRuns((current) => replaceRun(current, created))
+    } catch (cause) {
+      const message = errorMessage(cause)
+      const recovered = await api
+        .reviewRuns()
+        .then((response) => {
+          setRuns(response.runs)
+          return response.runs.some((run) => run.id === id)
+        })
+        .catch(() => null)
+      if (recovered === false) {
+        setRuns((current) => current.filter((run) => run.id !== id))
+        setError(message)
+      } else if (recovered === null) {
+        setRuns((current) =>
+          current.map((run) =>
+            run.id === id
+              ? {
+                  ...run,
+                  analysis: {
+                    ...run.analysis,
+                    error: 'Verbindung unterbrochen. Der Rundenstatus wird erneut abgeglichen.',
+                  },
+                }
+              : run,
+          ),
+        )
+        setError(`${message} Der Rundenstatus wird automatisch erneut abgeglichen.`)
+      }
+    } finally {
+      creatingRunRef.current = false
+      setCreatingRun(false)
+      setRunActionIds((current) => {
+        const next = new Set(current)
+        next.delete(id)
+        return next
+      })
+    }
   }
 
-  async function showSetup(discardCheckpoint = false) {
+  async function showSetup() {
     if (snapshot && restoredRef.current && !(await flushState())) return
-    if (discardCheckpoint) clearCheckpoint()
-    else if (snapshot) saveCheckpoint({ version: 7, roundId: snapshot.snapshotId })
+    if (snapshot) saveCheckpoint({ version: 7, roundId: snapshot.snapshotId })
     restoredRef.current = false
     activeRoundIdRef.current = null
     activeSnapshotRef.current = null
-    setCheckpoint(
-      discardCheckpoint
-        ? null
-        : snapshot
-          ? { version: 7, roundId: snapshot.snapshotId }
-          : loadCheckpoint(),
-    )
     setSnapshot(null)
     setBundleRun(null)
     setDetails({})
@@ -1119,175 +1378,139 @@ function App() {
     setError(null)
     setRoundUrl(null)
     try {
-      setOptions(await api.options())
+      const [nextOptions] = await Promise.all([api.options(), refreshRuns()])
+      setOptions(nextOptions)
+      setCodexSettings(nextOptions.codex)
     } catch (cause) {
       setError(errorMessage(cause))
+    }
+  }
+
+  async function deleteReview(run: ReviewRunSummary) {
+    if (!run.csrfToken) return
+    setDeleteRun(null)
+    setRunActionIds((current) => new Set(current).add(run.id))
+    setDeletingRunIds((current) => new Set(current).add(run.id))
+    setError(null)
+    try {
+      await api.deleteReview(run)
+      setRuns((current) => current.filter((item) => item.id !== run.id))
+      if (legacyMigrationRef.current?.migrationRoundId === run.id) {
+        setMigrationRoundId(null)
+      }
+      try {
+        const checkpoint = loadCheckpoint()
+        if (checkpoint?.version === 7 && checkpoint.roundId === run.id) clearCheckpoint()
+      } catch {
+        // An invalid legacy checkpoint is intentionally retained for visible startup recovery.
+      }
+    } catch (cause) {
+      setError(errorMessage(cause))
+      await refreshRuns().catch(() => undefined)
+    } finally {
+      setRunActionIds((current) => {
+        const next = new Set(current)
+        next.delete(run.id)
+        return next
+      })
+      setDeletingRunIds((current) => {
+        const next = new Set(current)
+        next.delete(run.id)
+        return next
+      })
+    }
+  }
+
+  async function reanalyzeReview(run: ReviewRunSummary) {
+    setRunActionIds((current) => new Set(current).add(run.id))
+    setError(null)
+    try {
+      const nextRun = await api.reanalyzeReview(run)
+      setRuns((current) => replaceRun(current, nextRun))
+      if (legacyMigrationRef.current?.migrationRoundId === run.id) setMigrationRoundId(run.id)
+    } catch (cause) {
+      setError(errorMessage(cause))
+      await refreshRuns().catch(() => undefined)
+    } finally {
+      setRunActionIds((current) => {
+        const next = new Set(current)
+        next.delete(run.id)
+        return next
+      })
     }
   }
 
   async function startCodexLogin() {
     setCodexLoginBusy(true)
-    setError(null)
+    setSettingsError(null)
     try {
       const { id } = await api.startCodexLogin()
       setCodexLogin({ id, status: 'starting', message: 'Anmeldung wird vorbereitet …' })
     } catch (cause) {
-      setError(errorMessage(cause))
+      setSettingsError(errorMessage(cause))
     } finally {
       setCodexLoginBusy(false)
     }
   }
 
-  async function changeCodexModel(model: CodexModelId) {
-    setCodexModelBusy(true)
-    setError(null)
+  async function changeCodexSettings(model: CodexModelId, thinkingLevel: CodexThinkingLevel) {
+    setCodexSettingsBusy(true)
+    setSettingsError(null)
     try {
-      const codex = await api.selectCodexModel(model)
+      const codex = await api.updateCodexSettings(model, thinkingLevel)
+      setCodexSettings(codex)
       setOptions((current) => (current ? { ...current, codex } : current))
-      setStatus(`Codex verwendet jetzt ${codexModels.find((item) => item.id === model)?.label}.`)
+      setStatus('Codex-Einstellungen gespeichert.')
     } catch (cause) {
-      setError(errorMessage(cause))
+      setSettingsError(errorMessage(cause))
     } finally {
-      setCodexModelBusy(false)
+      setCodexSettingsBusy(false)
     }
   }
 
-  async function continueWithoutCodex() {
-    if (!snapshot) return
-    if (codexFallbackRequestedRef.current) return
-    codexFallbackRequestedRef.current = true
-    setCodexFallbackBusy(true)
-    setError(null)
-    setStatus('Sichere Einzelansicht wird vorbereitet …')
-    try {
-      applySnapshot(await api.continueWithoutCodex(snapshot))
-    } catch (cause) {
-      codexFallbackRequestedRef.current = false
-      setError(errorMessage(cause))
-      setStatus('Die Runde wartet weiter auf Codex.')
-    } finally {
-      setCodexFallbackBusy(false)
-    }
-  }
-
-  async function splitSelectedOriginal() {
-    if (!snapshot || !bundleRun || !currentBundle || !summary || currentBundle.emailIds.length < 2)
-      return
-    const remainingIds = currentBundle.emailIds.filter((id) => id !== summary.id)
-    const selectedTimeline = currentBundle.timeline.filter((item) => item.emailId === summary.id)
-    const remainingTimeline = currentBundle.timeline.filter((item) => item.emailId !== summary.id)
-    const selectedBundle: ReviewBundle = {
-      bundleId: `split-${summary.id}`,
-      currentState: 'Einzelne Nachricht',
-      emailIds: [summary.id],
-      kind: 'standalone',
-      linkEvidence: [],
-      membershipConfidence: 1,
-      summary: summary.preview || summary.subject,
-      timeline: selectedTimeline,
-      title: summary.subject || '(Kein Betreff)',
-    }
-    const remainingBundle: ReviewBundle = {
-      ...currentBundle,
-      emailIds: remainingIds,
-      timeline: remainingTimeline,
-    }
-    setBundleRun({
-      ...bundleRun,
-      bundles: [
-        ...bundleRun.bundles.slice(0, index),
-        remainingBundle,
-        selectedBundle,
-        ...bundleRun.bundles.slice(index + 1),
-      ],
-    })
-    setSelectedMemberId(remainingIds[0] ?? summary.id)
-    setStatus('Original aus der Story gelöst. Die Korrektur wird für spätere Läufe gemerkt.')
-    try {
-      await api.bundleLabel(snapshot, {
-        anchorEmailIds: remainingIds,
-        candidateEmailIds: [summary.id],
-        label: 'split',
-      })
-    } catch (cause) {
-      setError(`Die Story wurde getrennt, aber die Lernkorrektur fehlte: ${errorMessage(cause)}`)
-    }
-  }
-
-  async function confirmCurrentBundle() {
-    if (!snapshot || !currentBundle || currentBundle.emailIds.length < 2) return
-    setConfirmedBundleIds((current) => new Set(current).add(currentBundle.bundleId))
-    setStatus('Verknüpfung bestätigt. Sie kann in späteren Läufen als Beispiel dienen.')
-    try {
-      await api.bundleLabel(snapshot, {
-        anchorEmailIds: [currentBundle.emailIds[0] as string],
-        candidateEmailIds: currentBundle.emailIds.slice(1),
-        label: 'merge',
-      })
-    } catch (cause) {
-      setConfirmedBundleIds((current) => {
-        const nextConfirmed = new Set(current)
-        nextConfirmed.delete(currentBundle.bundleId)
-        return nextConfirmed
-      })
-      setError(`Die Bestätigung konnte nicht gespeichert werden: ${errorMessage(cause)}`)
-    }
-  }
-
-  async function mergeCurrentBundle(targetIndex: number) {
-    if (!snapshot || !bundleRun || !currentBundle || targetIndex === index) return
-    const target = bundleRun.bundles[targetIndex]
-    if (!target) return
-    const mergedEmailIds = [...currentBundle.emailIds, ...target.emailIds].sort((left, right) => {
-      const leftEmail = emails.find((email) => email.id === left)
-      const rightEmail = emails.find((email) => email.id === right)
-      return Date.parse(leftEmail?.receivedAt ?? '') - Date.parse(rightEmail?.receivedAt ?? '')
-    })
-    const merged: ReviewBundle = {
-      ...currentBundle,
-      bundleId: `merged-${currentBundle.bundleId}-${target.bundleId}`,
-      emailIds: mergedEmailIds,
-      linkEvidence: [...new Set([...currentBundle.linkEvidence, ...target.linkEvidence])],
-      membershipConfidence: 1,
-      summary: `${currentBundle.summary} ${target.summary}`,
-      timeline: [...currentBundle.timeline, ...target.timeline].sort(
-        (left, right) => Date.parse(left.occurredAt) - Date.parse(right.occurredAt),
-      ),
-    }
-    const keepIndex = Math.min(index, targetIndex)
-    const nextBundles = bundleRun.bundles.filter(
-      (_bundle, bundleIndex) => bundleIndex !== index && bundleIndex !== targetIndex,
-    )
-    nextBundles.splice(keepIndex, 0, merged)
-    setBundleRun({ ...bundleRun, bundles: nextBundles })
-    setIndex(keepIndex)
-    setSelectedMemberId(merged.emailIds[0] ?? null)
-    setMergeOpen(false)
-    setStatus('Storys verbunden. Die Korrektur wird für spätere Läufe gemerkt.')
-    try {
-      await api.bundleLabel(snapshot, {
-        anchorEmailIds: currentBundle.emailIds,
-        candidateEmailIds: target.emailIds,
-        label: 'merge',
-      })
-    } catch (cause) {
-      setError(`Die Storys wurden verbunden, aber die Lernkorrektur fehlte: ${errorMessage(cause)}`)
-    }
-  }
-
-  const codexDialog =
-    codexLoginOpen && options ? (
-      <CodexLoginDialog
-        authConfigured={options.codex.configured}
-        busy={codexLoginBusy}
+  const settingsDialog =
+    settingsOpen && codexSettings ? (
+      <SettingsDialog
+        authBusy={codexLoginBusy}
+        authConfigured={codexSettings.configured}
+        error={settingsError}
         login={codexLogin}
-        model={options.codex.model}
-        modelBusy={codexModelBusy}
-        onClose={() => setCodexLoginOpen(false)}
-        onModelChange={(model) => void changeCodexModel(model)}
-        onStart={() => void startCodexLogin()}
+        model={codexSettings.model}
+        onClose={() => setSettingsOpen(false)}
+        onSave={(model, thinkingLevel) => void changeCodexSettings(model, thinkingLevel)}
+        onStartLogin={() => void startCodexLogin()}
+        saveBusy={codexSettingsBusy}
+        settingsEditable={options?.mode !== 'demo'}
+        thinkingLevel={codexSettings.thinkingLevel ?? 'high'}
       />
     ) : null
+
+  const setupPage = (
+    <>
+      <ReviewSetup
+        actionIds={runActionIds}
+        deletingIds={deletingRunIds}
+        deleteRun={deleteRun}
+        error={error ?? runStatusError}
+        filters={filters}
+        options={options}
+        runs={runs}
+        creatingRun={creatingRun}
+        onCancelDelete={() => setDeleteRun(null)}
+        onChange={setFilters}
+        onConfirmDelete={(run) => void deleteReview(run)}
+        onDelete={setDeleteRun}
+        onOpen={(run) => void openReview(run.id)}
+        onReanalyze={(run) => void reanalyzeReview(run)}
+        onSettings={() => {
+          setSettingsError(null)
+          setSettingsOpen(true)
+        }}
+        onStart={() => void startNewReview()}
+      />
+      {settingsDialog}
+    </>
+  )
 
   if (loading) {
     return (
@@ -1299,7 +1522,7 @@ function App() {
     )
   }
 
-  if (error && !options && !snapshot && !checkpoint) {
+  if (error && !options && !snapshot && runs.length === 0) {
     return (
       <main className="state-page">
         <h1>Postfach nicht erreichbar</h1>
@@ -1312,27 +1535,7 @@ function App() {
   }
 
   if (!snapshot) {
-    return (
-      <>
-        <ReviewSetup
-          checkpoint={checkpoint}
-          error={error}
-          filters={filters}
-          options={options}
-          onChange={setFilters}
-          onCodex={() => setCodexLoginOpen(true)}
-          onResume={() =>
-            checkpoint &&
-            void startReview(
-              checkpoint.version === 6 ? checkpoint.filters : defaultReviewFilters,
-              checkpoint,
-            )
-          }
-          onStart={() => void startNewReview()}
-        />
-        {codexDialog}
-      </>
-    )
+    return setupPage
   }
 
   if (emails.length === 0) {
@@ -1378,86 +1581,7 @@ function App() {
   }
 
   if (!bundleRun) {
-    const percent = Math.round(snapshot.analysis.progress * 100)
-    const waitingForCodex = snapshot.analysis.phase === 'waiting_for_codex'
-    return (
-      <>
-        <main
-          className="state-page analysis-page"
-          aria-busy={snapshot.analysis.status !== 'complete'}
-        >
-          {snapshot.analysis.status !== 'complete' &&
-            !snapshot.analysis.error &&
-            !waitingForCodex && <div className="spinner" aria-hidden="true" />}
-          <p className="analysis-origin">{analysisOrigin(snapshot.analysis)}</p>
-          <h1>
-            {waitingForCodex ? 'Codex-Anmeldung erforderlich' : 'Zusammenhänge werden analysiert'}
-          </h1>
-          <p>{analysisStatus(snapshot.analysis)}</p>
-          <div
-            className="analysis-progress"
-            role="progressbar"
-            aria-label="Analysefortschritt"
-            aria-valuemin={0}
-            aria-valuemax={100}
-            aria-valuenow={percent}
-          >
-            <span style={{ width: `${percent}%` }} />
-          </div>
-          <p className="analysis-detail">
-            {snapshot.analysis.processedEmailCount} von {snapshot.analysis.totalEmailCount}{' '}
-            Nachrichten · Runde {snapshot.snapshotId.slice(0, 8)}
-            {snapshot.analysis.callCount > 0 && ` · ${snapshot.analysis.callCount} Codex-Aufrufe`}
-          </p>
-          {waitingForCodex && (
-            <>
-              <div className="analysis-actions">
-                <button
-                  type="button"
-                  className="button primary analysis-login"
-                  disabled={codexFallbackBusy}
-                  onClick={() => setCodexLoginOpen(true)}
-                >
-                  Codex wieder verbinden
-                </button>
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={codexFallbackBusy}
-                  onClick={() => void continueWithoutCodex()}
-                >
-                  {codexFallbackBusy ? 'Wird vorbereitet …' : 'Ohne Codex fortsetzen'}
-                </button>
-              </div>
-              <p className="analysis-fallback-note">
-                Ohne Codex wird jede Nachricht einzeln angezeigt. Codex startet für diese Runde
-                später nicht erneut.
-              </p>
-            </>
-          )}
-          {(error ||
-            (snapshot.analysis.error && !waitingForCodex) ||
-            snapshot.analysis.status === 'complete') && (
-            <div className="inline-error" role="alert">
-              <strong>Die Runde bleibt gespeichert.</strong>
-              <p>
-                {error ||
-                  snapshot.analysis.error ||
-                  'Das Analyseergebnis ist unvollständig. Lade dieselbe Runde erneut.'}
-              </p>
-              <button
-                type="button"
-                className="button secondary"
-                onClick={() => window.location.reload()}
-              >
-                Dieselbe Runde neu laden
-              </button>
-            </div>
-          )}
-        </main>
-        {codexDialog}
-      </>
-    )
+    return setupPage
   }
 
   if (view === 'done' && result) {
@@ -1486,8 +1610,8 @@ function App() {
             </ul>
           </div>
         )}
-        <button type="button" className="button primary" onClick={() => void showSetup(true)}>
-          Neue Runde auswählen
+        <button type="button" className="button primary" onClick={() => void showSetup()}>
+          Zur Rundenübersicht
         </button>
       </main>
     )
@@ -1624,18 +1748,18 @@ function App() {
             {snapshot.analysis.callCount > 0 &&
               ` · ${snapshot.analysis.callCount} ${snapshot.analysis.callCount === 1 ? 'Aufruf' : 'Aufrufe'}`}
           </span>
-          {snapshot.mode === 'live' && (
-            <button
-              type="button"
-              className={`codex-status ${options?.codex.configured ? 'connected' : ''}`}
-              onClick={() => setCodexLoginOpen(true)}
-            >
-              <span aria-hidden="true" />
-              {options?.codex.configured ? 'Codex verbunden' : 'Codex anmelden'}
-            </button>
-          )}
+          <button
+            type="button"
+            className="text-button"
+            onClick={() => {
+              setSettingsError(null)
+              setSettingsOpen(true)
+            }}
+          >
+            Einstellungen
+          </button>
           <button type="button" className="text-button" onClick={() => void showSetup()}>
-            Neue Auswahl
+            Runden
           </button>
           <button
             type="button"
@@ -1696,37 +1820,6 @@ function App() {
               {currentBundle.emailIds.length}{' '}
               {currentBundle.emailIds.length === 1 ? 'Original' : 'Originale'}
             </span>
-            <div>
-              <button
-                type="button"
-                className="text-button"
-                disabled={bundles.length < 2}
-                onClick={() => setMergeOpen(true)}
-              >
-                Mit anderer Story verbinden
-              </button>
-              <button
-                type="button"
-                className="text-button"
-                disabled={
-                  currentBundle.emailIds.length < 2 ||
-                  confirmedBundleIds.has(currentBundle.bundleId)
-                }
-                onClick={() => void confirmCurrentBundle()}
-              >
-                {confirmedBundleIds.has(currentBundle.bundleId)
-                  ? 'Verknüpfung bestätigt'
-                  : 'Verknüpfung stimmt'}
-              </button>
-              <button
-                type="button"
-                className="text-button"
-                disabled={currentBundle.emailIds.length < 2}
-                onClick={() => void splitSelectedOriginal()}
-              >
-                Ausgewähltes Original lösen
-              </button>
-            </div>
           </div>
         </section>
         <article className="message-card">
@@ -1910,19 +2003,11 @@ function App() {
             setReplyOpen(false)
             setOverviewOpen(false)
           }}
-          onDiscard={() => void showSetup(true)}
+          onDiscard={() => void showSetup()}
         />
       )}
       {helpOpen && <HelpDialog isSpamReview={isSpamReview} onClose={() => setHelpOpen(false)} />}
-      {mergeOpen && (
-        <MergeDialog
-          bundles={bundles}
-          currentIndex={index}
-          onClose={() => setMergeOpen(false)}
-          onSelect={(targetIndex) => void mergeCurrentBundle(targetIndex)}
-        />
-      )}
-      {codexDialog}
+      {settingsDialog}
       {replyOpen && (
         <ReplyPanel
           context={thread}
@@ -1941,46 +2026,104 @@ function App() {
   )
 }
 
-function MergeDialog({
-  bundles,
-  currentIndex,
-  onClose,
-  onSelect,
+function runStatus(run: ReviewRunSummary) {
+  if (run.status === 'queued') return 'Wartet'
+  if (run.status === 'fetching') return 'Postfach wird geladen'
+  if (run.status === 'analyzing') return 'Wird analysiert'
+  if (run.status === 'ready') {
+    if (run.reviewStatus === 'finalizing') return 'Wird abgeschlossen'
+    return run.reviewStatus === 'finalized' ? 'Abgeschlossen' : 'Bereit'
+  }
+  return 'Fehlgeschlagen'
+}
+
+function runProgressText(run: ReviewRunSummary) {
+  if (run.status === 'ready') {
+    return `${run.emailCount} ${run.emailCount === 1 ? 'Nachricht' : 'Nachrichten'} analysiert`
+  }
+  if (run.status === 'failed') return 'Analyse nicht abgeschlossen'
+  if (run.status === 'queued') return 'Runde wird angelegt'
+  if (run.status === 'fetching') {
+    return run.analysis.totalEmailCount > 0
+      ? `${run.analysis.processedEmailCount} von ${run.analysis.totalEmailCount} Nachrichten geladen`
+      : 'Nachrichten werden von Fastmail geladen'
+  }
+  const phase = analysisStatus(run.analysis).replace(/ …$/, '')
+  const progress =
+    run.analysis.totalEmailCount > 0
+      ? `${phase} · ${run.analysis.processedEmailCount} von ${run.analysis.totalEmailCount}`
+      : phase
+  if (run.analysis.callCount === 0) return progress
+  return `${progress} · ${run.analysis.callCount} ${run.analysis.callCount === 1 ? 'Codex-Aufruf' : 'Codex-Aufrufe'}`
+}
+
+function runScope(run: ReviewRunSummary, options: ReviewOptions | null) {
+  const mailbox = options?.mailboxes.find((item) => item.id === run.filters.mailboxId)?.name
+  const scope = run.filters.spam === 'only' ? 'Spam' : (mailbox ?? 'Ungelesene Nachrichten')
+  const range =
+    run.filters.timeRange === 'all'
+      ? 'alle Zeiträume'
+      : run.filters.timeRange === '24h'
+        ? '24 Stunden'
+        : run.filters.timeRange === '7d'
+          ? '7 Tage'
+          : '30 Tage'
+  return `${scope} · ${range}`
+}
+
+function TrashIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+      <path
+        d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+    </svg>
+  )
+}
+
+function DeleteRunDialog({
+  run,
+  onCancel,
+  onConfirm,
 }: {
-  bundles: ReviewBundle[]
-  currentIndex: number
-  onClose: () => void
-  onSelect: (index: number) => void
+  run: ReviewRunSummary
+  onCancel: () => void
+  onConfirm: () => void
 }) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
+  const active = ['queued', 'fetching', 'analyzing'].includes(run.status)
   return (
     <div className="dialog-backdrop">
       <section
         ref={dialogRef}
-        className="dialog merge-dialog"
-        role="dialog"
+        className="dialog delete-run-dialog"
+        role="alertdialog"
         aria-modal="true"
-        aria-labelledby="merge-title"
+        aria-labelledby="delete-run-title"
+        aria-describedby="delete-run-description"
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') onCancel()
+        }}
         tabIndex={-1}
       >
-        <div className="dialog-header">
-          <div>
-            <h2 id="merge-title">Story verbinden</h2>
-            <p className="dialog-kicker">Welche Story beschreibt denselben Zusammenhang?</p>
-          </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
-            ×
+        <h2 id="delete-run-title">Runde löschen?</h2>
+        <p id="delete-run-description">
+          {active
+            ? 'Die laufende Verarbeitung wird abgebrochen. Danach wird die Runde dauerhaft gelöscht.'
+            : 'Die Runde und ihr gespeichertes Analyseergebnis werden dauerhaft gelöscht.'}
+        </p>
+        <div className="button-row">
+          <button type="button" className="button secondary" onClick={onCancel}>
+            Abbrechen
           </button>
-        </div>
-        <div className="merge-list">
-          {bundles.map((bundle, bundleIndex) =>
-            bundleIndex === currentIndex ? null : (
-              <button type="button" key={bundle.bundleId} onClick={() => onSelect(bundleIndex)}>
-                <strong>{bundle.title}</strong>
-                <span>{bundle.emailIds.length} Nachrichten</span>
-              </button>
-            ),
-          )}
+          <button type="button" className="button danger" onClick={onConfirm}>
+            Runde löschen
+          </button>
         </div>
       </section>
     </div>
@@ -1988,22 +2131,38 @@ function MergeDialog({
 }
 
 function ReviewSetup({
-  checkpoint,
+  actionIds,
+  creatingRun,
+  deletingIds,
+  deleteRun,
   error,
   filters,
   options,
+  runs,
+  onCancelDelete,
   onChange,
-  onCodex,
-  onResume,
+  onConfirmDelete,
+  onDelete,
+  onOpen,
+  onReanalyze,
+  onSettings,
   onStart,
 }: {
-  checkpoint: LoadedReviewCheckpoint | null
+  actionIds: ReadonlySet<string>
+  creatingRun: boolean
+  deletingIds: ReadonlySet<string>
+  deleteRun: ReviewRunSummary | null
   error: string | null
   filters: ReviewFilters
   options: ReviewOptions | null
+  runs: ReviewRunSummary[]
+  onCancelDelete: () => void
   onChange: (filters: ReviewFilters) => void
-  onCodex: () => void
-  onResume: () => void
+  onConfirmDelete: (run: ReviewRunSummary) => void
+  onDelete: (run: ReviewRunSummary) => void
+  onOpen: (run: ReviewRunSummary) => void
+  onReanalyze: (run: ReviewRunSummary) => void
+  onSettings: () => void
   onStart: () => void
 }) {
   const [mailboxQuery, setMailboxQuery] = useState('')
@@ -2029,211 +2188,305 @@ function ReviewSetup({
       .includes(mailboxQuery.trim().toLocaleLowerCase('de-DE')),
   )
   return (
-    <main className="setup-page">
-      <header className="setup-header">
-        <h1>Inbox Walk</h1>
-        <p>Stell die Runde zusammen, bevor eine einzige Nachricht geladen wird.</p>
-      </header>
-
-      {checkpoint && (checkpoint.version === 7 || checkpoint.emailIds.length > 0) && (
-        <section className="resume-review" aria-labelledby="resume-title">
-          <div>
-            <h2 id="resume-title">Offene Runde</h2>
-            <p>
-              {checkpoint.version === 7
-                ? `Runde ${checkpoint.roundId.slice(0, 8)} · serverseitig gespeichert`
-                : `${checkpoint.emailIds.length} Nachrichten · ${checkpoint.processedIds.length} bearbeitet`}
-            </p>
-          </div>
-          <button type="button" className="button secondary" onClick={onResume}>
-            Runde fortsetzen
+    <>
+      <main className="setup-page">
+        <header className="setup-header">
+          <h1>Inbox Walk</h1>
+          <button type="button" className="button secondary" onClick={onSettings}>
+            Einstellungen
           </button>
-        </section>
-      )}
+        </header>
 
-      {options?.mode === 'live' && (
-        <section className="setup-integration" aria-labelledby="setup-codex-title">
-          <div>
-            <h2 id="setup-codex-title">Zusammenhänge mit Codex</h2>
-            <p>
-              {options.codex.configured
-                ? `Verbunden mit ${codexModels.find((model) => model.id === options.codex.model)?.label}. Codex prüft die Kandidaten einmal beim Start einer neuen Runde.`
-                : 'Nicht verbunden. Eine neue Runde nutzt sonst nur die lokale Analyse.'}
-            </p>
+        <section className="runs-section" aria-labelledby="runs-title">
+          <div className="runs-heading">
+            <h2 id="runs-title">Runden</h2>
+            <p>Eine Runde lässt sich öffnen, sobald Codex alle Nachrichten analysiert hat.</p>
           </div>
-          <button type="button" className="button secondary" onClick={onCodex}>
-            {options.codex.configured ? 'Codex einstellen' : 'Codex verbinden'}
-          </button>
-        </section>
-      )}
-
-      <form
-        className="setup-form"
-        onSubmit={(event) => {
-          event.preventDefault()
-          onStart()
-        }}
-      >
-        <section className="setup-section" aria-labelledby="scope-title">
-          <div className="setup-section-heading">
-            <h2 id="scope-title">Bereich</h2>
-            <p>Was soll in dieser Runde auftauchen?</p>
-          </div>
-          <div className="scope-choices">
-            <button
-              type="button"
-              className="setup-choice"
-              aria-pressed={filters.spam === 'exclude'}
-              onClick={() => onChange({ ...filters, spam: 'exclude' })}
-            >
-              <span className="choice-box" aria-hidden="true">
-                {filters.spam === 'exclude' ? '✓' : ''}
-              </span>
-              <span>
-                <strong>Alles außer Spam</strong>
-                <small>Die normale ungelesene Post</small>
-              </span>
-            </button>
-            <button
-              type="button"
-              className="setup-choice"
-              aria-pressed={filters.spam === 'only'}
-              onClick={() => onChange({ ...filters, mailboxId: null, spam: 'only' })}
-            >
-              <span className="choice-box" aria-hidden="true">
-                {filters.spam === 'only' ? '✓' : ''}
-              </span>
-              <span>
-                <strong>Nur Spam</strong>
-                <small>Mit ↓ falsch erkannte Mails zurückholen</small>
-              </span>
-            </button>
-          </div>
-        </section>
-
-        <section className="setup-section" aria-labelledby="time-title">
-          <div className="setup-section-heading">
-            <h2 id="time-title">Zeitraum</h2>
-            <p>Direkt wählen, ohne Menü.</p>
-          </div>
-          <div className="direct-choices">
-            {timeRanges.map((range) => (
-              <button
-                type="button"
-                key={range.value}
-                aria-pressed={filters.timeRange === range.value}
-                onClick={() => onChange({ ...filters, timeRange: range.value })}
-              >
-                {range.label}
-              </button>
-            ))}
-          </div>
-        </section>
-
-        <section className="setup-section" aria-labelledby="narrow-title">
-          <div className="setup-section-heading">
-            <h2 id="narrow-title">Eingrenzen</h2>
-            <p>Optional – nichts davon muss gewählt werden.</p>
-          </div>
-          <label className="setup-check history-check">
-            <input
-              type="checkbox"
-              checked={filters.hideReviewed}
-              onChange={(event) => onChange({ ...filters, hideReviewed: event.target.checked })}
-            />
-            <span className="choice-box" aria-hidden="true">
-              {filters.hideReviewed ? '✓' : ''}
-            </span>
-            <span>
-              <strong>Zurückgestellte Nachrichten ausblenden</strong>
-              <small>
-                {options?.reviewedCount === 1
-                  ? '1 Nachricht wurde angesehen und bewusst ungelesen behalten'
-                  : `${options?.reviewedCount ?? 0} Nachrichten wurden angesehen und bewusst ungelesen behalten`}
-              </small>
-            </span>
-          </label>
-
-          <div className="setup-subsection">
-            <h3>Newsletter</h3>
-            <div className="direct-choices">
-              {newsletterFilters.map((filter) => (
-                <button
-                  type="button"
-                  key={filter.value}
-                  aria-pressed={filters.newsletter === filter.value}
-                  onClick={() => onChange({ ...filters, newsletter: filter.value })}
-                >
-                  {filter.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {filters.spam === 'exclude' && mailboxes.length > 0 && (
-            <details className="mailbox-picker" open={selectedMailbox ? true : undefined}>
-              <summary>
-                <span>Postfach einschränken</span>
-                <small>{selectedMailbox?.name ?? 'Alle Postfächer'}</small>
-              </summary>
-              <div className="mailbox-picker-body">
-                <input
-                  type="search"
-                  value={mailboxQuery}
-                  onChange={(event) => setMailboxQuery(event.target.value)}
-                  placeholder="Postfach suchen …"
-                  aria-label="Postfach suchen"
-                />
-                <div className="mailbox-choices">
-                  {selectedMailbox && (
-                    <button
-                      type="button"
-                      className="clear-mailbox"
-                      onClick={() => onChange({ ...filters, mailboxId: null })}
-                    >
-                      Auswahl aufheben
-                    </button>
-                  )}
-                  {visibleMailboxes.map((mailbox) => {
-                    const checked = filters.mailboxId === mailbox.id
+          {runs.length === 0 ? (
+            <p className="runs-empty">Noch keine Runde. Lege unten die erste an.</p>
+          ) : (
+            <div className="runs-table-wrap">
+              <table className="runs-table">
+                <thead>
+                  <tr>
+                    <th scope="col">Runde</th>
+                    <th scope="col">Status</th>
+                    <th scope="col">Fortschritt</th>
+                    <th scope="col">Erstellt</th>
+                    <th scope="col">
+                      <span className="sr-only">Aktionen</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {runs.map((run) => {
+                    const busy = actionIds.has(run.id)
+                    const deleting = deletingIds.has(run.id)
+                    const deletionBlocked = run.reviewStatus === 'finalizing'
+                    const percent =
+                      run.status === 'ready'
+                        ? 100
+                        : Math.min(100, Math.round(run.analysis.progress * 100))
                     return (
-                      <label className="setup-check compact" key={mailbox.id}>
-                        <input
-                          type="checkbox"
-                          checked={checked}
-                          onChange={() =>
-                            onChange({ ...filters, mailboxId: checked ? null : mailbox.id })
-                          }
-                        />
-                        <span className="choice-box" aria-hidden="true">
-                          {checked ? '✓' : ''}
-                        </span>
-                        <span>{mailbox.name}</span>
-                      </label>
+                      <tr
+                        key={run.id}
+                        id={`run-${run.id}`}
+                        data-status={run.status}
+                        aria-busy={busy}
+                      >
+                        <td data-label="Runde">
+                          <strong>Runde {run.id.slice(0, 8)}</strong>
+                          <small>{runScope(run, options)}</small>
+                        </td>
+                        <td data-label="Status">
+                          <span
+                            className={`run-status ${run.status}`}
+                            role="status"
+                            aria-live="polite"
+                            aria-atomic="true"
+                          >
+                            {deleting ? 'Wird gelöscht' : runStatus(run)}
+                          </span>
+                          {run.analysis.error && (
+                            <small className="run-error">{run.analysis.error}</small>
+                          )}
+                        </td>
+                        <td data-label="Fortschritt">
+                          <div
+                            className="run-progress"
+                            role="progressbar"
+                            aria-label={`Fortschritt der Runde ${run.id.slice(0, 8)}`}
+                            aria-valuemin={0}
+                            aria-valuemax={100}
+                            aria-valuenow={percent}
+                            aria-valuetext={runProgressText(run)}
+                          >
+                            <span style={{ width: `${percent}%` }} />
+                          </div>
+                          <small>
+                            {deleting ? 'Verarbeitung wird abgebrochen' : runProgressText(run)}
+                          </small>
+                        </td>
+                        <td data-label="Erstellt">
+                          <time dateTime={run.createdAt}>{formatDate(run.createdAt)}</time>
+                        </td>
+                        <td className="run-actions">
+                          <button
+                            type="button"
+                            className="button secondary run-open"
+                            disabled={run.status !== 'ready' || busy}
+                            onClick={() => onOpen(run)}
+                          >
+                            Runde öffnen
+                          </button>
+                          <button
+                            type="button"
+                            className="text-button"
+                            disabled={!run.csrfToken || !run.reanalyzable || busy}
+                            onClick={() => onReanalyze(run)}
+                          >
+                            Mit Codex neu analysieren
+                          </button>
+                          <button
+                            type="button"
+                            className="icon-button run-delete"
+                            disabled={!run.csrfToken || busy || deletionBlocked}
+                            onClick={() => onDelete(run)}
+                            aria-label={`Runde ${run.id.slice(0, 8)} löschen`}
+                            title={
+                              deletionBlocked
+                                ? 'Die Runde wird gerade abgeschlossen'
+                                : 'Runde löschen'
+                            }
+                          >
+                            <TrashIcon />
+                          </button>
+                        </td>
+                      </tr>
                     )
                   })}
-                  {visibleMailboxes.length === 0 && (
-                    <p className="empty-mailboxes">Kein passendes Postfach.</p>
-                  )}
-                </div>
-              </div>
-            </details>
+                </tbody>
+              </table>
+            </div>
           )}
         </section>
 
-        {error && (
-          <p className="setup-error" role="alert">
-            {error}
-          </p>
-        )}
-        <footer className="setup-footer">
-          <p>Die Auswahl wird als feste Runde geladen. Änderungen passieren erst beim Abschluss.</p>
-          <button type="submit" className="button primary">
-            Review starten
-          </button>
-        </footer>
-      </form>
-    </main>
+        <form
+          className="setup-form"
+          onSubmit={(event) => {
+            event.preventDefault()
+            onStart()
+          }}
+        >
+          <h2 className="new-run-title">Neue Runde</h2>
+          <section className="setup-section" aria-labelledby="scope-title">
+            <div className="setup-section-heading">
+              <h2 id="scope-title">Bereich</h2>
+              <p>Was soll in dieser Runde auftauchen?</p>
+            </div>
+            <div className="scope-choices">
+              <button
+                type="button"
+                className="setup-choice"
+                aria-pressed={filters.spam === 'exclude'}
+                onClick={() => onChange({ ...filters, spam: 'exclude' })}
+              >
+                <span className="choice-box" aria-hidden="true">
+                  {filters.spam === 'exclude' ? '✓' : ''}
+                </span>
+                <span>
+                  <strong>Alles außer Spam</strong>
+                  <small>Die normale ungelesene Post</small>
+                </span>
+              </button>
+              <button
+                type="button"
+                className="setup-choice"
+                aria-pressed={filters.spam === 'only'}
+                onClick={() => onChange({ ...filters, mailboxId: null, spam: 'only' })}
+              >
+                <span className="choice-box" aria-hidden="true">
+                  {filters.spam === 'only' ? '✓' : ''}
+                </span>
+                <span>
+                  <strong>Nur Spam</strong>
+                  <small>Mit ↓ falsch erkannte Mails zurückholen</small>
+                </span>
+              </button>
+            </div>
+          </section>
+
+          <section className="setup-section" aria-labelledby="time-title">
+            <div className="setup-section-heading">
+              <h2 id="time-title">Zeitraum</h2>
+              <p>Direkt wählen, ohne Menü.</p>
+            </div>
+            <div className="direct-choices">
+              {timeRanges.map((range) => (
+                <button
+                  type="button"
+                  key={range.value}
+                  aria-pressed={filters.timeRange === range.value}
+                  onClick={() => onChange({ ...filters, timeRange: range.value })}
+                >
+                  {range.label}
+                </button>
+              ))}
+            </div>
+          </section>
+
+          <section className="setup-section" aria-labelledby="narrow-title">
+            <div className="setup-section-heading">
+              <h2 id="narrow-title">Eingrenzen</h2>
+              <p>Optional – nichts davon muss gewählt werden.</p>
+            </div>
+            <label className="setup-check history-check">
+              <input
+                type="checkbox"
+                checked={filters.hideReviewed}
+                onChange={(event) => onChange({ ...filters, hideReviewed: event.target.checked })}
+              />
+              <span className="choice-box" aria-hidden="true">
+                {filters.hideReviewed ? '✓' : ''}
+              </span>
+              <span>
+                <strong>Zurückgestellte Nachrichten ausblenden</strong>
+                <small>
+                  {options?.reviewedCount === 1
+                    ? '1 Nachricht wurde angesehen und bewusst ungelesen behalten'
+                    : `${options?.reviewedCount ?? 0} Nachrichten wurden angesehen und bewusst ungelesen behalten`}
+                </small>
+              </span>
+            </label>
+
+            <div className="setup-subsection">
+              <h3>Newsletter</h3>
+              <div className="direct-choices">
+                {newsletterFilters.map((filter) => (
+                  <button
+                    type="button"
+                    key={filter.value}
+                    aria-pressed={filters.newsletter === filter.value}
+                    onClick={() => onChange({ ...filters, newsletter: filter.value })}
+                  >
+                    {filter.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {filters.spam === 'exclude' && mailboxes.length > 0 && (
+              <details className="mailbox-picker" open={selectedMailbox ? true : undefined}>
+                <summary>
+                  <span>Postfach einschränken</span>
+                  <small>{selectedMailbox?.name ?? 'Alle Postfächer'}</small>
+                </summary>
+                <div className="mailbox-picker-body">
+                  <input
+                    type="search"
+                    value={mailboxQuery}
+                    onChange={(event) => setMailboxQuery(event.target.value)}
+                    placeholder="Postfach suchen …"
+                    aria-label="Postfach suchen"
+                  />
+                  <div className="mailbox-choices">
+                    {selectedMailbox && (
+                      <button
+                        type="button"
+                        className="clear-mailbox"
+                        onClick={() => onChange({ ...filters, mailboxId: null })}
+                      >
+                        Auswahl aufheben
+                      </button>
+                    )}
+                    {visibleMailboxes.map((mailbox) => {
+                      const checked = filters.mailboxId === mailbox.id
+                      return (
+                        <label className="setup-check compact" key={mailbox.id}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() =>
+                              onChange({ ...filters, mailboxId: checked ? null : mailbox.id })
+                            }
+                          />
+                          <span className="choice-box" aria-hidden="true">
+                            {checked ? '✓' : ''}
+                          </span>
+                          <span>{mailbox.name}</span>
+                        </label>
+                      )
+                    })}
+                    {visibleMailboxes.length === 0 && (
+                      <p className="empty-mailboxes">Kein passendes Postfach.</p>
+                    )}
+                  </div>
+                </div>
+              </details>
+            )}
+          </section>
+
+          {error && (
+            <p className="setup-error" role="alert">
+              {error}
+            </p>
+          )}
+          <footer className="setup-footer">
+            <p>Beim Start wird sofort eine gespeicherte Runde angelegt.</p>
+            <button type="submit" className="button primary" disabled={creatingRun}>
+              {creatingRun ? 'Runde wird angelegt …' : 'Runde starten'}
+            </button>
+          </footer>
+        </form>
+      </main>
+      {deleteRun && (
+        <DeleteRunDialog
+          run={deleteRun}
+          onCancel={onCancelDelete}
+          onConfirm={() => onConfirmDelete(deleteRun)}
+        />
+      )}
+    </>
   )
 }
 
@@ -2322,7 +2575,7 @@ function OverviewDrawer({
         </ol>
         <div className="drawer-footer">
           <button type="button" className="danger-link" onClick={onDiscard}>
-            Runde verwerfen und neue Auswahl treffen
+            Zur Rundenübersicht
           </button>
         </div>
       </aside>
@@ -2401,110 +2654,162 @@ function HelpDialog({
   )
 }
 
-function CodexLoginDialog({
+const thinkingLevelOptions: Array<{
+  label: string
+  value: CodexThinkingLevel
+}> = [
+  { label: 'Aus', value: 'off' },
+  { label: 'Minimal', value: 'minimal' },
+  { label: 'Niedrig', value: 'low' },
+  { label: 'Mittel', value: 'medium' },
+  { label: 'Hoch', value: 'high' },
+  { label: 'Sehr hoch', value: 'xhigh' },
+  { label: 'Maximum', value: 'max' },
+]
+
+function SettingsDialog({
+  authBusy,
   authConfigured,
-  busy,
+  error,
   login,
   model,
-  modelBusy,
   onClose,
-  onModelChange,
-  onStart,
+  onSave,
+  onStartLogin,
+  saveBusy,
+  settingsEditable,
+  thinkingLevel,
 }: {
+  authBusy: boolean
   authConfigured: boolean
-  busy: boolean
+  error: string | null
   login: CodexLoginState | null
   model: CodexModelId
-  modelBusy: boolean
   onClose: () => void
-  onModelChange: (model: CodexModelId) => void
-  onStart: () => void
+  onSave: (model: CodexModelId, thinkingLevel: CodexThinkingLevel) => void
+  onStartLogin: () => void
+  saveBusy: boolean
+  settingsEditable: boolean
+  thinkingLevel: CodexThinkingLevel
 }) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
   const [selectedModel, setSelectedModel] = useState<CodexModelId>(model)
+  const [selectedThinkingLevel, setSelectedThinkingLevel] =
+    useState<CodexThinkingLevel>(thinkingLevel)
   const waiting = login?.status === 'starting' || login?.status === 'waiting'
   useEffect(() => setSelectedModel(model), [model])
+  useEffect(() => setSelectedThinkingLevel(thinkingLevel), [thinkingLevel])
+  const unchanged = selectedModel === model && selectedThinkingLevel === thinkingLevel
   return (
     <div className="dialog-backdrop">
       <section
         ref={dialogRef}
-        className="dialog codex-dialog"
+        className="dialog settings-dialog"
         role="dialog"
         aria-modal="true"
-        aria-labelledby="codex-title"
+        aria-labelledby="settings-title"
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') onClose()
+        }}
         tabIndex={-1}
       >
         <div className="dialog-header">
-          <div>
-            <h2 id="codex-title">Codex einrichten</h2>
-            <p className="dialog-kicker">ChatGPT-Abo</p>
-          </div>
+          <h2 id="settings-title">Einstellungen</h2>
           <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
             ×
           </button>
         </div>
-        <p className="dialog-note">
-          OpenAI erneuert diese OAuth-Anmeldung automatisch. Sie bleibt auf dem privaten
-          App-Speicher; ein OpenAI-API-Schlüssel ist nicht nötig.
-        </p>
-        <fieldset className="codex-model-section">
-          <legend>Modell</legend>
-          <p>Gilt für neue Bundles und Antwortentwürfe.</p>
-          <div className="codex-model-list">
-            {codexModels.map((option) => (
-              <label
-                className="codex-model-choice"
-                data-selected={selectedModel === option.id}
-                key={option.id}
+        <section className="settings-section" aria-labelledby="settings-codex-title">
+          <div className="settings-section-heading">
+            <div>
+              <h3 id="settings-codex-title">Codex</h3>
+              <p>
+                Codex prüft vor dem Öffnen jeder Runde, welche Nachrichten zu derselben Story
+                gehören. Modell und Denkaufwand gelten für neue Analysen und Antwortentwürfe.
+              </p>
+            </div>
+            <span className={`connection-state ${authConfigured ? 'connected' : ''}`}>
+              {authConfigured ? 'Verbunden' : 'Nicht verbunden'}
+            </span>
+          </div>
+          <div className="settings-fields">
+            <label>
+              Modell
+              <select
+                value={selectedModel}
+                disabled={saveBusy || !settingsEditable}
+                onChange={(event) => setSelectedModel(event.target.value as CodexModelId)}
               >
-                <input
-                  type="radio"
-                  name="codex-model"
-                  value={option.id}
-                  checked={selectedModel === option.id}
-                  disabled={modelBusy}
-                  onChange={() => setSelectedModel(option.id)}
-                />
-                <span>
-                  <strong>{option.label}</strong>
-                  <small>{option.description}</small>
-                </span>
-              </label>
-            ))}
+                {codexModels.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <small>
+                {codexModels.find((option) => option.id === selectedModel)?.description}
+              </small>
+            </label>
+            <label>
+              Denkaufwand
+              <select
+                value={selectedThinkingLevel}
+                disabled={saveBusy || !settingsEditable}
+                onChange={(event) =>
+                  setSelectedThinkingLevel(event.target.value as CodexThinkingLevel)
+                }
+              >
+                {thinkingLevelOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              <small>Mehr Denkaufwand kann gründlicher sein, braucht aber länger.</small>
+            </label>
           </div>
-          <button
-            type="button"
-            className="button secondary codex-model-save"
-            disabled={modelBusy || selectedModel === model}
-            onClick={() => onModelChange(selectedModel)}
-          >
-            {modelBusy ? 'Wird gespeichert …' : 'Modell speichern'}
-          </button>
-        </fieldset>
-        {login ? (
-          <div className={`codex-login-state ${login.status}`} aria-live="polite">
-            <strong>{login.message}</strong>
-            {login.userCode && <code>{login.userCode}</code>}
-            {login.url && (
-              <a className="button primary" href={login.url} target="_blank" rel="noreferrer">
-                OpenAI-Anmeldung öffnen
-              </a>
-            )}
-          </div>
-        ) : (
-          <p className={`codex-current ${authConfigured ? 'connected' : ''}`}>
-            {authConfigured ? 'Codex ist verbunden.' : 'Codex ist noch nicht verbunden.'}
-          </p>
-        )}
+          {!settingsEditable && (
+            <p className="settings-demo-note">Im Demo-Modus sind diese Werte fest eingestellt.</p>
+          )}
+          {error && (
+            <p className="settings-error" role="alert">
+              {error}
+            </p>
+          )}
+          {login && (
+            <div className={`codex-login-state ${login.status}`} aria-live="polite">
+              <strong>{login.message}</strong>
+              {login.userCode && <code>{login.userCode}</code>}
+              {login.url && (
+                <a className="button primary" href={login.url} target="_blank" rel="noreferrer">
+                  OpenAI-Anmeldung öffnen
+                </a>
+              )}
+            </div>
+          )}
+          {settingsEditable && !waiting && (
+            <button
+              type="button"
+              className="text-button settings-login"
+              disabled={authBusy}
+              onClick={onStartLogin}
+            >
+              {authConfigured ? 'Codex neu verbinden' : 'Mit ChatGPT verbinden'}
+            </button>
+          )}
+        </section>
         <div className="button-row">
           <button type="button" className="button secondary" onClick={onClose}>
             Schließen
           </button>
-          {!waiting && login?.status !== 'completed' && (
-            <button type="button" className="button primary" disabled={busy} onClick={onStart}>
-              {authConfigured ? 'Neu anmelden' : 'Mit ChatGPT anmelden'}
-            </button>
-          )}
+          <button
+            type="button"
+            className="button primary"
+            disabled={saveBusy || unchanged || !settingsEditable}
+            onClick={() => onSave(selectedModel, selectedThinkingLevel)}
+          >
+            {saveBusy ? 'Wird gespeichert …' : 'Speichern'}
+          </button>
         </div>
       </section>
     </div>

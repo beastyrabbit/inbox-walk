@@ -1,21 +1,21 @@
 # Release status
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
-## Current release
+## Release
 
-`v0.7.1` is the current usable release. It is deployed in kub-homelab at
+`v0.8.0` is the release described by this source tree. Forgejo publishes its
+immutable image, and Flux deploys the pinned tag through kub-homelab to
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
-Forgejo publishes immutable images and Flux deploys the pinned release tag.
-
-There are no active release blockers.
 
 ## Shipped
 
 - [x] Complete paginated JMAP unread snapshot without a fixed message limit.
 - [x] Contextual review bundles for related repository, deployment, order, and carrier mail.
-- [x] Per-original keep-unread controls plus explicit merge, split, and learning feedback.
-- [x] Durable review rounds with stable URLs, persisted bundle analysis, decisions, and finalization.
+- [x] Per-original keep-unread controls while Codex owns automatic story grouping.
+- [x] Durable review rounds with immediate IDs, stable URLs, visible backend progress, and ready-to-open gating.
+- [x] Round deletion that cancels active backend work, plus reanalysis of the same frozen snapshot.
+- [x] Persisted bundle analysis, review decisions, drafts, and finalization across reloads and restarts.
 - [x] Null-safe Fastmail address normalization and resilient gateway error handling.
 - [x] Lazy detail loading, safe email rendering, and streamed allowlisted blobs.
 - [x] Safe remote-image proxying with authenticated same-origin iframe resources.
@@ -28,7 +28,8 @@ There are no active release blockers.
 - [x] Separate Spam review with an explicit deferred “Not Spam” action.
 - [x] Deferred newsletter-unsubscribe labeling without automatic link execution.
 - [x] Full-thread assisted replies with automatic all-attachment handling.
-- [x] Persistent in-app Codex model selection for Sol, Terra, and Luna.
+- [x] Codex connection, Sol/Terra/Luna model selection, and thinking level in Settings.
+- [x] Complete snapshot analysis without a per-round provider-call cutoff.
 - [x] Editable and revisable reply text with selectable identity and recipients.
 - [x] Verified Fastmail draft construction with no send-mail path.
 - [x] Unit, API, security-contract, desktop, and mobile browser tests.
@@ -40,7 +41,5 @@ There are no active release blockers.
 
 ## Deferred until needed
 
-- [ ] Move round creation into a persistent background Run with status, ready-to-open gating,
-  restart recovery, and an explicit backend cancel/delete action.
 - [ ] Add operational metrics only if live troubleshooting shows a concrete need.
 - [ ] Reassess the broad personal-runner trust boundary if repository collaboration expands.

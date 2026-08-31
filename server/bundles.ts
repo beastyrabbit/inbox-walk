@@ -65,7 +65,23 @@ export interface BundleDecision {
   title: string
 }
 
-export type DecideBundle = (input: BundleDecisionInput) => Promise<BundleDecision>
+export interface BundleDecisionCohort extends BundleDecisionInput {
+  cohortId: string
+}
+
+export interface BundleDecisionResult extends BundleDecision {
+  cohortId: string
+}
+
+export type DecideBundle = (
+  input: BundleDecisionInput,
+  signal?: AbortSignal,
+) => Promise<BundleDecision>
+
+export type DecideBundleBatch = (
+  cohorts: readonly BundleDecisionCohort[],
+  signal?: AbortSignal,
+) => Promise<BundleDecisionResult[]>
 
 export type BundleAnalysisEngine = 'codex' | 'fallback' | 'heuristic'
 
@@ -90,11 +106,21 @@ export interface BundleBuildProgress {
 
 export interface BuildReviewBundlesOptions {
   codexCallCount?: number
+  decideBatch?: DecideBundleBatch
   engine?: BundleAnalysisEngine
   getCodexCallCount?: () => number
   model?: string
   onProgress?: (progress: BundleBuildProgress) => void
+  signal?: AbortSignal
 }
+
+const MAX_BATCH_COHORTS = 8
+const MAX_CANDIDATE_ROOTS_PER_COHORT = 24
+const MAX_CROSS_SOURCE_RECALL_ROOTS = 8
+const MAX_CROSS_SOURCE_TEMPORAL_NEIGHBORS = 64
+const MAX_LEXICAL_HITS = 512
+const MAX_QUERY_TERMS = 12
+const CROSS_SOURCE_RECALL_WINDOW_MS = 30 * 24 * 60 * 60 * 1000
 
 function bundleProgressReporter(
   totalEmailCount: number,
@@ -275,37 +301,58 @@ class UnionFind {
   }
 }
 
-function ftsCandidates(emails: readonly ReviewEmailSummary[], signals: Map<string, BundleSignals>) {
+function ftsCandidates(
+  emails: readonly ReviewEmailSummary[],
+  signals: Map<string, BundleSignals>,
+  signal?: AbortSignal,
+) {
   const database = new DatabaseSync(':memory:')
-  database.exec('CREATE VIRTUAL TABLE mail_index USING fts5(email_id UNINDEXED, content)')
-  const insert = database.prepare('INSERT INTO mail_index(email_id, content) VALUES (?, ?)')
-  for (const email of emails) {
-    insert.run(email.id, `${email.subject} ${email.preview}`)
-  }
-  const query = database.prepare(
-    'SELECT email_id FROM mail_index WHERE mail_index MATCH ? ORDER BY bm25(mail_index) LIMIT 512 OFFSET ?',
-  )
-  const find = (emailIds: readonly string[], excluded: ReadonlySet<string>) => {
-    const terms = unique(
-      emailIds
-        .flatMap((id) => signals.get(id)?.searchTerms ?? [])
-        .filter((term) => term.length >= 4),
-    ).slice(0, 12)
-    if (terms.length === 0) return []
-    const expression = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ')
-    const result: string[] = []
-    let offset = 0
-    while (true) {
-      const page = query.all(expression, offset) as Array<{ email_id: string }>
-      for (const row of page) {
-        if (!excluded.has(row.email_id)) result.push(row.email_id)
+  try {
+    database.exec('CREATE VIRTUAL TABLE mail_index USING fts5(email_id UNINDEXED, content)')
+    const insert = database.prepare('INSERT INTO mail_index(email_id, content) VALUES (?, ?)')
+    const documentFrequency = new Map<string, number>()
+    for (const email of emails) {
+      signal?.throwIfAborted()
+      insert.run(email.id, `${email.subject} ${email.preview}`)
+      for (const term of new Set(signals.get(email.id)?.searchTerms ?? [])) {
+        documentFrequency.set(term, (documentFrequency.get(term) ?? 0) + 1)
       }
-      if (page.length < 512) break
-      offset += page.length
     }
-    return unique(result)
+    const query = database.prepare(
+      'SELECT email_id FROM mail_index WHERE mail_index MATCH ? ORDER BY bm25(mail_index), email_id LIMIT ?',
+    )
+    const maximumDocumentFrequency = Math.max(8, Math.ceil(emails.length * 0.1))
+    const find = (
+      emailIds: readonly string[],
+      excluded: ReadonlySet<string>,
+      signal?: AbortSignal,
+    ) => {
+      signal?.throwIfAborted()
+      const terms = unique(
+        emailIds
+          .flatMap((id) => signals.get(id)?.searchTerms ?? [])
+          .filter((term) => {
+            const frequency = documentFrequency.get(term) ?? 0
+            return term.length >= 4 && frequency > 1 && frequency <= maximumDocumentFrequency
+          }),
+      )
+        .sort(
+          (left, right) =>
+            (documentFrequency.get(left) ?? 0) - (documentFrequency.get(right) ?? 0) ||
+            left.localeCompare(right),
+        )
+        .slice(0, MAX_QUERY_TERMS)
+      if (terms.length === 0) return []
+      const expression = terms.map((term) => `"${term.replaceAll('"', '""')}"`).join(' OR ')
+      const rows = query.all(expression, MAX_LEXICAL_HITS) as Array<{ email_id: string }>
+      signal?.throwIfAborted()
+      return unique(rows.map((row) => row.email_id).filter((id) => !excluded.has(id)))
+    }
+    return { close: () => database.close(), find }
+  } catch (error) {
+    database.close()
+    throw error
   }
-  return { close: () => database.close(), find }
 }
 
 export function selectBundleExamples(
@@ -429,10 +476,18 @@ export function singletonBundleRun(
   emails: readonly ReviewEmailSummary[],
   options: BuildReviewBundlesOptions = {},
 ) {
+  options.signal?.throwIfAborted()
   const progress = bundleProgressReporter(emails.length, options, 'fallback')
-  const signals = new Map(emails.map((email) => [email.id, extractBundleSignals(email)]))
+  const signals = new Map<string, BundleSignals>()
+  for (const email of emails) {
+    options.signal?.throwIfAborted()
+    signals.set(email.id, extractBundleSignals(email))
+  }
   const run = {
-    bundles: emails.map((email) => asBundle([email], signals)),
+    bundles: emails.map((email) => {
+      options.signal?.throwIfAborted()
+      return asBundle([email], signals)
+    }),
     fallback: true,
     snapshotId,
   } satisfies ReviewBundleRun
@@ -463,7 +518,13 @@ function stableId(ids: readonly string[]) {
   return createHash('sha256').update(ids.join('\0')).digest('hex').slice(0, 16)
 }
 
-function representativeEmails(emails: readonly ReviewEmailSummary[], maximum = 100) {
+function representativeEmails(emails: readonly ReviewEmailSummary[], maximum = 24) {
+  if (maximum <= 1) {
+    const latest = [...emails].sort(
+      (left, right) => Date.parse(right.receivedAt) - Date.parse(left.receivedAt),
+    )[0]
+    return latest ? [latest] : []
+  }
   if (emails.length <= maximum) return [...emails]
   const ordered = [...emails].sort(
     (left, right) => Date.parse(left.receivedAt) - Date.parse(right.receivedAt),
@@ -480,6 +541,92 @@ function representativeEmails(emails: readonly ReviewEmailSummary[], maximum = 1
   return [...selected.values()].slice(0, maximum)
 }
 
+function receivedAtRange(emails: readonly ReviewEmailSummary[]) {
+  const timestamps = emails
+    .map((email) => Date.parse(email.receivedAt))
+    .filter((timestamp) => Number.isFinite(timestamp))
+  if (timestamps.length === 0) return undefined
+  return { maximum: Math.max(...timestamps), minimum: Math.min(...timestamps) }
+}
+
+function rangeDistance(
+  left: { maximum: number; minimum: number },
+  right: { maximum: number; minimum: number },
+) {
+  if (left.maximum < right.minimum) return right.minimum - left.maximum
+  if (right.maximum < left.minimum) return left.minimum - right.maximum
+  return 0
+}
+
+function crossSourceRecallByRoot(
+  membersByRoot: ReadonlyMap<string, readonly ReviewEmailSummary[]>,
+  signals: Map<string, BundleSignals>,
+  signal?: AbortSignal,
+) {
+  const entries = [...membersByRoot]
+    .flatMap(([root, members]) => {
+      const range = receivedAtRange(members)
+      if (!range) return []
+      return [
+        {
+          anchor: range.minimum + (range.maximum - range.minimum) / 2,
+          providers: unique(
+            members.map((email) => signals.get(email.id)?.provider ?? 'E-Mail'),
+          ).sort(),
+          range,
+          root,
+        },
+      ]
+    })
+    .sort((left, right) => left.anchor - right.anchor || left.root.localeCompare(right.root))
+  const recall = new Map<string, string[]>()
+  for (let seedIndex = 0; seedIndex < entries.length; seedIndex += 1) {
+    signal?.throwIfAborted()
+    const seed = entries[seedIndex]
+    if (!seed) continue
+    const seedProviders = new Set(seed.providers)
+    const firstNeighbor = Math.max(0, seedIndex - MAX_CROSS_SOURCE_TEMPORAL_NEIGHBORS)
+    const lastNeighbor = Math.min(
+      entries.length,
+      seedIndex + MAX_CROSS_SOURCE_TEMPORAL_NEIGHBORS + 1,
+    )
+    const ranked = entries
+      .slice(firstNeighbor, lastNeighbor)
+      .filter((candidate) => candidate.root !== seed.root)
+      .flatMap((candidate) => {
+        const providers = candidate.providers.filter((provider) => !seedProviders.has(provider))
+        if (providers.length === 0) return []
+        const distance = rangeDistance(seed.range, candidate.range)
+        if (distance > CROSS_SOURCE_RECALL_WINDOW_MS) return []
+        return [{ distance, providers, root: candidate.root }]
+      })
+      .sort(
+        (left, right) =>
+          left.distance - right.distance ||
+          left.providers[0]?.localeCompare(right.providers[0] ?? '') ||
+          left.root.localeCompare(right.root),
+      )
+
+    const selected: string[] = []
+    const selectedRoots = new Set<string>()
+    const representedProviders = new Set<string>()
+    for (const candidate of ranked) {
+      if (selected.length >= MAX_CROSS_SOURCE_RECALL_ROOTS) break
+      if (candidate.providers.every((provider) => representedProviders.has(provider))) continue
+      selected.push(candidate.root)
+      selectedRoots.add(candidate.root)
+      for (const provider of candidate.providers) representedProviders.add(provider)
+    }
+    for (const candidate of ranked) {
+      if (selected.length >= MAX_CROSS_SOURCE_RECALL_ROOTS) break
+      if (selectedRoots.has(candidate.root)) continue
+      selected.push(candidate.root)
+    }
+    recall.set(seed.root, selected)
+  }
+  return recall
+}
+
 export async function buildReviewBundles(
   snapshotId: string,
   emails: readonly ReviewEmailSummary[],
@@ -487,17 +634,29 @@ export async function buildReviewBundles(
   examples: readonly BundleExample[] = [],
   options: BuildReviewBundlesOptions = {},
 ): Promise<ReviewBundleRun> {
-  const progress = bundleProgressReporter(emails.length, options, decide ? 'codex' : 'heuristic')
+  const hasDecider = Boolean(decide || options.decideBatch)
+  const progress = bundleProgressReporter(
+    emails.length,
+    options,
+    hasDecider ? 'codex' : 'heuristic',
+  )
+  options.signal?.throwIfAborted()
   progress.emit('indexing', 0, 0)
   if (emails.length === 0) {
     progress.emit('complete', 1, 0)
     return { bundles: [], fallback: false, snapshotId }
   }
-  const byId = new Map(emails.map((email) => [email.id, email]))
-  const signals = new Map(emails.map((email) => [email.id, extractBundleSignals(email)]))
+  const byId = new Map<string, ReviewEmailSummary>()
+  const signals = new Map<string, BundleSignals>()
+  for (const email of emails) {
+    options.signal?.throwIfAborted()
+    byId.set(email.id, email)
+    signals.set(email.id, extractBundleSignals(email))
+  }
   const union = new UnionFind()
   const keyOwners = new Map<string, string>()
   for (const email of emails) {
+    options.signal?.throwIfAborted()
     union.add(email.id)
     for (const key of signals.get(email.id)?.exactKeys ?? []) {
       const owner = keyOwners.get(key)
@@ -508,107 +667,182 @@ export async function buildReviewBundles(
     }
   }
   progress.emit('grouping', 0.1, 0)
-  const lexicalIndex = ftsCandidates(emails, signals)
+  const lexicalIndex = ftsCandidates(emails, signals, options.signal)
   try {
     const open = new Set(emails.map((email) => union.find(email.id)))
+    const initialMembersByRoot = new Map<string, ReviewEmailSummary[]>()
+    for (const email of emails) {
+      const root = union.find(email.id)
+      const members = initialMembersByRoot.get(root) ?? []
+      members.push(email)
+      initialMembersByRoot.set(root, members)
+    }
+    const crossSourceRecall = crossSourceRecallByRoot(initialMembersByRoot, signals, options.signal)
     const membersFor = (root: string) =>
       emails.filter((email) => open.has(root) && union.find(email.id) === root)
     const bundles: ReviewBundle[] = []
+    const analyzedRoots = new Set<string>()
+    const consideredRoots = new Map<string, Set<string>>()
+    const metadataByRoot = new Map<string, Omit<BundleDecision, 'includedEmailIds'>>()
     let processedEmailCount = 0
 
     const analysisProgress = () => 0.15 + (0.75 * processedEmailCount) / Math.max(1, emails.length)
 
     progress.emit('grouping', analysisProgress(), processedEmailCount)
 
-    while (open.size > 0) {
-      const seedRoot = [...open][0]
-      if (!seedRoot) break
-      let seed = membersFor(seedRoot)
-      const excluded = new Set(seed.map((email) => email.id))
-      const candidateIds = lexicalIndex
-        .find(
-          seed.map((email) => email.id),
-          excluded,
-        )
-        .filter((id) => open.has(union.find(id)))
-      const candidateRoots = unique(candidateIds.map((id) => union.find(id))).filter((root) => {
-        if (root === seedRoot) return false
-        return !hardConflict(seed, membersFor(root), signals)
-      })
-      let metadata: Omit<BundleDecision, 'includedEmailIds'> | undefined
-
-      const judgeRootPages = async (
-        roots: readonly string[],
-        phase: Extract<BundleBuildPhase, 'deciding' | 'reconciling'> = 'deciding',
-      ) => {
-        if (!decide) return false
-        let acceptedAny = false
-        const pages =
-          roots.length > 0 ? Array.from({ length: Math.ceil(roots.length / 100) }) : [null]
-        for (let pageIndex = 0; pageIndex < pages.length; pageIndex += 1) {
-          const pageRoots = roots.slice(pageIndex * 100, (pageIndex + 1) * 100)
-          const perRoot = Math.max(1, Math.floor(100 / Math.max(1, pageRoots.length)))
-          const pageCandidates = pageRoots.flatMap((root) => membersFor(root).slice(0, perRoot))
-          progress.codexCallStarted()
-          progress.emit(phase, analysisProgress(), processedEmailCount)
-          const decision = await decide({
-            candidates: pageCandidates,
-            examples: selectBundleExamples(
-              examples,
-              learningSignalsFor([...seed, ...pageCandidates]),
-            ),
-            seed: representativeEmails(seed),
-          })
-          const permitted = new Set(pageCandidates.map((email) => email.id))
-          if (decision.includedEmailIds.some((id) => !permitted.has(id))) {
-            throw new Error('Bundle decision contains an ID outside its candidate set.')
-          }
-          const acceptedRoots = new Set(decision.includedEmailIds.map((id) => union.find(id)))
-          for (const root of acceptedRoots) {
-            for (const member of membersFor(root)) union.join(seedRoot, member.id)
-            open.delete(root)
-          }
-          acceptedAny ||= acceptedRoots.size > 0
-          seed = emails.filter((email) => union.find(email.id) === union.find(seedRoot))
-          metadata = {
-            currentState: decision.currentState,
-            kind: decision.kind,
-            linkEvidence: decision.linkEvidence,
-            membershipConfidence: decision.membershipConfidence,
-            summary: decision.summary,
-            title: decision.title,
-          }
-        }
-        return acceptedAny
-      }
-
-      if (decide && (candidateRoots.length > 0 || seed.length > 1)) {
-        await judgeRootPages(candidateRoots)
-
-        // Reconcile once after accepted members expand the seed's vocabulary and exact signals.
-        const alreadyConsidered = new Set(candidateRoots)
-        const reconciledIds = lexicalIndex
-          .find(
-            seed.map((email) => email.id),
-            new Set(seed.map((email) => email.id)),
-          )
-          .filter((id) => open.has(union.find(id)))
-        const reconciledRoots = unique(reconciledIds.map((id) => union.find(id))).filter((root) => {
-          if (root === seedRoot || alreadyConsidered.has(root)) return false
-          return !hardConflict(seed, membersFor(root), signals)
-        })
-        if (reconciledRoots.length > 0) {
-          await judgeRootPages(reconciledRoots, 'reconciling')
-        }
-      }
+    const finalize = (seedRoot: string, metadata?: Omit<BundleDecision, 'includedEmailIds'>) => {
+      const members = emails.filter((email) => union.find(email.id) === union.find(seedRoot))
       open.delete(seedRoot)
-      const bundle = asBundle(seed, signals, metadata)
+      const bundle = asBundle(members, signals, metadata)
       bundle.bundleId = `bundle-${stableId(bundle.emailIds)}`
       bundles.push(bundle)
       processedEmailCount += bundle.emailIds.length
       progress.emit('grouping', analysisProgress(), processedEmailCount)
     }
 
+    while (open.size > 0) {
+      options.signal?.throwIfAborted()
+      const reserved = new Set<string>()
+      const deferred = new Set<string>()
+      const cohortRoots = new Map<string, { candidateRoots: string[]; seedRoot: string }>()
+      const cohorts: BundleDecisionCohort[] = []
+
+      while (cohorts.length < MAX_BATCH_COHORTS) {
+        options.signal?.throwIfAborted()
+        const seedRoot = [...open].find((root) => !reserved.has(root) && !deferred.has(root))
+        if (!seedRoot) break
+        const seed = membersFor(seedRoot)
+        const candidateIds = lexicalIndex
+          .find(
+            seed.map((email) => email.id),
+            new Set(seed.map((email) => email.id)),
+            options.signal,
+          )
+          .filter((id) => open.has(union.find(id)))
+        const considered = consideredRoots.get(seedRoot) ?? new Set<string>()
+        const eligible = (root: string) => {
+          if (root === seedRoot) return false
+          if (considered.has(root)) return false
+          return !hardConflict(seed, membersFor(root), signals)
+        }
+        const lexicalRoots = unique(candidateIds.map((id) => union.find(id))).filter(eligible)
+        const recallRoots = unique(
+          (crossSourceRecall.get(seedRoot) ?? []).map((root) => union.find(root)),
+        )
+          .filter((root) => open.has(root))
+          .filter(eligible)
+        const eligibleRoots = unique([...lexicalRoots, ...recallRoots])
+        if (recallRoots.some((root) => reserved.has(root))) {
+          deferred.add(seedRoot)
+          continue
+        }
+        const recalledCandidateRoots = recallRoots
+        const recalled = new Set(recalledCandidateRoots)
+        const lexicalCandidateRoots = lexicalRoots.filter(
+          (root) => !reserved.has(root) && !recalled.has(root),
+        )
+        const candidateRoots = [
+          ...lexicalCandidateRoots.slice(
+            0,
+            MAX_CANDIDATE_ROOTS_PER_COHORT - recalledCandidateRoots.length,
+          ),
+          ...recalledCandidateRoots,
+        ]
+
+        if (!hasDecider) {
+          finalize(seedRoot)
+          continue
+        }
+        if (eligibleRoots.length === 0 && analyzedRoots.has(seedRoot)) {
+          finalize(seedRoot, metadataByRoot.get(seedRoot))
+          continue
+        }
+        if (eligibleRoots.length > 0 && candidateRoots.length === 0) {
+          deferred.add(seedRoot)
+          continue
+        }
+
+        reserved.add(seedRoot)
+        for (const root of candidateRoots) reserved.add(root)
+        const candidatesPerRoot = Math.max(1, Math.floor(24 / Math.max(1, candidateRoots.length)))
+        const candidates = candidateRoots.flatMap((root) =>
+          representativeEmails(membersFor(root), candidatesPerRoot),
+        )
+        const cohortId = `cohort-${stableId(seed.map((email) => email.id))}-${stableId(
+          candidates.map((email) => email.id),
+        )}`
+        cohortRoots.set(cohortId, { candidateRoots, seedRoot })
+        cohorts.push({
+          candidates,
+          cohortId,
+          examples: selectBundleExamples(examples, learningSignalsFor([...seed, ...candidates])),
+          seed: representativeEmails(seed),
+        })
+      }
+
+      if (cohorts.length === 0) continue
+      options.signal?.throwIfAborted()
+      progress.emit('deciding', analysisProgress(), processedEmailCount)
+      let decisions: BundleDecisionResult[]
+      if (options.decideBatch) {
+        progress.codexCallStarted()
+        decisions = await options.decideBatch(cohorts, options.signal)
+      } else {
+        if (!decide) throw new Error('Bundle analysis has no decision provider.')
+        decisions = []
+        for (const cohort of cohorts) {
+          options.signal?.throwIfAborted()
+          progress.codexCallStarted()
+          const decision = await decide(cohort, options.signal)
+          decisions.push({ ...decision, cohortId: cohort.cohortId })
+        }
+      }
+      options.signal?.throwIfAborted()
+
+      const decisionsByCohort = new Map<string, BundleDecisionResult>()
+      for (const decision of decisions) {
+        if (!cohortRoots.has(decision.cohortId) || decisionsByCohort.has(decision.cohortId)) {
+          throw new Error('Bundle batch decision contains an unknown or duplicate cohort ID.')
+        }
+        decisionsByCohort.set(decision.cohortId, decision)
+      }
+      if (decisionsByCohort.size !== cohorts.length) {
+        throw new Error('Bundle batch decision does not cover every cohort.')
+      }
+
+      for (const cohort of cohorts) {
+        options.signal?.throwIfAborted()
+        const roots = cohortRoots.get(cohort.cohortId)
+        const decision = decisionsByCohort.get(cohort.cohortId)
+        if (!roots || !decision) throw new Error('Bundle cohort disappeared before finalization.')
+        const permitted = new Set(cohort.candidates.map((email) => email.id))
+        if (decision.includedEmailIds.some((id) => !permitted.has(id))) {
+          throw new Error('Bundle decision contains an ID outside its candidate set.')
+        }
+        const acceptedRoots = new Set(decision.includedEmailIds.map((id) => union.find(id)))
+        const considered = consideredRoots.get(roots.seedRoot) ?? new Set<string>()
+        for (const root of roots.candidateRoots) considered.add(root)
+        consideredRoots.set(roots.seedRoot, considered)
+        for (const root of acceptedRoots) {
+          if (!roots.candidateRoots.includes(root) || !open.has(root)) {
+            throw new Error('Bundle decision contains a candidate that is no longer open.')
+          }
+          for (const member of membersFor(root)) union.join(roots.seedRoot, member.id)
+          open.delete(root)
+        }
+        analyzedRoots.add(roots.seedRoot)
+        metadataByRoot.set(roots.seedRoot, {
+          currentState: decision.currentState,
+          kind: decision.kind,
+          linkEvidence: decision.linkEvidence,
+          membershipConfidence: decision.membershipConfidence,
+          summary: decision.summary,
+          title: decision.title,
+        })
+      }
+    }
+
+    options.signal?.throwIfAborted()
     progress.emit('finalizing', 0.95, processedEmailCount)
     validateBundlePartition(
       emails.map((email) => email.id),

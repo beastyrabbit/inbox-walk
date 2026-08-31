@@ -84,6 +84,22 @@ export const codexModels = [
 
 export type CodexModelId = (typeof codexModels)[number]['id']
 
+export const codexThinkingLevels = [
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+] as const
+
+export type CodexThinkingLevel = (typeof codexThinkingLevels)[number]
+
+export function isCodexThinkingLevel(value: unknown): value is CodexThinkingLevel {
+  return codexThinkingLevels.some((level) => level === value)
+}
+
 export function isCodexModelId(value: unknown): value is CodexModelId {
   return codexModels.some((model) => model.id === value)
 }
@@ -91,6 +107,7 @@ export function isCodexModelId(value: unknown): value is CodexModelId {
 export interface CodexAuthStatus {
   configured: boolean
   model: CodexModelId
+  thinkingLevel?: CodexThinkingLevel
   source?:
     | 'stored'
     | 'runtime'
@@ -124,6 +141,23 @@ export interface ReviewSnapshot {
   userState: ReviewRoundUserState
 }
 
+export type ReviewRunStatus = 'queued' | 'fetching' | 'analyzing' | 'ready' | 'failed'
+
+export interface ReviewRunSummary {
+  analysis: ReviewAnalysisState
+  createdAt: string
+  csrfToken: string
+  emailCount: number
+  filters: ReviewFilters
+  generation: number
+  id: string
+  mode: 'demo' | 'live'
+  reanalyzable: boolean
+  reviewStatus: 'active' | 'finalizing' | 'finalized'
+  status: ReviewRunStatus
+  updatedAt: string
+}
+
 export type ReviewAnalysisStatus = 'pending' | 'running' | 'complete'
 export type ReviewAnalysisEngine = 'codex' | 'heuristic' | 'fallback'
 
@@ -132,6 +166,7 @@ export interface ReviewAnalysisState {
   engine: ReviewAnalysisEngine
   error?: string
   model?: string
+  thinkingLevel?: CodexThinkingLevel
   phase: string
   processedEmailCount: number
   progress: number
@@ -197,6 +232,7 @@ export interface LegacyReviewCheckpoint {
   processedIds: string[]
   secondaryActionIds: string[]
   replyDrafts: Record<string, ReplyEditorState>
+  migrationRoundId?: string
 }
 
 export type LoadedReviewCheckpoint = ReviewCheckpoint | LegacyReviewCheckpoint

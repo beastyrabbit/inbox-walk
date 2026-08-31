@@ -7,7 +7,7 @@ and makes every mailbox mutation explicit and recoverable.
 ## Review contract
 
 1. Configure a new round before mail is loaded, explicitly choosing either Spam only or everything except Spam.
-2. Query a stable, bounded snapshot of matching unread, non-draft incoming mail.
+2. Query a stable, fixed snapshot of matching unread, non-draft incoming mail. The query is paginated and has no fixed message-count cap.
 3. Keep only summaries in the initial payload and load bodies on demand.
 4. Store every round under a stable server-side ID and URL. The browser checkpoint contains only that opaque round pointer.
 5. Persist summaries, bundle analysis, decisions, editor state, and finalization in SQLite, but never received bodies or attachment content.
@@ -23,14 +23,16 @@ If a body cannot be loaded, that message is protected as unread automatically.
 
 ## Bundle analysis contract
 
-1. Create and persist the frozen round, Codex model, and hashed learning-example corpus before analysis starts.
-2. Use exact identifiers and a local full-text index to find plausible related messages.
-3. If Codex was connected when the round started, send only summary fields for those candidates: ID, subject, preview, time, sender, and thread ID.
-4. Save every completed Codex decision before moving to the next one. Resume from those decisions after a process restart.
-5. Never rerun a finished analysis. A browser reload only reads its stored status and result.
-6. Keep later incoming mail outside the round. Analyze it in a new round.
-7. Use the local analyzer when Codex is not connected before a new round starts. Do not silently downgrade a Codex run that was already in progress; only an explicit user choice may persist the safe individual-message view instead.
-8. Freeze the configured Codex call limit with the round. Stop at that limit and use the safe fallback view.
+1. Create and persist the run ID before fetching mail. Keep the user on the rounds table while the backend fetches and analyzes it.
+2. Persist the frozen snapshot, Codex model, thinking level, and hashed learning-example corpus before the first provider request.
+3. Rebuild the local candidate index from every summary in that snapshot. Use exact identifiers, full-text matches, and bounded cross-provider time recall to find plausible related messages.
+4. Send Codex only summary fields: ID, subject, preview, time, sender, and thread ID. Exact local groups need no second seed check.
+5. Save every completed Codex decision before moving to the next one. Resume from those decisions after a process restart.
+6. A reload or open action only reads stored status and results. Only an explicit reanalysis starts a new generation on the same snapshot.
+7. Keep later incoming mail outside the round. Analyze it in a new round.
+8. In live mode, fail visibly when Codex is unavailable or times out. Never silently downgrade the run to local or singleton analysis.
+9. Cover every message in the frozen snapshot. Do not stop analysis at an arbitrary provider-call count.
+10. Deleting a run aborts active snapshot or Codex analysis work. Reply generation and draft storage block deletion immediately. Finalization blocks deletion after it acquires the durable selection lock; if deletion wins before that lock, finalization stops before changing the mailbox. Reanalysis preserves review decisions and drafts unless finalization has already locked the round.
 
 ## Reply contract
 

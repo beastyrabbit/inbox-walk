@@ -1,6 +1,6 @@
 import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv } from 'vite'
-import { createApiMiddleware, waitForApiJobs } from './server/api.ts'
+import { abortApiJobs, createApiMiddleware, waitForApiJobs } from './server/api.ts'
 import { createBundleStore } from './server/bundle-store.ts'
 import { createReviewHistory } from './server/review-history.ts'
 import { createRoundStore } from './server/round-store.ts'
@@ -8,9 +8,9 @@ import { createRoundStore } from './server/round-store.ts'
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   for (const key of [
-    'CODEX_BUNDLE_MAX_CALLS',
     'CODEX_INFERENCE_TIMEOUT_MS',
     'CODEX_MODEL',
+    'CODEX_THINKING_LEVEL',
     'DATA_DIR',
     'TIKA_URL',
   ]) {
@@ -38,6 +38,7 @@ export default defineConfig(({ mode }) => {
             createApiMiddleware({ ...apiOptions, bundleStore, reviewHistory, roundStore }),
           )
           server.httpServer?.once('close', () => {
+            abortApiJobs()
             void waitForApiJobs().finally(() => {
               reviewHistory.close()
               bundleStore.close()

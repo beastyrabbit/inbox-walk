@@ -149,8 +149,11 @@ export class JmapError extends Error {
   }
 }
 
-async function getSession(token: string): Promise<JmapSession> {
-  const response = await fetch(SESSION_URL, { headers: { Authorization: `Bearer ${token}` } })
+async function getSession(token: string, signal?: AbortSignal): Promise<JmapSession> {
+  const response = await fetch(SESSION_URL, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal,
+  })
   if (!response.ok) {
     const code = response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'FASTMAIL_SESSION_FAILED'
     throw new JmapError(`Fastmail session failed (${response.status})`, code, response.status)
@@ -158,8 +161,8 @@ async function getSession(token: string): Promise<JmapSession> {
   return (await response.json()) as JmapSession
 }
 
-async function accountContext(token: string): Promise<MailAccountContext> {
-  const session = await getSession(token)
+async function accountContext(token: string, signal?: AbortSignal): Promise<MailAccountContext> {
+  const session = await getSession(token, signal)
   const accountId = session.primaryAccounts[MAIL]
   if (!accountId)
     throw new JmapError('Fastmail session has no primary mail account', 'NO_MAIL_ACCOUNT')
@@ -178,6 +181,7 @@ async function callJmap<T>(
   token: string,
   methodCalls: unknown[][],
   includeSubmission = false,
+  signal?: AbortSignal,
 ): Promise<ResponseTuple<T>[]> {
   if (methodCalls.some(([name]) => String(name).startsWith('EmailSubmission/'))) {
     throw new JmapError('Email submission is not supported by Inbox Walk', 'SUBMISSION_FORBIDDEN')
@@ -189,6 +193,7 @@ async function callJmap<T>(
       using: includeSubmission ? [CORE, MAIL, SUBMISSION] : [CORE, MAIL],
       methodCalls,
     }),
+    signal,
   })
   if (!response.ok) {
     const code = response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'FASTMAIL_REQUEST_FAILED'
@@ -243,14 +248,24 @@ export function unreadFilter(
   return { operator: 'AND', conditions }
 }
 
-async function fetchMailboxes(context: MailAccountContext, token: string): Promise<Mailbox[]> {
-  const responses = await callJmap<Mailbox>(context.apiUrl, token, [
+async function fetchMailboxes(
+  context: MailAccountContext,
+  token: string,
+  signal?: AbortSignal,
+): Promise<Mailbox[]> {
+  const responses = await callJmap<Mailbox>(
+    context.apiUrl,
+    token,
     [
-      'Mailbox/get',
-      { accountId: context.accountId, properties: ['id', 'name', 'role', 'myRights'] },
-      'mailboxes',
+      [
+        'Mailbox/get',
+        { accountId: context.accountId, properties: ['id', 'name', 'role', 'myRights'] },
+        'mailboxes',
+      ],
     ],
-  ])
+    false,
+    signal,
+  )
   return responseFor(responses, 'mailboxes').list ?? []
 }
 
@@ -333,38 +348,46 @@ async function getEmails(
   token: string,
   ids: readonly string[],
   detail: boolean,
+  signal?: AbortSignal,
 ) {
   const list: JmapEmail[] = []
   const missing: string[] = []
   for (let start = 0; start < ids.length; start += context.maxObjectsInGet) {
-    const responses = await callJmap<JmapEmail>(context.apiUrl, token, [
+    signal?.throwIfAborted()
+    const responses = await callJmap<JmapEmail>(
+      context.apiUrl,
+      token,
       [
-        'Email/get',
-        {
-          accountId: context.accountId,
-          ids: ids.slice(start, start + context.maxObjectsInGet),
-          properties: detail ? DETAIL_PROPERTIES : SUMMARY_PROPERTIES,
-          ...(detail
-            ? {
-                bodyProperties: [
-                  'partId',
-                  'blobId',
-                  'size',
-                  'name',
-                  'type',
-                  'charset',
-                  'disposition',
-                  'cid',
-                ],
-                fetchHTMLBodyValues: true,
-                fetchTextBodyValues: true,
-                maxBodyValueBytes: 2_000_000,
-              }
-            : {}),
-        },
-        'emails',
+        [
+          'Email/get',
+          {
+            accountId: context.accountId,
+            ids: ids.slice(start, start + context.maxObjectsInGet),
+            properties: detail ? DETAIL_PROPERTIES : SUMMARY_PROPERTIES,
+            ...(detail
+              ? {
+                  bodyProperties: [
+                    'partId',
+                    'blobId',
+                    'size',
+                    'name',
+                    'type',
+                    'charset',
+                    'disposition',
+                    'cid',
+                  ],
+                  fetchHTMLBodyValues: true,
+                  fetchTextBodyValues: true,
+                  maxBodyValueBytes: 2_000_000,
+                }
+              : {}),
+          },
+          'emails',
+        ],
       ],
-    ])
+      false,
+      signal,
+    )
     const result = responseFor(responses, 'emails')
     list.push(...(result.list ?? []))
     missing.push(...(result.notFound ?? []))
@@ -437,9 +460,11 @@ export async function fetchUnreadSnapshot(
     timeRange: 'all',
   },
   retainedIds: ReadonlySet<string> = new Set(),
+  signal?: AbortSignal,
 ): Promise<LiveSnapshotData> {
-  const context = await accountContext(token)
-  const mailboxList = await fetchMailboxes(context, token)
+  signal?.throwIfAborted()
+  const context = await accountContext(token, signal)
+  const mailboxList = await fetchMailboxes(context, token, signal)
   const mailboxes = new Map(mailboxList.map((mailbox) => [mailbox.id, mailbox]))
   const junkMailboxId = mailboxList.find((mailbox) => mailbox.role === 'junk')?.id
   if (filters.spam === 'only' && !junkMailboxId) {
@@ -470,9 +495,14 @@ export async function fetchUnreadSnapshot(
     const missingIds: string[] = []
 
     while (!exhausted) {
-      const pageResponses = await callJmap<never>(context.apiUrl, token, [
-        ['Email/query', { ...queryArguments, position, limit: QUERY_PAGE_SIZE }, 'query'],
-      ])
+      signal?.throwIfAborted()
+      const pageResponses = await callJmap<never>(
+        context.apiUrl,
+        token,
+        [['Email/query', { ...queryArguments, position, limit: QUERY_PAGE_SIZE }, 'query']],
+        false,
+        signal,
+      )
       const page = responseFor(pageResponses, 'query')
       if (queryState === undefined) queryState = page.queryState
       else if (page.queryState !== queryState) {
@@ -485,7 +515,7 @@ export async function fetchUnreadSnapshot(
         exhausted = true
         break
       }
-      const fetched = await getEmails(context, token, ids, false)
+      const fetched = await getEmails(context, token, ids, false, signal)
       missingIds.push(...fetched.missing)
       const byId = new Map(fetched.list.map((email) => [email.id, email]))
       selected.push(
@@ -499,15 +529,20 @@ export async function fetchUnreadSnapshot(
           .filter((email) => newsletterMatches(email, filters.newsletter)),
       )
       position += ids.length
-      if (position >= candidateTotal || ids.length < QUERY_PAGE_SIZE) {
+      if (position >= candidateTotal) {
         exhausted = true
         break
       }
     }
     if (changed) continue
-    const secondResponses = await callJmap<never>(context.apiUrl, token, [
-      ['Email/query', { ...queryArguments, position: 0, limit: 1 }, 'query-check'],
-    ])
+    signal?.throwIfAborted()
+    const secondResponses = await callJmap<never>(
+      context.apiUrl,
+      token,
+      [['Email/query', { ...queryArguments, position: 0, limit: 1 }, 'query-check']],
+      false,
+      signal,
+    )
     const second = responseFor(secondResponses, 'query-check')
     if (queryState !== second.queryState) continue
     return {

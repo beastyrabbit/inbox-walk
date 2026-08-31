@@ -4,7 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ReviewEmailSummary, ReviewFilters } from '../src/shared.ts'
 import { createCheckpointedBundleDecider } from './bundle-checkpoint.ts'
-import type { BundleDecision, BundleDecisionInput } from './bundles.ts'
+import type { BundleDecision, BundleDecisionCohort, BundleDecisionInput } from './bundles.ts'
 import { createRoundStore } from './round-store.ts'
 
 const directories: string[] = []
@@ -174,7 +174,6 @@ describe('persisted Codex bundle decisions', () => {
         throw authError
       }),
       initialCallCount: 0,
-      maxCallCount: 1,
       onCallRolledBack: (callCount) => {
         store.updateAnalysis('round', { callCount })
       },
@@ -232,7 +231,7 @@ describe('persisted Codex bundle decisions', () => {
     store.close()
   })
 
-  it('fails closed before exceeding the per-round Codex call budget', async () => {
+  it('continues after the historical per-round call count instead of aborting the round', async () => {
     const path = databasePath()
     const store = createRoundStore(path)
     store.create({
@@ -246,19 +245,85 @@ describe('persisted Codex bundle decisions', () => {
       mode: 'live',
     })
     const provider = vi.fn(async () => decision)
-    const limited = createCheckpointedBundleDecider({
+    const unlimited = createCheckpointedBundleDecider({
       decide: provider,
       initialCallCount: 2,
-      maxCallCount: 2,
       model: 'gpt-5.6-sol',
       onCallStarted: () => {},
       roundId: 'round',
       store,
     })
 
-    await expect(limited.decide(input)).rejects.toThrow('call budget exhausted')
-    expect(provider).not.toHaveBeenCalled()
-    expect(limited.callCount()).toBe(2)
+    await expect(unlimited.decide(input)).resolves.toEqual(decision)
+    expect(provider).toHaveBeenCalledOnce()
+    expect(unlimited.callCount()).toBe(3)
     store.close()
+  })
+
+  it('checkpoints every cohort from one provider batch and replays all of them', async () => {
+    const path = databasePath()
+    const secondSeed = email('seed-2')
+    const secondCandidate = email('candidate-2')
+    const cohorts: BundleDecisionCohort[] = [
+      { ...input, cohortId: 'cohort-1' },
+      {
+        candidates: [secondCandidate],
+        cohortId: 'cohort-2',
+        examples: [],
+        seed: [secondSeed],
+      },
+    ]
+    const store = createRoundStore(path)
+    store.create({
+      analysis: { engine: 'codex', model: 'gpt-5.6-sol' },
+      csrfToken: 'csrf',
+      emails: [seed, candidate, secondSeed, secondCandidate],
+      filters,
+      id: 'round',
+      imageToken: 'image',
+      mailboxes: [],
+      mode: 'live',
+    })
+    const batchProvider = vi.fn(async (missing: readonly BundleDecisionCohort[]) =>
+      missing.map((cohort) => ({
+        ...decision,
+        cohortId: cohort.cohortId,
+        includedEmailIds: cohort.candidates.map((item) => item.id),
+      })),
+    )
+    const first = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: batchProvider,
+      initialCallCount: 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: (callCount) => store.updateAnalysis('round', { callCount }),
+      roundId: 'round',
+      store,
+    })
+
+    await expect(first.decideBatch(cohorts)).resolves.toHaveLength(2)
+    expect(batchProvider).toHaveBeenCalledOnce()
+    expect(first.callCount()).toBe(1)
+    store.close()
+
+    const reopened = createRoundStore(path)
+    const replayProvider = vi.fn(async () => [])
+    const replay = createCheckpointedBundleDecider({
+      decide: vi.fn(async () => decision),
+      decideBatch: replayProvider,
+      initialCallCount: reopened.get('round')?.analysis.callCount ?? 0,
+      model: 'gpt-5.6-sol',
+      onCallStarted: () => {},
+      roundId: 'round',
+      store: reopened,
+    })
+
+    await expect(replay.decideBatch(cohorts)).resolves.toMatchObject([
+      { cohortId: 'cohort-1', includedEmailIds: ['candidate'] },
+      { cohortId: 'cohort-2', includedEmailIds: ['candidate-2'] },
+    ])
+    expect(replayProvider).not.toHaveBeenCalled()
+    expect(replay.callCount()).toBe(1)
+    reopened.close()
   })
 })

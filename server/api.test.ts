@@ -6,17 +6,17 @@ import type {
   ReplyProposal,
   ReviewEmail,
   ReviewOptions,
+  ReviewRunSummary,
   ReviewSnapshot,
   ThreadContext,
 } from '../src/shared.ts'
+import { defaultReviewFilters } from '../src/shared.ts'
 import {
   clearApiStateForTests,
-  codexBundleCallLimit,
   createApiMiddleware,
   safeCodexLoginUrl,
   waitForApiJobs,
 } from './api.ts'
-import type { BundleRelationshipLabel } from './bundle-store.ts'
 import { type BundleExample, hashLearningSignal } from './bundles.ts'
 import { CodexAuthenticationError } from './codex.ts'
 import { demoEmails } from './demo.ts'
@@ -29,7 +29,6 @@ let injectUnknownBundleId = false
 let bundleDecisionCalls = 0
 let bundleDecisionGate: Promise<void> | null = null
 let releaseBundleDecision: (() => void) | null = null
-const recordedBundleLabels: BundleRelationshipLabel[] = []
 let availableBundleExamples: BundleExample[] = []
 const roundStore = createRoundStore(':memory:')
 const partialFinalizeResult: FinalizeResult = {
@@ -48,7 +47,25 @@ const partialFinalizeResult: FinalizeResult = {
 
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
-  return { response, body: (await response.json()) as T }
+  const body = (await response.json()) as T
+  if (
+    path === '/api/reviews' &&
+    init?.method === 'POST' &&
+    typeof init.body === 'string' &&
+    !Object.hasOwn(JSON.parse(init.body) as object, 'id') &&
+    response.status === 202 &&
+    body &&
+    typeof body === 'object' &&
+    'id' in body &&
+    typeof body.id === 'string'
+  ) {
+    // The older behavioral tests below need a ready snapshot. Drive the new
+    // background contract to completion instead of preserving a second creation path.
+    await waitForApiJobs()
+    const opened = await fetch(`${baseUrl}/api/reviews/${body.id}`)
+    return { response, body: (await opened.json()) as T }
+  }
+  return { response, body }
 }
 
 async function waitForBundles(review: ReviewSnapshot) {
@@ -95,7 +112,7 @@ beforeAll(async () => {
     roundStore,
     bundleStore: {
       examples: () => availableBundleExamples,
-      record: (label) => recordedBundleLabels.push(label),
+      record: () => {},
     },
     reviewHistory: {
       close() {},
@@ -178,31 +195,10 @@ beforeEach(() => {
   bundleDecisionCalls = 0
   bundleDecisionGate = null
   releaseBundleDecision = null
-  recordedBundleLabels.length = 0
   availableBundleExamples = []
 })
 
 describe('demo API contract', () => {
-  it('uses the documented Codex call limit default for empty configuration', () => {
-    const previous = process.env.CODEX_BUNDLE_MAX_CALLS
-    try {
-      delete process.env.CODEX_BUNDLE_MAX_CALLS
-      expect(codexBundleCallLimit(undefined)).toBe(64)
-      process.env.CODEX_BUNDLE_MAX_CALLS = ''
-      expect(codexBundleCallLimit(undefined)).toBe(64)
-      process.env.CODEX_BUNDLE_MAX_CALLS = '   '
-      expect(codexBundleCallLimit(undefined)).toBe(64)
-      process.env.CODEX_BUNDLE_MAX_CALLS = 'invalid'
-      expect(codexBundleCallLimit(undefined)).toBe(64)
-      expect(codexBundleCallLimit(0)).toBe(1)
-      expect(codexBundleCallLimit(2.9)).toBe(2)
-      expect(codexBundleCallLimit(1_000)).toBe(512)
-    } finally {
-      if (previous === undefined) delete process.env.CODEX_BUNDLE_MAX_CALLS
-      else process.env.CODEX_BUNDLE_MAX_CALLS = previous
-    }
-  })
-
   it('allows only the official OpenAI host for login links', () => {
     expect(safeCodexLoginUrl('https://auth.openai.com/codex/device')).toBe(
       'https://auth.openai.com/codex/device',
@@ -242,6 +238,969 @@ describe('demo API contract', () => {
     expect(result.body.error.code).toBe('DEMO_MODE')
   })
 
+  it('creates one durable background run idempotently, lists it, reanalyzes its frozen snapshot, and deletes it', async () => {
+    const id = crypto.randomUUID()
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    const created = await json<ReviewRunSummary>('/api/reviews', post({ id, filters }))
+    expect(created.response.status).toBe(202)
+    expect(created.body).toMatchObject({
+      generation: 1,
+      id,
+      reanalyzable: false,
+      status: 'queued',
+    })
+
+    const repeated = await json<ReviewRunSummary>('/api/reviews', post({ id, filters }))
+    expect(repeated.response.status).toBe(202)
+    expect(repeated.body.csrfToken).toBe(created.body.csrfToken)
+
+    await waitForApiJobs()
+    const listed = await json<{ runs: ReviewRunSummary[] }>('/api/reviews')
+    const ready = listed.body.runs.find((run) => run.id === id)
+    expect(ready).toMatchObject({
+      emailCount: 9,
+      generation: 1,
+      reanalyzable: true,
+      status: 'ready',
+    })
+
+    const opened = await json<ReviewSnapshot>(`/api/reviews/${id}`)
+    expect(opened.response.status).toBe(200)
+    const frozenIds = opened.body.emails.map((email) => email.id)
+
+    const restarted = await json<ReviewRunSummary>(
+      `/api/reviews/${id}/reanalyze`,
+      post({}, created.body.csrfToken),
+    )
+    expect(restarted.response.status).toBe(202)
+    expect(restarted.body).toMatchObject({
+      generation: 2,
+      id,
+      reanalyzable: false,
+      status: 'analyzing',
+    })
+    await waitForApiJobs()
+    const reopened = await json<ReviewSnapshot>(`/api/reviews/${id}`)
+    expect(reopened.body.emails.map((email) => email.id)).toEqual(frozenIds)
+    const detailId = frozenIds[0]
+    expect(detailId).toBeDefined()
+    if (!detailId) return
+    const detail = await json<ReviewEmail>(`/api/reviews/${id}/emails/${detailId}`)
+    expect(detail.response.status).toBe(200)
+    expect(detail.body.text).toBe(demoEmails.find((email) => email.id === detailId)?.text)
+
+    const deleted = await fetch(`${baseUrl}/api/reviews/${id}`, {
+      method: 'DELETE',
+      headers: { 'X-Inbox-Walk-CSRF': created.body.csrfToken },
+    })
+    expect(deleted.status).toBe(204)
+    expect(roundStore.get(id)).toBeNull()
+  })
+
+  it('generates a durable background run ID when the client omits one', async () => {
+    const response = await fetch(
+      `${baseUrl}/api/reviews`,
+      post({
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+      }),
+    )
+    const created = (await response.json()) as ReviewRunSummary
+
+    expect(response.status).toBe(202)
+    expect(created).toMatchObject({
+      generation: 1,
+      reanalyzable: false,
+      status: 'queued',
+    })
+    expect(created.id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    )
+    expect(['fetching', 'analyzing', 'ready']).toContain(roundStore.get(created.id)?.runStatus)
+
+    await waitForApiJobs()
+    expect(roundStore.get(created.id)).toMatchObject({
+      bundleRun: expect.any(Object),
+      runStatus: 'ready',
+    })
+
+    const deleted = await fetch(`${baseUrl}/api/reviews/${created.id}`, {
+      method: 'DELETE',
+      headers: { 'X-Inbox-Walk-CSRF': created.csrfToken },
+    })
+    expect(deleted.status).toBe(204)
+  })
+
+  it('gates an unfinished run and deleting it aborts snapshot loading before persistence', async () => {
+    const localStore = createRoundStore(':memory:')
+    let fetchAborted = false
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: true,
+      fastmailToken: 'test-token',
+      fetchMailSnapshot: async (_token, _filters, _retainedIds, signal) => {
+        await new Promise<never>((_resolve, reject) => {
+          const abort = () => {
+            fetchAborted = true
+            reject(new DOMException('Cancelled', 'AbortError'))
+          }
+          signal?.addEventListener('abort', abort, { once: true })
+          if (signal?.aborted) abort()
+        })
+        throw new Error('unreachable')
+      },
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const id = crypto.randomUUID()
+      const created = (await (
+        await fetch(
+          `${localBase}/api/reviews`,
+          post({
+            id,
+            filters: {
+              hideReviewed: false,
+              mailboxId: null,
+              newsletter: 'all',
+              spam: 'exclude',
+              timeRange: 'all',
+            },
+          }),
+        )
+      ).json()) as ReviewRunSummary
+      const gated = await fetch(`${localBase}/api/reviews/${id}`)
+      expect(gated.status).toBe(409)
+      expect(((await gated.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_NOT_READY',
+      )
+      const earlyDetail = await fetch(`${localBase}/api/reviews/${id}/emails/anything`)
+      expect(earlyDetail.status).toBe(409)
+      expect(((await earlyDetail.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_NOT_READY',
+      )
+      expect(localStore.get(id)).toMatchObject({
+        analysis: { phase: 'fetching', status: 'running' },
+        runStatus: 'fetching',
+      })
+      const deleted = await fetch(`${localBase}/api/reviews/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-Inbox-Walk-CSRF': created.csrfToken },
+      })
+      expect(deleted.status).toBe(204)
+      await waitForApiJobs()
+      expect(fetchAborted).toBe(true)
+      expect(localStore.get(id)).toBeNull()
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('rejects deletion while non-abortable reply work is in flight', async () => {
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    localStore.create({
+      csrfToken: 'reply-delete-csrf',
+      emails: [source],
+      filters: defaultReviewFilters,
+      id: 'reply-delete-round',
+      imageToken: 'reply-delete-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'live',
+      runStatus: 'ready',
+    })
+    let contextStarted: (() => void) | undefined
+    const contextStart = new Promise<void>((resolve) => {
+      contextStarted = resolve
+    })
+    let releaseContext: (() => void) | undefined
+    const contextGate = new Promise<void>((resolve) => {
+      releaseContext = resolve
+    })
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: false,
+      codexAuthStatus: () => ({ configured: true, model: 'gpt-5.6-sol' }),
+      fastmailToken: 'test-token',
+      resumeMailSnapshot: async () => {
+        contextStarted?.()
+        await contextGate
+        throw new Error('Stop reply after delete guard is verified')
+      },
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const replying = fetch(
+        `${localBase}/api/reviews/reply-delete-round/replies`,
+        post(
+          {
+            emailId: source.id,
+            requestId: crypto.randomUUID(),
+            roughNotes: 'Kurze Antwort',
+          },
+          'reply-delete-csrf',
+        ),
+      )
+      await contextStart
+
+      const blocked = await fetch(`${localBase}/api/reviews/reply-delete-round`, {
+        method: 'DELETE',
+        headers: { 'X-Inbox-Walk-CSRF': 'reply-delete-csrf' },
+      })
+      expect(blocked.status).toBe(409)
+      expect((await blocked.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_DRAFT_IN_PROGRESS' },
+      })
+      expect(localStore.get('reply-delete-round')).not.toBeNull()
+
+      const reanalysis = await fetch(
+        `${localBase}/api/reviews/reply-delete-round/reanalyze`,
+        post({}, 'reply-delete-csrf'),
+      )
+      expect(reanalysis.status).toBe(409)
+      expect((await reanalysis.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_DRAFT_IN_PROGRESS' },
+      })
+      expect(localStore.get('reply-delete-round')).toMatchObject({
+        generation: 0,
+        runStatus: 'ready',
+      })
+
+      releaseContext?.()
+      expect((await replying).status).toBe(500)
+      const deleted = await fetch(`${localBase}/api/reviews/reply-delete-round`, {
+        method: 'DELETE',
+        headers: { 'X-Inbox-Walk-CSRF': 'reply-delete-csrf' },
+      })
+      expect(deleted.status).toBe(204)
+      expect(localStore.get('reply-delete-round')).toBeNull()
+    } finally {
+      releaseContext?.()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('fails a new live run closed when Fastmail returns an incomplete snapshot', async () => {
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    let providerCalls = 0
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async () => {
+        providerCalls += 1
+        throw new Error('Provider must not be called for an incomplete snapshot')
+      },
+      fastmailToken: 'test-token',
+      fetchMailSnapshot: async (_token, filters) => ({
+        context: {
+          accountId: 'account',
+          apiUrl: 'https://api.example.invalid',
+          downloadUrl: 'https://download.example.invalid',
+          maxObjectsInGet: 256,
+          maxObjectsInSet: 256,
+          username: 'test@example.invalid',
+        },
+        emails: [source],
+        filters: filters ?? {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+        missingIds: ['missing-live-message'],
+        totalBeforeLimit: 2,
+        truncated: false,
+      }),
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const id = crypto.randomUUID()
+      const createdResponse = await fetch(
+        `${localBase}/api/reviews`,
+        post({
+          id,
+          filters: {
+            hideReviewed: false,
+            mailboxId: null,
+            newsletter: 'all',
+            spam: 'exclude',
+            timeRange: 'all',
+          },
+        }),
+      )
+      const created = (await createdResponse.json()) as ReviewRunSummary
+      expect(createdResponse.status).toBe(202)
+
+      await waitForApiJobs()
+      expect(providerCalls).toBe(0)
+      expect(localStore.get(id)).toMatchObject({
+        bundleRun: null,
+        emails: [expect.objectContaining({ id: source.id })],
+        generation: 1,
+        missingIds: ['missing-live-message'],
+        runStatus: 'failed',
+      })
+
+      const opened = await fetch(`${localBase}/api/reviews/${id}`)
+      expect(opened.status).toBe(409)
+      expect(((await opened.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_SNAPSHOT_INCOMPLETE',
+      )
+
+      const reanalyzed = await fetch(
+        `${localBase}/api/reviews/${id}/reanalyze`,
+        post({}, created.csrfToken),
+      )
+      expect(reanalyzed.status).toBe(409)
+      expect(((await reanalyzed.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_SNAPSHOT_INCOMPLETE',
+      )
+
+      const deleted = await fetch(`${localBase}/api/reviews/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-Inbox-Walk-CSRF': created.csrfToken },
+      })
+      expect(deleted.status).toBe(204)
+      expect(localStore.get(id)).toBeNull()
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('deleting an analyzing run aborts its decider and cannot persist a late result', async () => {
+    const localStore = createRoundStore(':memory:')
+    let analysisStartedResolve: (() => void) | undefined
+    const analysisStarted = new Promise<void>((resolve) => {
+      analysisStartedResolve = resolve
+    })
+    let analysisAborted = false
+    let savedDecisions = 0
+    let savedRuns = 0
+    const observedStore = {
+      ...localStore,
+      saveBundleDecision: (...args: Parameters<(typeof localStore)['saveBundleDecision']>) => {
+        savedDecisions += 1
+        return localStore.saveBundleDecision(...args)
+      },
+      saveBundleRun: (...args: Parameters<(typeof localStore)['saveBundleRun']>) => {
+        savedRuns += 1
+        return localStore.saveBundleRun(...args)
+      },
+    }
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async (_input, signal) => {
+        analysisStartedResolve?.()
+        await new Promise<never>((_resolve, reject) => {
+          const abort = () => {
+            analysisAborted = true
+            reject(signal?.reason ?? new DOMException('Cancelled', 'AbortError'))
+          }
+          signal?.addEventListener('abort', abort, { once: true })
+          if (signal?.aborted) abort()
+        })
+        throw new Error('unreachable')
+      },
+      forceDemo: true,
+      roundStore: observedStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const id = crypto.randomUUID()
+      const createdResponse = await fetch(
+        `${localBase}/api/reviews`,
+        post({
+          id,
+          filters: {
+            hideReviewed: false,
+            mailboxId: null,
+            newsletter: 'all',
+            spam: 'exclude',
+            timeRange: 'all',
+          },
+        }),
+      )
+      expect(createdResponse.status).toBe(202)
+      const created = (await createdResponse.json()) as ReviewRunSummary
+      await analysisStarted
+      expect(localStore.get(id)?.runStatus).toBe('analyzing')
+
+      const deleted = await fetch(`${localBase}/api/reviews/${id}`, {
+        method: 'DELETE',
+        headers: { 'X-Inbox-Walk-CSRF': created.csrfToken },
+      })
+      expect(deleted.status).toBe(204)
+      await waitForApiJobs()
+
+      expect(analysisAborted).toBe(true)
+      expect(savedDecisions).toBe(0)
+      expect(savedRuns).toBe(0)
+      expect(localStore.get(id)).toBeNull()
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('reanalyzes a ready empty snapshot but rejects a failed run with no snapshot', async () => {
+    const localStore = createRoundStore(':memory:')
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'heuristic',
+        phase: 'complete',
+        processedEmailCount: 0,
+        progress: 1,
+        status: 'complete',
+        totalEmailCount: 0,
+      },
+      csrfToken: 'empty-ready-csrf',
+      emails: [],
+      filters,
+      generation: 1,
+      id: 'empty-ready-round',
+      imageToken: 'empty-ready-image',
+      mailboxes: [],
+      mode: 'demo',
+      runStatus: 'ready',
+    })
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'codex',
+        error: 'Snapshot failed.',
+        phase: 'failed',
+        processedEmailCount: 0,
+        progress: 0,
+        status: 'pending',
+        totalEmailCount: 0,
+      },
+      csrfToken: 'empty-failed-csrf',
+      emails: [],
+      filters,
+      generation: 1,
+      id: 'empty-failed-round',
+      imageToken: 'empty-failed-image',
+      mailboxes: [],
+      mode: 'live',
+      runStatus: 'failed',
+    })
+    const localMiddleware = createApiMiddleware({ forceDemo: true, roundStore: localStore })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const restarted = await fetch(
+        `${localBase}/api/reviews/empty-ready-round/reanalyze`,
+        post({}, 'empty-ready-csrf'),
+      )
+      expect(restarted.status).toBe(202)
+      await waitForApiJobs()
+      expect(localStore.get('empty-ready-round')).toMatchObject({
+        bundleRun: { bundles: [] },
+        generation: 2,
+        runStatus: 'ready',
+      })
+
+      const rejected = await fetch(
+        `${localBase}/api/reviews/empty-failed-round/reanalyze`,
+        post({}, 'empty-failed-csrf'),
+      )
+      expect(rejected.status).toBe(409)
+      expect(((await rejected.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_SNAPSHOT_MISSING',
+      )
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('rejects a second reanalysis request without aborting the first generation', async () => {
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'heuristic',
+        phase: 'complete',
+        processedEmailCount: 1,
+        progress: 1,
+        status: 'complete',
+        totalEmailCount: 1,
+      },
+      csrfToken: 'double-reanalysis-csrf',
+      emails: [source],
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 1,
+      id: 'double-reanalysis-round',
+      imageToken: 'double-reanalysis-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'demo',
+      runStatus: 'ready',
+    })
+    let releaseDecision: (() => void) | undefined
+    const decisionGate = new Promise<void>((resolve) => {
+      releaseDecision = resolve
+    })
+    let providerSignal: AbortSignal | undefined
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async (input, signal) => {
+        providerSignal = signal
+        await decisionGate
+        return {
+          currentState: 'Geprüft',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Eigenständige Nachricht.',
+          title: input.seed[0]?.subject ?? 'Nachricht',
+        }
+      },
+      forceDemo: true,
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const first = await fetch(
+        `${localBase}/api/reviews/double-reanalysis-round/reanalyze`,
+        post({}, 'double-reanalysis-csrf'),
+      )
+      expect(first.status).toBe(202)
+      const second = await fetch(
+        `${localBase}/api/reviews/double-reanalysis-round/reanalyze`,
+        post({}, 'double-reanalysis-csrf'),
+      )
+      expect(second.status).toBe(409)
+      expect(((await second.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_REANALYSIS_IN_PROGRESS',
+      )
+      expect(providerSignal?.aborted).toBe(false)
+      releaseDecision?.()
+      await waitForApiJobs()
+      expect(localStore.get('double-reanalysis-round')).toMatchObject({
+        generation: 2,
+        runStatus: 'ready',
+      })
+    } finally {
+      releaseDecision?.()
+      await waitForApiJobs()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('marks a background run failed when its final bundle result cannot be persisted', async () => {
+    const localStore = createRoundStore(':memory:')
+    let providerCalls = 0
+    const failingStore = {
+      ...localStore,
+      saveBundleRun: () => null,
+    }
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async (input) => {
+        providerCalls += 1
+        return {
+          currentState: 'Geprüft',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Eigenständige Nachricht.',
+          title: input.seed[0]?.subject ?? 'Nachricht',
+        }
+      },
+      forceDemo: true,
+      roundStore: failingStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const id = crypto.randomUUID()
+      await fetch(
+        `${localBase}/api/reviews`,
+        post({
+          id,
+          filters: {
+            hideReviewed: false,
+            mailboxId: null,
+            newsletter: 'all',
+            spam: 'exclude',
+            timeRange: 'all',
+          },
+        }),
+      )
+      await waitForApiJobs()
+      expect(providerCalls).toBeGreaterThan(0)
+      expect(localStore.get(id)).toMatchObject({
+        bundleRun: null,
+        runStatus: 'failed',
+      })
+      expect(localStore.get(id)?.analysis.error).toContain('nicht dauerhaft gespeichert')
+
+      const callsAfterFailure = providerCalls
+      await fetch(`${localBase}/api/reviews`)
+      await fetch(`${localBase}/api/reviews`)
+      await waitForApiJobs()
+      expect(providerCalls).toBe(callsAfterFailure)
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('contains throwing terminal persistence transitions and still cleans up the analysis job', async () => {
+    const localStore = createRoundStore(':memory:')
+    localStore.create({
+      analysis: {
+        callCount: 0,
+        engine: 'heuristic',
+        phase: 'complete',
+        processedEmailCount: demoEmails.length,
+        progress: 1,
+        status: 'complete',
+        totalEmailCount: demoEmails.length,
+      },
+      csrfToken: 'throwing-terminal-csrf',
+      emails: demoEmails,
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 1,
+      id: 'throwing-terminal-round',
+      imageToken: 'throwing-terminal-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      mode: 'demo',
+      runStatus: 'ready',
+    })
+    let terminalTransitions = 0
+    const throwingStore = {
+      ...localStore,
+      saveBundleRun: () => {
+        throw new Error('Simulated bundle result persistence failure')
+      },
+      updateRunStatus: (...args: Parameters<(typeof localStore)['updateRunStatus']>) => {
+        const updated = localStore.updateRunStatus(...args)
+        if (args[2] === 'failed') {
+          terminalTransitions += 1
+          throw new Error('Simulated post-commit terminal persistence failure')
+        }
+        return updated
+      },
+    }
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async (input) => ({
+        currentState: 'Geprüft',
+        includedEmailIds: [],
+        kind: 'standalone',
+        linkEvidence: [],
+        membershipConfidence: 1,
+        summary: 'Eigenständige Nachricht.',
+        title: input.seed[0]?.subject ?? 'Nachricht',
+      }),
+      forceDemo: true,
+      roundStore: throwingStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const restarted = await fetch(
+        `${localBase}/api/reviews/throwing-terminal-round/reanalyze`,
+        post({}, 'throwing-terminal-csrf'),
+      )
+      expect(restarted.status).toBe(202)
+
+      await expect(waitForApiJobs()).resolves.toBeUndefined()
+      await new Promise<void>((resolve) => setImmediate(resolve))
+      expect(terminalTransitions).toBeGreaterThan(0)
+      expect(localStore.get('throwing-terminal-round')).toMatchObject({
+        bundleRun: null,
+        runStatus: 'failed',
+      })
+
+      const deleted = await fetch(`${localBase}/api/reviews/throwing-terminal-round`, {
+        method: 'DELETE',
+        headers: { 'X-Inbox-Walk-CSRF': 'throwing-terminal-csrf' },
+      })
+      expect(deleted.status).toBe(204)
+    } finally {
+      await waitForApiJobs()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('fails a background run before provider work when analysis start persistence is rejected', async () => {
+    const localStore = createRoundStore(':memory:')
+    let providerCalls = 0
+    const failingStore = {
+      ...localStore,
+      updateAnalysis: () => null,
+    }
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async () => {
+        providerCalls += 1
+        throw new Error('Provider must not be called')
+      },
+      forceDemo: true,
+      roundStore: failingStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const id = crypto.randomUUID()
+      await fetch(
+        `${localBase}/api/reviews`,
+        post({
+          id,
+          filters: {
+            hideReviewed: false,
+            mailboxId: null,
+            newsletter: 'all',
+            spam: 'exclude',
+            timeRange: 'all',
+          },
+        }),
+      )
+      await waitForApiJobs()
+      expect(providerCalls).toBe(0)
+      expect(localStore.get(id)).toMatchObject({ runStatus: 'failed' })
+      expect(localStore.get(id)?.analysis.error).toContain('nicht sicher gestartet')
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('recovers a persisted queued run when the run list is loaded after restart', async () => {
+    const localStore = createRoundStore(':memory:')
+    const id = crypto.randomUUID()
+    localStore.create({
+      analysis: {
+        engine: 'heuristic',
+        phase: 'queued',
+        status: 'pending',
+        totalEmailCount: 0,
+      },
+      csrfToken: 'restart-csrf',
+      emails: [],
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 1,
+      id,
+      imageToken: 'restart-image',
+      mailboxes: [],
+      mode: 'demo',
+      runStatus: 'queued',
+    })
+    const localMiddleware = createApiMiddleware({ forceDemo: true, roundStore: localStore })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      await fetch(`http://127.0.0.1:${address.port}/api/reviews`)
+      await waitForApiJobs()
+      expect(localStore.get(id)).toMatchObject({ runStatus: 'ready' })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('reads and atomically updates model plus thinking level through settings', async () => {
+    let settings = { model: 'gpt-5.6-sol' as const, thinkingLevel: 'high' as const }
+    const localMiddleware = createApiMiddleware({
+      codexAuthStatus: () => ({ configured: true, ...settings }),
+      codexSettingsSelect: (next) => {
+        settings = next as typeof settings
+        return { configured: true, ...settings }
+      },
+      fastmailToken: 'test-token',
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      expect(await (await fetch(`${localBase}/api/settings/codex`)).json()).toMatchObject(settings)
+      const updated = await fetch(
+        `${localBase}/api/settings/codex`,
+        post({ model: 'gpt-5.6-terra', thinkingLevel: 'xhigh' }),
+      )
+      expect(updated.status).toBe(200)
+      expect(await updated.json()).toMatchObject({
+        model: 'gpt-5.6-terra',
+        thinkingLevel: 'xhigh',
+      })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      clearApiStateForTests()
+    }
+  })
+
   it('creates a fixed review and lazily loads a detail', async () => {
     const options = await json<ReviewOptions>('/api/review/options')
     expect(options.response.status).toBe(200)
@@ -251,7 +1210,7 @@ describe('demo API contract', () => {
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
     )
-    expect(review.response.status).toBe(201)
+    expect(review.response.status).toBe(202)
     expect(review.body.emails).toHaveLength(9)
     expect(review.body.emails[0]).not.toHaveProperty('html')
     expect(review.body.finalization).toEqual({
@@ -339,16 +1298,421 @@ describe('demo API contract', () => {
     expect(afterRead.body.reviewedCount).toBe(0)
   })
 
-  it('resumes only exact IDs and reports missing messages', async () => {
-    const resumed = await json<ReviewSnapshot>(
+  it('rejects an incomplete demo checkpoint before persistence or bundle analysis', async () => {
+    const existingRunIds = new Set(roundStore.list().map((run) => run.id))
+    const resumed = await json<{
+      error: { code: string; details: { missingCount: number }; message: string }
+    }>(
       '/api/reviews/resume',
       post({
+        id: crypto.randomUUID(),
         emailIds: ['demo-human', 'missing-id', 'demo-train'],
         filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
       }),
     )
-    expect(resumed.body.emails.map((email) => email.id)).toEqual(['demo-human', 'demo-train'])
-    expect(resumed.body.missingIds).toEqual(['missing-id'])
+
+    expect(resumed.response.status).toBe(409)
+    expect(resumed.body.error).toMatchObject({
+      code: 'ROUND_SNAPSHOT_INCOMPLETE',
+      details: { missingCount: 1 },
+    })
+    expect(resumed.body.error.message).toContain('Zwischenstand bleibt erhalten')
+    await waitForApiJobs()
+    expect(bundleDecisionCalls).toBe(0)
+    expect(roundStore.list().filter((run) => !existingRunIds.has(run.id))).toEqual([])
+  })
+
+  it('makes a complete resumed snapshot ready and reanalyzable', async () => {
+    bundleDecisionGate = new Promise<void>((resolve) => {
+      releaseBundleDecision = resolve
+    })
+    const id = crypto.randomUUID()
+    const resumed = await json<ReviewRunSummary>(
+      '/api/reviews/resume',
+      post({
+        id,
+        emailIds: ['demo-human', 'demo-train'],
+        filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' },
+      }),
+    )
+    expect(resumed.response.status).toBe(202)
+    expect(resumed.body).toMatchObject({ emailCount: 2, id, status: 'analyzing' })
+    const analyzing = await json<{ runs: ReviewRunSummary[] }>('/api/reviews')
+    expect(analyzing.body.runs.find((run) => run.id === id)).toMatchObject({
+      reanalyzable: false,
+      status: 'analyzing',
+    })
+
+    releaseBundleDecision?.()
+    await waitForApiJobs()
+    const ready = await json<{ runs: ReviewRunSummary[] }>('/api/reviews')
+    expect(ready.body.runs.find((run) => run.id === id)).toMatchObject({
+      emailCount: 2,
+      reanalyzable: true,
+      status: 'ready',
+    })
+    const opened = await json<ReviewSnapshot>(`/api/reviews/${id}`)
+    expect(opened.body.emails.map((email) => email.id)).toEqual(['demo-human', 'demo-train'])
+    expect(opened.body.missingIds).toEqual([])
+  })
+
+  it('reuses one resumed round and analysis job for repeated requests with the same ID', async () => {
+    bundleDecisionGate = new Promise<void>((resolve) => {
+      releaseBundleDecision = resolve
+    })
+    const id = crypto.randomUUID()
+    const filters = {
+      hideReviewed: false,
+      mailboxId: null,
+      newsletter: 'all' as const,
+      spam: 'exclude' as const,
+      timeRange: 'all' as const,
+    }
+    const body = { id, emailIds: ['demo-human'], filters }
+    const first = await json<ReviewRunSummary>('/api/reviews/resume', post(body))
+    const repeated = await json<ReviewRunSummary>('/api/reviews/resume', post(body))
+
+    expect(first.response.status).toBe(202)
+    expect(repeated.response.status).toBe(202)
+    expect(repeated.body).toMatchObject({
+      csrfToken: first.body.csrfToken,
+      emailCount: 1,
+      id,
+      status: 'analyzing',
+    })
+    expect(roundStore.list().filter((run) => run.id === id)).toHaveLength(1)
+
+    for (const conflictBody of [
+      { ...body, emailIds: ['demo-train'] },
+      { ...body, filters: { ...filters, newsletter: 'exclude' as const } },
+    ]) {
+      const conflict = await json<{ error: { code: string } }>(
+        '/api/reviews/resume',
+        post(conflictBody),
+      )
+      expect(conflict.response.status).toBe(409)
+      expect(conflict.body.error.code).toBe('ROUND_ID_CONFLICT')
+    }
+
+    releaseBundleDecision?.()
+    await waitForApiJobs()
+    expect(bundleDecisionCalls).toBe(1)
+    expect(roundStore.get(id)).toMatchObject({ runStatus: 'ready' })
+  })
+
+  it('shares one snapshot fetch when the same resume ID arrives concurrently', async () => {
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    let snapshotCalls = 0
+    let providerCalls = 0
+    let snapshotStarted: (() => void) | undefined
+    const snapshotStart = new Promise<void>((resolve) => {
+      snapshotStarted = resolve
+    })
+    let releaseSnapshot: (() => void) | undefined
+    const snapshotGate = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve
+    })
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async (input) => {
+        providerCalls += 1
+        return {
+          currentState: 'Geprüft',
+          includedEmailIds: [],
+          kind: 'standalone',
+          linkEvidence: [],
+          membershipConfidence: 1,
+          summary: 'Eigenständige Nachricht.',
+          title: input.seed[0]?.subject ?? 'Nachricht',
+        }
+      },
+      fastmailToken: 'test-token',
+      resumeMailSnapshot: async (_token, _ids, filters) => {
+        snapshotCalls += 1
+        snapshotStarted?.()
+        await snapshotGate
+        return {
+          context: {
+            accountId: 'account',
+            apiUrl: 'https://api.example.invalid',
+            downloadUrl: 'https://download.example.invalid',
+            maxObjectsInGet: 256,
+            maxObjectsInSet: 256,
+            username: 'test@example.invalid',
+          },
+          emails: [source],
+          filters,
+          mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+          missingIds: [],
+          totalBeforeLimit: 1,
+          truncated: false,
+        }
+      },
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const id = crypto.randomUUID()
+      const body = { id, emailIds: [source.id], filters: defaultReviewFilters }
+      const first = fetch(`${localBase}/api/reviews/resume`, post(body))
+      await snapshotStart
+      const repeated = fetch(`${localBase}/api/reviews/resume`, post(body))
+      const conflict = await fetch(
+        `${localBase}/api/reviews/resume`,
+        post({ ...body, emailIds: ['different-message'] }),
+      )
+      expect(conflict.status).toBe(409)
+      expect((await conflict.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_ID_CONFLICT' },
+      })
+
+      releaseSnapshot?.()
+      const responses = await Promise.all([first, repeated])
+      expect(responses.map((response) => response.status)).toEqual([202, 202])
+      const summaries = (await Promise.all(
+        responses.map((response) => response.json()),
+      )) as ReviewRunSummary[]
+      expect(summaries[0]?.csrfToken).toBe(summaries[1]?.csrfToken)
+      await waitForApiJobs()
+      expect(snapshotCalls).toBe(1)
+      expect(providerCalls).toBe(1)
+      expect(localStore.list().filter((run) => run.id === id)).toHaveLength(1)
+      expect(localStore.get(id)).toMatchObject({ runStatus: 'ready' })
+    } finally {
+      releaseSnapshot?.()
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('rejects invalid resume IDs and empty or duplicate message snapshots', async () => {
+    const existingRunIds = new Set(roundStore.list().map((run) => run.id))
+    const cases = [
+      {
+        body: { id: 'not-a-uuid', emailIds: ['demo-human'], filters: defaultReviewFilters },
+        code: 'INVALID_ROUND_ID',
+      },
+      {
+        body: { id: crypto.randomUUID(), emailIds: [], filters: defaultReviewFilters },
+        code: 'INVALID_RESUME',
+      },
+      {
+        body: {
+          id: crypto.randomUUID(),
+          emailIds: ['demo-human', 'demo-human'],
+          filters: defaultReviewFilters,
+        },
+        code: 'INVALID_RESUME',
+      },
+      {
+        body: { id: crypto.randomUUID(), emailIds: ['   '], filters: defaultReviewFilters },
+        code: 'INVALID_RESUME',
+      },
+    ]
+
+    for (const invalid of cases) {
+      const response = await json<{ error: { code: string } }>(
+        '/api/reviews/resume',
+        post(invalid.body),
+      )
+      expect(response.response.status).toBe(400)
+      expect(response.body.error.code).toBe(invalid.code)
+    }
+    expect(roundStore.list().filter((run) => !existingRunIds.has(run.id))).toEqual([])
+    expect(bundleDecisionCalls).toBe(0)
+  })
+
+  it('rejects an incomplete live checkpoint before persistence or Codex work', async () => {
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    let providerCalls = 0
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async () => {
+        providerCalls += 1
+        throw new Error('Provider must not be called for an incomplete snapshot')
+      },
+      fastmailToken: 'test-token',
+      resumeMailSnapshot: async (_token, _ids, filters) => ({
+        context: {
+          accountId: 'account',
+          apiUrl: 'https://api.example.invalid',
+          downloadUrl: 'https://download.example.invalid',
+          maxObjectsInGet: 256,
+          maxObjectsInSet: 256,
+          username: 'test@example.invalid',
+        },
+        emails: [source],
+        filters,
+        mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+        missingIds: ['missing-live-message'],
+        totalBeforeLimit: 2,
+        truncated: false,
+      }),
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const response = await fetch(
+        `http://127.0.0.1:${address.port}/api/reviews/resume`,
+        post({
+          id: crypto.randomUUID(),
+          emailIds: [source.id, 'missing-live-message'],
+          filters: {
+            hideReviewed: false,
+            mailboxId: null,
+            newsletter: 'all',
+            spam: 'exclude',
+            timeRange: 'all',
+          },
+        }),
+      )
+      expect(response.status).toBe(409)
+      expect((await response.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_SNAPSHOT_INCOMPLETE' },
+      })
+      await waitForApiJobs()
+      expect(providerCalls).toBe(0)
+      expect(localStore.list()).toEqual([])
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('quarantines a historically persisted ready round with missing snapshot messages', async () => {
+    const localStore = createRoundStore(':memory:')
+    const source = demoEmails[0]
+    expect(source).toBeDefined()
+    if (!source) return
+    localStore.create({
+      analysis: {
+        callCount: 1,
+        engine: 'codex',
+        phase: 'complete',
+        processedEmailCount: 1,
+        progress: 1,
+        status: 'complete',
+        totalEmailCount: 1,
+      },
+      csrfToken: 'incomplete-history-csrf',
+      emails: [source],
+      filters: {
+        hideReviewed: false,
+        mailboxId: null,
+        newsletter: 'all',
+        spam: 'exclude',
+        timeRange: 'all',
+      },
+      generation: 3,
+      id: 'incomplete-history-round',
+      imageToken: 'incomplete-history-image',
+      mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
+      missingIds: ['missing-history-message'],
+      mode: 'demo',
+      runStatus: 'ready',
+      totalBeforeLimit: 2,
+    })
+    let providerCalls = 0
+    const localMiddleware = createApiMiddleware({
+      bundleDecider: async () => {
+        providerCalls += 1
+        throw new Error('Incomplete historical rounds must never run analysis')
+      },
+      forceDemo: true,
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const listed = (await (await fetch(`${localBase}/api/reviews`)).json()) as {
+        runs: ReviewRunSummary[]
+      }
+      expect(listed.runs).toEqual([
+        expect.objectContaining({
+          id: 'incomplete-history-round',
+          reanalyzable: false,
+          status: 'failed',
+        }),
+      ])
+      expect(listed.runs[0]?.analysis.error).toContain('Zwischenstand bleibt erhalten')
+
+      for (const path of [
+        '/api/reviews/incomplete-history-round',
+        `/api/reviews/incomplete-history-round/emails/${source.id}`,
+      ]) {
+        const gated = await fetch(`${localBase}${path}`)
+        expect(gated.status).toBe(409)
+        expect(((await gated.json()) as { error: { code: string } }).error.code).toBe(
+          'ROUND_SNAPSHOT_INCOMPLETE',
+        )
+      }
+      const reanalyzed = await fetch(
+        `${localBase}/api/reviews/incomplete-history-round/reanalyze`,
+        post({}, 'incomplete-history-csrf'),
+      )
+      expect(reanalyzed.status).toBe(409)
+      expect(((await reanalyzed.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_SNAPSHOT_INCOMPLETE',
+      )
+      const finalized = await fetch(
+        `${localBase}/api/reviews/incomplete-history-round/finalize`,
+        post({}, 'incomplete-history-csrf'),
+      )
+      expect(finalized.status).toBe(409)
+      expect(((await finalized.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_SNAPSHOT_INCOMPLETE',
+      )
+
+      await waitForApiJobs()
+      expect(providerCalls).toBe(0)
+      expect(localStore.get('incomplete-history-round')).toMatchObject({
+        emails: [expect.objectContaining({ id: source.id })],
+        generation: 3,
+        missingIds: ['missing-history-message'],
+        runStatus: 'failed',
+      })
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
   })
 
   it('loads the same persisted round ID and tokens after the RAM cache is cleared', async () => {
@@ -414,52 +1778,42 @@ describe('demo API contract', () => {
     bundleDecisionGate = new Promise<void>((resolve) => {
       releaseBundleDecision = resolve
     })
-    const created = await json<ReviewSnapshot>(
-      '/api/reviews',
+    const createdResponse = await fetch(
+      `${baseUrl}/api/reviews`,
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
     )
-    const started = await json<ReviewSnapshot>(
-      `/api/reviews/${created.body.snapshotId}/bundles`,
-      post({}, created.body.csrfToken),
-    )
+    const created = (await createdResponse.json()) as ReviewRunSummary
 
-    expect(started.response.status).toBe(202)
-    expect(started.body.analysis).toMatchObject({ engine: 'codex', status: 'running' })
-    expect(started.body.bundleRun).toBeUndefined()
+    expect(createdResponse.status).toBe(202)
+    expect(created).toMatchObject({ reanalyzable: false, status: 'queued' })
     releaseBundleDecision?.()
-    const completed = await waitForBundles(created.body)
+    await waitForApiJobs()
+    const completed = await json<ReviewSnapshot>(`/api/reviews/${created.id}`)
     const callsAfterCompletion = bundleDecisionCalls
     expect(callsAfterCompletion).toBeGreaterThan(0)
+    expect(completed.body.bundleRun).toBeDefined()
 
     clearApiStateForTests()
-    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.body.snapshotId}`)
+    const restored = await json<ReviewSnapshot>(`/api/reviews/${created.id}`)
     expect(restored.body.analysis.status).toBe('complete')
     const restarted = await json<ReviewSnapshot>(
-      `/api/reviews/${created.body.snapshotId}/bundles`,
-      post({}, created.body.csrfToken),
+      `/api/reviews/${created.id}/bundles`,
+      post({}, created.csrfToken),
     )
     expect(restarted.response.status).toBe(200)
-    expect(restarted.body.bundleRun).toEqual(completed.bundleRun)
+    expect(restarted.body.bundleRun).toEqual(completed.body.bundleRun)
     expect(bundleDecisionCalls).toBe(callsAfterCompletion)
-    const rejectedFallback = await json<{ error: { code: string } }>(
-      `/api/reviews/${created.body.snapshotId}/bundles/fallback`,
-      post({}, created.body.csrfToken),
-    )
-    expect(rejectedFallback.response.status).toBe(409)
-    expect(rejectedFallback.body.error.code).toBe('ANALYSIS_ALREADY_COMPLETE')
   })
 
-  it('keeps the process alive when both bundle fallback layers fail', async () => {
+  it('keeps the process alive when background bundle analysis fails', async () => {
     const source = demoEmails[0]
     expect(source).toBeDefined()
     if (!source) return
+    const localStore = createRoundStore(':memory:')
     const localMiddleware = createApiMiddleware({
       autoStartBundles: true,
       bundleDecider: async () => {
         throw new Error('Primary bundle analysis failed')
-      },
-      bundleFallback: () => {
-        throw new Error('Emergency fallback failed')
       },
       demoMessages: [
         source,
@@ -470,6 +1824,7 @@ describe('demo API contract', () => {
         },
       ],
       forceDemo: true,
+      roundStore: localStore,
     })
     const localServer = createServer((request, response) => {
       void localMiddleware(request, response, () => {
@@ -487,68 +1842,32 @@ describe('demo API contract', () => {
           `${localBase}/api/reviews`,
           post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
         )
-      ).json()) as ReviewSnapshot
+      ).json()) as ReviewRunSummary
 
       await waitForApiJobs()
-      const recovered = (await (
-        await fetch(`${localBase}/api/reviews/${created.snapshotId}`)
-      ).json()) as ReviewSnapshot
-
-      expect(recovered.bundleRun).toBeUndefined()
-      expect(recovered.analysis).toMatchObject({
-        engine: 'fallback',
-        phase: 'waiting',
-        progress: 0,
+      expect(localStore.get(created.id)).toMatchObject({
+        bundleRun: null,
+        runStatus: 'failed',
+      })
+      expect(localStore.get(created.id)?.analysis).toMatchObject({
+        phase: 'failed',
         status: 'pending',
       })
-      expect(recovered.analysis.error).toContain('gespeicherte Runde')
+      const gated = await fetch(`${localBase}/api/reviews/${created.id}`)
+      expect(gated.status).toBe(409)
+      expect(((await gated.json()) as { error: { code: string } }).error.code).toBe(
+        'ROUND_NOT_READY',
+      )
     } finally {
       await new Promise<void>((resolve, reject) =>
         localServer.close((error) => (error ? reject(error) : resolve())),
       )
+      localStore.close()
       clearApiStateForTests()
     }
   })
 
-  it('rejects the explicit fallback immediately while Codex analysis is running', async () => {
-    bundleDecisionGate = new Promise<void>((resolve) => {
-      releaseBundleDecision = resolve
-    })
-    const created = await json<ReviewSnapshot>(
-      '/api/reviews',
-      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
-    )
-    const started = await json<ReviewSnapshot>(
-      `/api/reviews/${created.body.snapshotId}/bundles`,
-      post({}, created.body.csrfToken),
-    )
-    expect(started.response.status).toBe(202)
-    expect(started.body.analysis.status).toBe('running')
-
-    const fallbackRequest = json<{ error: { code: string } }>(
-      `/api/reviews/${created.body.snapshotId}/bundles/fallback`,
-      post({}, created.body.csrfToken),
-    )
-    try {
-      const early = await Promise.race([
-        fallbackRequest.then((result) => ({ kind: 'response' as const, result })),
-        new Promise<{ kind: 'timeout' }>((resolve) =>
-          setTimeout(() => resolve({ kind: 'timeout' }), 100),
-        ),
-      ])
-      expect(early.kind).toBe('response')
-      if (early.kind === 'response') {
-        expect(early.result.response.status).toBe(409)
-        expect(early.result.body.error.code).toBe('ANALYSIS_NOT_WAITING_FOR_CODEX')
-      }
-    } finally {
-      releaseBundleDecision?.()
-      await fallbackRequest
-      await waitForApiJobs()
-    }
-  })
-
-  it('automatically resumes a persisted unfinished analysis when the round is opened', async () => {
+  it('resumes a persisted unfinished analysis with demo details when the run list is loaded', async () => {
     clearApiStateForTests()
     const localStore = createRoundStore(':memory:')
     localStore.create({
@@ -575,6 +1894,8 @@ describe('demo API contract', () => {
       imageToken: 'recovery-image',
       mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
       mode: 'demo',
+      generation: 1,
+      runStatus: 'analyzing',
     })
     let releaseDecision: (() => void) | undefined
     const decisionGate = new Promise<void>((resolve) => {
@@ -611,12 +1932,8 @@ describe('demo API contract', () => {
       const address = localServer.address()
       if (!address || typeof address === 'string') throw new Error('Local test server did not bind')
       const localBase = `http://127.0.0.1:${address.port}`
-      const openedResponse = await fetch(`${localBase}/api/reviews/pending-recovery-round`)
-      const opened = (await openedResponse.json()) as ReviewSnapshot
-
-      expect(openedResponse.status).toBe(200)
-      expect(opened.analysis).toMatchObject({ engine: 'codex', status: 'running' })
-      expect(opened.bundleRun).toBeUndefined()
+      const listedResponse = await fetch(`${localBase}/api/reviews`)
+      expect(listedResponse.status).toBe(200)
       for (let attempt = 0; attempt < 50 && decisionCalls === 0; attempt += 1) {
         await new Promise((resolve) => setTimeout(resolve, 5))
       }
@@ -629,6 +1946,14 @@ describe('demo API contract', () => {
       ).json()) as ReviewSnapshot
       expect(completed.analysis.status).toBe('complete')
       expect(completed.bundleRun).toBeDefined()
+      const source = demoEmails[0]
+      expect(source).toBeDefined()
+      if (!source) return
+      const detailResponse = await fetch(
+        `${localBase}/api/reviews/pending-recovery-round/emails/${source.id}`,
+      )
+      expect(detailResponse.status).toBe(200)
+      expect(((await detailResponse.json()) as ReviewEmail).text).toBe(source.text)
       const callsAfterCompletion = decisionCalls
 
       clearApiStateForTests()
@@ -733,68 +2058,11 @@ describe('demo API contract', () => {
       expect(current.analysis.error).toContain('erneut verbunden')
       expect(current.bundleRun).toBeUndefined()
 
-      const forbiddenFallback = await fetch(
-        `${localBase}/api/reviews/live-restart-round/bundles/fallback`,
-        post({}, 'wrong-csrf'),
-      )
-      expect(forbiddenFallback.status).toBe(403)
-
-      const fallbackResponse = await fetch(
+      const removedFallback = await fetch(
         `${localBase}/api/reviews/live-restart-round/bundles/fallback`,
         post({}, 'restart-csrf'),
       )
-      const fallback = (await fallbackResponse.json()) as ReviewSnapshot
-      expect(fallbackResponse.status).toBe(200)
-      expect(fallback.analysis).toMatchObject({
-        callCount: 2,
-        engine: 'fallback',
-        model: 'gpt-5.6-sol',
-        phase: 'complete',
-        processedEmailCount: 2,
-        progress: 1,
-        status: 'complete',
-      })
-      expect(fallback.analysis).not.toHaveProperty('error')
-      expect(fallback.bundleRun?.fallback).toBe(true)
-      expect(fallback.bundleRun?.bundles.map((bundle) => bundle.emailIds)).toEqual([
-        [source.id],
-        [secondSource.id],
-      ])
-      expect(localStore.get('live-restart-round')?.analysis).toMatchObject({
-        callCount: 2,
-        engine: 'fallback',
-        phase: 'complete',
-        status: 'complete',
-      })
-
-      const repeatedResponse = await fetch(
-        `${localBase}/api/reviews/live-restart-round/bundles/fallback`,
-        post({}, 'restart-csrf'),
-      )
-      const repeated = (await repeatedResponse.json()) as ReviewSnapshot
-      expect(repeatedResponse.status).toBe(200)
-      expect(repeated.bundleRun).toEqual(fallback.bundleRun)
-
-      const extraSegmentResponse = await fetch(
-        `${localBase}/api/reviews/live-restart-round/bundles/fallback/extra`,
-        post({}, 'restart-csrf'),
-      )
-      expect(extraSegmentResponse.status).toBe(404)
-
-      clearApiStateForTests()
-      const reopened = (await (
-        await fetch(`${localBase}/api/reviews/live-restart-round`)
-      ).json()) as ReviewSnapshot
-      expect(reopened.analysis).toMatchObject({ engine: 'fallback', status: 'complete' })
-      expect(reopened.bundleRun).toEqual(fallback.bundleRun)
-      const normalBundleResponse = await fetch(
-        `${localBase}/api/reviews/live-restart-round/bundles`,
-        post({}, 'restart-csrf'),
-      )
-      expect(normalBundleResponse.status).toBe(200)
-      expect(((await normalBundleResponse.json()) as ReviewSnapshot).bundleRun).toEqual(
-        fallback.bundleRun,
-      )
+      expect(removedFallback.status).toBe(404)
     } finally {
       await new Promise<void>((resolve, reject) =>
         localServer.close((error) => (error ? reject(error) : resolve())),
@@ -804,98 +2072,7 @@ describe('demo API contract', () => {
     }
   })
 
-  it('keeps the Codex waiting state in memory when fallback persistence fails', async () => {
-    for (const failureMode of ['null', 'throw'] as const) {
-      clearApiStateForTests()
-      const localStore = createRoundStore(':memory:')
-      const source = demoEmails[0]
-      expect(source).toBeDefined()
-      if (!source) return
-      localStore.create({
-        analysis: {
-          callCount: 1,
-          engine: 'codex',
-          model: 'gpt-5.6-sol',
-          phase: 'waiting_for_codex',
-          processedEmailCount: 0,
-          progress: 0.25,
-          status: 'pending',
-          totalEmailCount: 1,
-        },
-        csrfToken: `fallback-${failureMode}-csrf`,
-        emails: [source],
-        filters: {
-          hideReviewed: false,
-          mailboxId: null,
-          newsletter: 'all',
-          spam: 'exclude',
-          timeRange: 'all',
-        },
-        id: `fallback-${failureMode}-round`,
-        imageToken: `fallback-${failureMode}-image`,
-        mailboxes: [{ id: 'Inbox', name: 'Inbox', role: 'inbox' }],
-        mode: 'live',
-      })
-      const failingStore = {
-        ...localStore,
-        saveBundleRun: () => {
-          if (failureMode === 'throw') throw new Error('Simulated persistence failure')
-          return null
-        },
-      }
-      const localMiddleware = createApiMiddleware({
-        autoStartBundles: false,
-        roundStore: failingStore,
-      })
-      const localServer = createServer((request, response) => {
-        void localMiddleware(request, response, () => {
-          response.statusCode = 404
-          response.end()
-        })
-      })
-      await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
-      try {
-        const address = localServer.address()
-        if (!address || typeof address === 'string')
-          throw new Error('Local test server did not bind')
-        const localBase = `http://127.0.0.1:${address.port}`
-        const failedResponse = await fetch(
-          `${localBase}/api/reviews/fallback-${failureMode}-round/bundles/fallback`,
-          post({}, `fallback-${failureMode}-csrf`),
-        )
-        expect(failedResponse.status).toBe(503)
-        expect((await failedResponse.json()) as { error: { code: string } }).toMatchObject({
-          error: { code: 'ROUND_PERSIST_FAILED' },
-        })
-
-        const current = (await (
-          await fetch(`${localBase}/api/reviews/fallback-${failureMode}-round`)
-        ).json()) as ReviewSnapshot
-        expect(current.analysis).toMatchObject({
-          engine: 'codex',
-          phase: 'waiting_for_codex',
-          status: 'pending',
-        })
-        expect(current.bundleRun).toBeUndefined()
-        expect(localStore.get(`fallback-${failureMode}-round`)).toMatchObject({
-          analysis: {
-            engine: 'codex',
-            phase: 'waiting_for_codex',
-            status: 'pending',
-          },
-          bundleRun: null,
-        })
-      } finally {
-        await new Promise<void>((resolve, reject) =>
-          localServer.close((error) => (error ? reject(error) : resolve())),
-        )
-        localStore.close()
-        clearApiStateForTests()
-      }
-    }
-  })
-
-  it('reuses the frozen Codex inputs and call limit after restart', async () => {
+  it('reuses the frozen Codex inputs and checkpoints after restart', async () => {
     clearApiStateForTests()
     const localStore = createRoundStore(':memory:')
     const source = demoEmails[0]
@@ -934,7 +2111,6 @@ describe('demo API contract', () => {
         status: 'pending',
         totalEmailCount: summaries.length,
       },
-      bundleCallLimit: 2,
       bundleExamples: globalExamples,
       csrfToken: 'auth-resume-csrf',
       emails: summaries,
@@ -956,7 +2132,6 @@ describe('demo API contract', () => {
     const observedExamples: BundleExample[][] = []
     const localMiddleware = createApiMiddleware({
       autoStartBundles: false,
-      bundleCallLimit: 1,
       bundleDecider: async (input) => {
         providerCalls += 1
         observedExamples.push(input.examples)
@@ -1272,6 +2447,76 @@ describe('demo API contract', () => {
     })
   })
 
+  it('does not delete a round while a draft request body is still arriving', async () => {
+    const created = await json<ReviewSnapshot>(
+      '/api/reviews',
+      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+    )
+    const email = created.body.emails[0]
+    expect(email).toBeDefined()
+    if (!email) return
+    const context = await json<ThreadContext>(
+      `/api/reviews/${created.body.snapshotId}/threads/${email.threadId}?emailId=${email.id}`,
+    )
+    const payload = JSON.stringify({
+      bodyText: 'Antworttext',
+      cc: context.body.recipients.cc,
+      emailId: email.id,
+      identityId: context.body.recipients.identityId,
+      requestId: crypto.randomUUID(),
+      subject: context.body.recipients.subject,
+      to: context.body.recipients.to,
+    })
+    let slowRequest: ReturnType<typeof httpRequest> | undefined
+    const slowResponse = new Promise<{ status: number }>((resolve, reject) => {
+      slowRequest = httpRequest(
+        `${baseUrl}/api/reviews/${created.body.snapshotId}/drafts`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Length': Buffer.byteLength(payload),
+            'Content-Type': 'application/json',
+            'X-Inbox-Walk-CSRF': created.body.csrfToken,
+          },
+        },
+        (response) => {
+          response.resume()
+          response.on('end', () => resolve({ status: response.statusCode ?? 0 }))
+        },
+      )
+      slowRequest.on('error', reject)
+    })
+    slowRequest?.write(payload.slice(0, 1))
+    await new Promise((resolve) => setTimeout(resolve, 25))
+
+    const blocked = await fetch(`${baseUrl}/api/reviews/${created.body.snapshotId}`, {
+      method: 'DELETE',
+      headers: { 'X-Inbox-Walk-CSRF': created.body.csrfToken },
+    })
+    expect(blocked.status).toBe(409)
+    expect((await blocked.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: 'ROUND_DRAFT_IN_PROGRESS' },
+    })
+    expect(roundStore.get(created.body.snapshotId)).not.toBeNull()
+
+    const reanalysis = await fetch(
+      `${baseUrl}/api/reviews/${created.body.snapshotId}/reanalyze`,
+      post({}, created.body.csrfToken),
+    )
+    expect(reanalysis.status).toBe(409)
+    expect((await reanalysis.json()) as { error: { code: string } }).toMatchObject({
+      error: { code: 'ROUND_DRAFT_IN_PROGRESS' },
+    })
+
+    slowRequest?.end(payload.slice(1))
+    await expect(slowResponse).resolves.toMatchObject({ status: 201 })
+    const deleted = await fetch(`${baseUrl}/api/reviews/${created.body.snapshotId}`, {
+      method: 'DELETE',
+      headers: { 'X-Inbox-Walk-CSRF': created.body.csrfToken },
+    })
+    expect(deleted.status).toBe(204)
+  })
+
   it('requires the snapshot CSRF token for mutations', async () => {
     const review = await json<ReviewSnapshot>(
       '/api/reviews',
@@ -1290,7 +2535,7 @@ describe('demo API contract', () => {
     expect(rejected.body.error.code).toBe('INVALID_CSRF')
   })
 
-  it('builds an exact bundle partition and rejects unknown learning IDs', async () => {
+  it('builds an exact bundle partition', async () => {
     const review = await json<ReviewSnapshot>(
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
@@ -1311,69 +2556,28 @@ describe('demo API contract', () => {
         'demo-railway-success',
       ]),
     )
-    const rejected = await json<{ error: { code: string } }>(
-      `/api/reviews/${review.body.snapshotId}/bundle-labels`,
-      post(
-        {
-          anchorEmailIds: [review.body.emails[0]?.id],
-          candidateEmailIds: ['not-in-the-snapshot'],
-          label: 'split',
-        },
-        review.body.csrfToken,
-      ),
-    )
-    expect(rejected.response.status).toBe(400)
-    expect(rejected.body.error.code).toBe('UNKNOWN_EMAIL')
   })
 
-  it('accepts a bundle-label reason without persisting its free-form text', async () => {
-    const review = await json<ReviewSnapshot>(
-      '/api/reviews',
-      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
-    )
-    const [anchor, candidate] = review.body.emails
-    expect(anchor).toBeDefined()
-    expect(candidate).toBeDefined()
-    if (!anchor || !candidate) return
-
-    const recorded = await json<{ recorded: boolean }>(
-      `/api/reviews/${review.body.snapshotId}/bundle-labels`,
-      post(
-        {
-          anchorEmailIds: [anchor.id],
-          candidateEmailIds: [candidate.id],
-          label: 'split',
-          reason: 'Untrusted free-form reason that must not reach SQLite.',
-        },
-        review.body.csrfToken,
-      ),
-    )
-
-    expect(recorded.response.status).toBe(201)
-    expect(recorded.body.recorded).toBe(true)
-    expect(recordedBundleLabels).toHaveLength(1)
-    expect(recordedBundleLabels[0]).toMatchObject({
-      label: 'split',
-      reason: 'Vom Nutzer im Review bestätigt.',
-    })
-  })
-
-  it('falls back to safe singletons when a bundle decision injects an unknown ID', async () => {
+  it('fails the background run closed when a bundle decision injects an unknown ID', async () => {
     injectUnknownBundleId = true
-    const review = await json<ReviewSnapshot>(
-      '/api/reviews',
+    const response = await fetch(
+      `${baseUrl}/api/reviews`,
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
     )
-    const completed = await waitForBundles(review.body)
-    const run = completed.bundleRun
-    if (!run) return
-    expect(run.fallback).toBe(true)
-    expect(completed.analysis).toMatchObject({ engine: 'fallback', status: 'complete' })
-    expect(completed.analysis.error).toContain('nicht sicher bestimmt')
-    expect(run.bundles).toHaveLength(review.body.emails.length)
-    expect(run.bundles.flatMap((bundle) => bundle.emailIds)).not.toContain(
-      'outside-frozen-snapshot',
-    )
+    const created = (await response.json()) as ReviewRunSummary
+    expect(response.status).toBe(202)
+
+    await waitForApiJobs()
+    const failed = roundStore.get(created.id)
+    expect(failed).toMatchObject({ bundleRun: null, runStatus: 'failed' })
+    expect(failed?.analysis.error).toContain('nicht sicher bestimmt')
+    expect(failed?.emails.map((email) => email.id)).not.toContain('outside-frozen-snapshot')
+
+    const deleted = await fetch(`${baseUrl}/api/reviews/${created.id}`, {
+      method: 'DELETE',
+      headers: { 'X-Inbox-Walk-CSRF': created.csrfToken },
+    })
+    expect(deleted.status).toBe(204)
   })
 
   it('builds reply context, proposes text, saves a draft, and exposes no send route', async () => {
@@ -1515,7 +2719,11 @@ describe('demo API contract', () => {
         `${localBase}/api/reviews`,
         post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
       )
-      const created = (await createdResponse.json()) as ReviewSnapshot
+      const run = (await createdResponse.json()) as ReviewRunSummary
+      await waitForApiJobs()
+      const created = (await (
+        await fetch(`${localBase}/api/reviews/${run.id}`)
+      ).json()) as ReviewSnapshot
       const emailId = created.emails[0]?.id
       expect(emailId).toBeDefined()
       if (!emailId) return
@@ -1826,6 +3034,18 @@ describe('demo API contract', () => {
         second.then((response) => ({ response, request: 'second' as const })),
       ])
       expect(early.response.status).toBe(409)
+      const deleteDuringFinalization = await fetch(
+        `${localBase}/api/reviews/concurrent-finalize-round`,
+        {
+          method: 'DELETE',
+          headers: { 'X-Inbox-Walk-CSRF': 'concurrent-finalize-csrf' },
+        },
+      )
+      expect(deleteDuringFinalization.status).toBe(409)
+      expect((await deleteDuringFinalization.json()) as { error: { code: string } }).toMatchObject({
+        error: { code: 'ROUND_FINALIZATION_IN_PROGRESS' },
+      })
+      expect(localStore.get('concurrent-finalize-round')).not.toBeNull()
       releaseMarkRead?.()
       const responses = await Promise.all([first, second])
       expect(responses.map((response) => response.status).sort()).toEqual([200, 409])
@@ -2169,7 +3389,12 @@ describe('demo API contract', () => {
       subject: `Bulk message ${index}`,
       messageId: [`bulk-${index}@example.test`],
     }))
-    const localMiddleware = createApiMiddleware({ forceDemo: true, demoMessages: messages })
+    const localStore = createRoundStore(':memory:')
+    const localMiddleware = createApiMiddleware({
+      demoMessages: messages,
+      forceDemo: true,
+      roundStore: localStore,
+    })
     const localServer = createServer((request, response) => {
       void localMiddleware(request, response, () => {
         response.statusCode = 404
@@ -2185,7 +3410,11 @@ describe('demo API contract', () => {
         `${localBase}/api/reviews`,
         post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
       )
-      const created = (await createdResponse.json()) as ReviewSnapshot
+      const run = (await createdResponse.json()) as ReviewRunSummary
+      await waitForApiJobs()
+      const created = (await (
+        await fetch(`${localBase}/api/reviews/${run.id}`)
+      ).json()) as ReviewSnapshot
       expect(created.emails).toHaveLength(301)
       const finalizeIds = created.emails.slice(0, 300).map((email) => email.id)
       const finalResponse = await fetch(
@@ -2225,6 +3454,8 @@ describe('demo API contract', () => {
       await new Promise<void>((resolve, reject) =>
         localServer.close((error) => (error ? reject(error) : resolve())),
       )
+      localStore.close()
+      clearApiStateForTests()
     }
   })
 

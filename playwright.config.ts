@@ -5,6 +5,9 @@ const baseURL = 'http://127.0.0.1:4173'
 export default defineConfig({
   testDir: './e2e',
   fullyParallel: false,
+  // Both browser projects exercise the same single-user SQLite instance.
+  // Serial workers prevent one test from mutating another test's active round.
+  workers: 1,
   forbidOnly: Boolean(process.env.CI),
   retries: process.env.CI ? 1 : 0,
   reporter: [['list'], ['html', { open: 'never' }]],

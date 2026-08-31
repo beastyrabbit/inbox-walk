@@ -1,6 +1,11 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { clearCheckpoint, loadCheckpoint, saveCheckpoint } from './checkpoint.ts'
+import {
+  clearCheckpoint,
+  loadCheckpoint,
+  saveCheckpoint,
+  stageCheckpointMigration,
+} from './checkpoint.ts'
 
 class MemoryStorage implements Storage {
   private values = new Map<string, string>()
@@ -131,8 +136,15 @@ describe('local review checkpoint', () => {
     expect(localStorage.getItem('inbox-walk:checkpoint:v1')).not.toContain('Eigener Entwurf')
   })
 
-  it('removes invalid and explicitly cleared checkpoints', () => {
-    localStorage.setItem('inbox-walk:checkpoint:v1', '{"version":2}')
+  it('retains invalid checkpoints until they can be recovered or explicitly cleared', () => {
+    const invalid = '{"version":2,"replyDrafts":{"mail-1":{"bodyText":"Nicht verlieren"}}}'
+    localStorage.setItem('inbox-walk:checkpoint:v1', invalid)
+    expect(() => loadCheckpoint()).toThrow(
+      'Der gespeicherte alte Rundenstand ist ungültig und wurde nicht gelöscht.',
+    )
+    expect(localStorage.getItem('inbox-walk:checkpoint:v1')).toBe(invalid)
+
+    clearCheckpoint()
     expect(loadCheckpoint()).toBeNull()
     saveCheckpoint({
       version: 7,
@@ -182,6 +194,52 @@ describe('local review checkpoint', () => {
 
     expect(saveCheckpoint({ version: 7, roundId: 'migrated-round' })).toBe(false)
     expect(loadCheckpoint()).toEqual(legacy)
+  })
+
+  it('stages a durable migration ID without discarding legacy decisions or drafts', () => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [['mail-1']],
+        emailIds: ['mail-1'],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: ['mail-1'],
+        processedIds: ['mail-1'],
+        secondaryActionIds: [],
+        replyDrafts: {
+          'mail-1': {
+            bodyText: 'Eigener Entwurf',
+            cc: [],
+            identityId: 'identity-1',
+            revisionInstruction: '',
+            roughNotes: '',
+            subject: 'Re: Test',
+            to: [{ email: 'mara@example.com', name: 'Mara' }],
+          },
+        },
+      }),
+    )
+    const checkpoint = loadCheckpoint()
+    expect(checkpoint?.version).toBe(6)
+    if (checkpoint?.version !== 6) throw new Error('Legacy checkpoint expected')
+
+    const migrationRoundId = '550e8400-e29b-41d4-a716-446655440000'
+    expect(stageCheckpointMigration(checkpoint, migrationRoundId)).toMatchObject({
+      migrationRoundId,
+      keptUnreadIds: ['mail-1'],
+      replyDrafts: { 'mail-1': { bodyText: 'Eigener Entwurf' } },
+    })
+    expect(loadCheckpoint()).toMatchObject({ migrationRoundId })
+    expect(stageCheckpointMigration(checkpoint, 'not-a-round-uuid')).toBeNull()
+    expect(loadCheckpoint()).toMatchObject({ migrationRoundId })
   })
 
   it('migrates old checkpoints without assuming messages were processed', () => {

@@ -1,15 +1,22 @@
-import { expect, test } from '@playwright/test'
-import type { ReviewSnapshot } from '../src/shared.ts'
+import { expect, type Page, test } from '@playwright/test'
+import type { ReviewRunSummary } from '../src/shared.ts'
+
+async function startAndOpenRound(page: Page) {
+  await page.getByRole('button', { name: 'Runde starten' }).click()
+  const open = page.getByRole('button', { name: 'Runde öffnen' }).first()
+  await expect(open).toBeEnabled({ timeout: 15_000 })
+  await open.click()
+}
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Inbox Walk' })).toBeVisible()
-  await page.getByRole('button', { name: 'Review starten' }).click()
+  await startAndOpenRound(page)
   await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
 })
 
 test('configures every new round on a dedicated direct-selection screen', async ({ page }) => {
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await page.getByRole('button', { name: 'Runden' }).click()
   await expect(page.getByRole('heading', { name: 'Inbox Walk' })).toBeVisible()
   await expect(page.locator('select')).toHaveCount(0)
   await expect(page.getByRole('button', { name: /Alles außer Spam/ })).toHaveAttribute(
@@ -17,10 +24,213 @@ test('configures every new round on a dedicated direct-selection screen', async 
     'true',
   )
   await expect(page.getByLabel('Zurückgestellte Nachrichten ausblenden')).not.toBeChecked()
-  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Runde öffnen' }).first()).toBeEnabled()
 })
 
-test('keeps a stable round URL across reload and the real resume action', async ({ page }) => {
+test('keeps the overview visible and shows the new run before processing starts', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  const rows = page.locator('.runs-table tbody tr')
+  const countBefore = await rows.count()
+  let releaseCreate = () => undefined
+  const createGate = new Promise<void>((resolve) => {
+    releaseCreate = resolve
+  })
+  await page.route('**/api/reviews', async (route) => {
+    if (route.request().method() === 'POST') {
+      await createGate
+    }
+    await route.continue()
+  })
+
+  try {
+    await page.getByRole('button', { name: 'Runde starten' }).click()
+    const run = rows.first()
+    await expect(rows).toHaveCount(countBefore + 1)
+    await expect(page.getByRole('heading', { name: 'Runden' })).toBeVisible()
+    expect(new URL(page.url()).pathname).toBe('/')
+    await expect(run).toHaveAttribute('data-status', 'queued')
+    await expect(run.getByRole('button', { name: 'Runde öffnen' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Runde wird angelegt …' })).toBeDisabled()
+
+    await page.waitForTimeout(1_100)
+    await expect(rows).toHaveCount(countBefore + 1)
+    const runBox = await run.boundingBox()
+    const viewport = page.viewportSize()
+    expect(runBox).not.toBeNull()
+    expect(viewport).not.toBeNull()
+    if (runBox && viewport) {
+      expect(runBox.y).toBeGreaterThanOrEqual(0)
+      expect(runBox.y).toBeLessThan(viewport.height)
+    }
+
+    releaseCreate()
+    await expect(run.getByRole('button', { name: 'Runde öffnen' })).toBeEnabled({
+      timeout: 15_000,
+    })
+  } finally {
+    releaseCreate()
+    await page.unroute('**/api/reviews')
+  }
+})
+
+test('recovers a persisted run after its create response and first status check are lost', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  let dropStatusChecks = true
+  await page.route('**/api/reviews', async (route) => {
+    if (route.request().method() === 'POST') {
+      await route.fetch()
+      await route.abort('connectionfailed')
+      return
+    }
+    if (dropStatusChecks) {
+      await route.abort('connectionfailed')
+      return
+    }
+    await route.continue()
+  })
+
+  try {
+    await page.getByRole('button', { name: 'Runde starten' }).click()
+    const run = page.locator('.runs-table tbody tr').first()
+    await expect(run).toBeVisible()
+    await expect(page.getByRole('alert')).toContainText(
+      'Der Rundenstatus wird automatisch erneut abgeglichen.',
+    )
+    dropStatusChecks = false
+    await expect(run.getByRole('button', { name: 'Runde öffnen' })).toBeEnabled({
+      timeout: 15_000,
+    })
+  } finally {
+    dropStatusChecks = false
+    await page.unroute('**/api/reviews')
+  }
+})
+
+test('refreshes a stale ready row when another tab has already restarted the analysis', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await page.route(/\/api\/reviews\/[^/]+$/, async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    await route.fulfill({
+      status: 409,
+      json: {
+        error: {
+          code: 'ROUND_NOT_READY',
+          message: 'Diese Runde wird noch analysiert.',
+          retryable: true,
+        },
+      },
+    })
+  })
+  await page.route('**/api/reviews', async (route) => {
+    const response = await route.fetch()
+    const body = (await response.json()) as { runs: ReviewRunSummary[] }
+    const [latest, ...rest] = body.runs
+    await route.fulfill({
+      response,
+      json: {
+        runs: latest
+          ? [
+              {
+                ...latest,
+                analysis: {
+                  ...latest.analysis,
+                  phase: 'deciding',
+                  status: 'running',
+                },
+                reanalyzable: false,
+                status: 'analyzing',
+              },
+              ...rest,
+            ]
+          : rest,
+      },
+    })
+  })
+
+  const run = page.locator('.runs-table tbody tr').first()
+  await run.getByRole('button', { name: 'Runde öffnen' }).click()
+  await expect(run).toHaveAttribute('data-status', 'analyzing')
+  await expect(run.getByRole('button', { name: 'Runde öffnen' })).toBeDisabled()
+  expect(new URL(page.url()).pathname).toBe('/')
+})
+
+test('does not keep the previous review visible after invalid browser history navigation', async ({
+  page,
+}) => {
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  await page.evaluate(() => {
+    window.history.pushState({}, '', '/rounds/deleted-round')
+    window.dispatchEvent(new PopStateEvent('popstate'))
+  })
+
+  await expect(page.getByRole('heading', { name: 'Runden' })).toBeVisible()
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toHaveCount(0)
+  expect(new URL(page.url()).pathname).toBe('/')
+})
+
+test('reanalyzes the same run and gates opening until the new result is ready', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  const run = page.locator('.runs-table tbody tr').first()
+  await run.getByRole('button', { name: 'Mit Codex neu analysieren' }).click()
+  await expect(run).toHaveAttribute('data-status', 'analyzing')
+  await expect(run.getByRole('button', { name: 'Runde öffnen' })).toBeDisabled()
+  await expect(run.getByRole('button', { name: 'Runde öffnen' })).toBeEnabled({ timeout: 15_000 })
+})
+
+test('shows concrete Codex call progress while a large round is still analyzing', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await page.route('**/api/reviews', async (route) => {
+    const response = await route.fetch()
+    if (route.request().method() !== 'GET') {
+      await route.fulfill({ response })
+      return
+    }
+    const body = (await response.json()) as { runs: ReviewRunSummary[] }
+    const [latest, ...rest] = body.runs
+    await route.fulfill({
+      response,
+      json: {
+        runs: latest
+          ? [
+              {
+                ...latest,
+                analysis: {
+                  ...latest.analysis,
+                  callCount: 3,
+                  phase: 'deciding',
+                  processedEmailCount: 0,
+                  progress: 0,
+                  status: 'running',
+                  totalEmailCount: 379,
+                },
+                reanalyzable: false,
+                status: 'analyzing',
+              },
+              ...rest,
+            ]
+          : rest,
+      },
+    })
+  })
+
+  await page.reload()
+  await expect(page.getByText(/0 von 379 · 3 Codex-Aufrufe/)).toBeVisible()
+})
+
+test('keeps a stable round URL across reload and reopening from the overview', async ({ page }) => {
   const roundUrl = page.url()
   expect(new URL(roundUrl).pathname).toMatch(/^\/rounds\/[0-9a-f-]+$/)
 
@@ -28,28 +238,100 @@ test('keeps a stable round URL across reload and the real resume action', async 
   await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
   expect(page.url()).toBe(roundUrl)
 
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
-  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
-  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await expect(page.getByRole('button', { name: 'Runde öffnen' }).first()).toBeEnabled()
+  await page.getByRole('button', { name: 'Runde öffnen' }).first().click()
   await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
   expect(page.url()).toBe(roundUrl)
 })
 
-test('clears an expired resume pointer instead of offering it forever', async ({ page }) => {
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+test('deletes a persisted round from the overview', async ({ page }) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  const row = page.getByRole('row').filter({ hasText: 'Bereit' }).first()
+  const roundLabel = await row.locator('strong').first().innerText()
+  await row.getByRole('button', { name: /löschen/ }).click()
+  await expect(page.getByRole('heading', { name: 'Runde löschen?' })).toBeVisible()
+  await page.getByRole('button', { name: 'Runde löschen', exact: true }).click()
+  await expect(page.getByText(roundLabel, { exact: true })).toHaveCount(0)
+  await page.reload()
+  await expect(page.getByText(roundLabel, { exact: true })).toHaveCount(0)
+})
+
+test('stops polling after deleting the currently staged legacy migration run', async ({ page }) => {
+  let migrationId = ''
+  let listRequests = 0
+  await page.route('**/api/reviews/resume', async (route) => {
+    const request = route.request().postDataJSON() as { id: string }
+    const response = await route.fetch()
+    const body = (await response.json()) as { id: string }
+    migrationId = request.id
+    expect(body.id).toBe(migrationId)
+    await route.fulfill({ response, json: body })
+  })
+  await page.route('**/api/reviews', async (route) => {
+    if (route.request().method() !== 'GET') {
+      await route.continue()
+      return
+    }
+    listRequests += 1
+    const response = await route.fetch()
+    const body = (await response.json()) as { runs: ReviewRunSummary[] }
+    await route.fulfill({
+      response,
+      json: {
+        runs: body.runs.map((run) =>
+          run.id === migrationId
+            ? {
+                ...run,
+                analysis: { ...run.analysis, phase: 'deciding', status: 'running' },
+                reanalyzable: false,
+                status: 'analyzing',
+              }
+            : run,
+        ),
+      },
+    })
+  })
   await page.evaluate(() => {
     localStorage.setItem(
       'inbox-walk:checkpoint:v1',
-      JSON.stringify({ version: 7, roundId: '00000000-0000-4000-8000-000000000000' }),
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [['demo-human']],
+        emailIds: ['demo-human'],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: [],
+        processedIds: [],
+        secondaryActionIds: [],
+        replyDrafts: {},
+      }),
     )
   })
-  await page.reload()
-  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
 
-  await expect(page.getByText('Diese Sitzung ist abgelaufen.')).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toHaveCount(0)
-  expect(new URL(page.url()).pathname).toBe('/')
-  expect(await page.evaluate(() => localStorage.getItem('inbox-walk:checkpoint:v1'))).toBeNull()
+  await page.goto('/')
+  await expect.poll(() => migrationId).not.toBe('')
+  const row = page.locator(`#run-${migrationId}`)
+  await expect(row).toHaveAttribute('data-status', 'analyzing')
+  await row.getByRole('button', { name: /löschen/ }).click()
+  await page.getByRole('button', { name: 'Runde löschen', exact: true }).click()
+  await expect(row).toHaveCount(0)
+
+  const checkpoint = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? 'null'),
+  )
+  expect(checkpoint).toMatchObject({ version: 6, migrationRoundId: migrationId })
+
+  await page.waitForTimeout(2_200)
+  const settledRequests = listRequests
+  await page.waitForTimeout(1_300)
+  expect(listRequests).toBe(settledRequests)
 })
 
 test('restores persisted review decisions after reload', async ({ page }) => {
@@ -65,6 +347,165 @@ test('restores persisted review decisions after reload', async ({ page }) => {
     'aria-pressed',
     'true',
   )
+})
+
+test('migrates a legacy round once, including its reply draft, then keeps only the round ID', async ({
+  page,
+}) => {
+  const draftBody = 'Eigener Legacy-Entwurf, der vollständig erhalten bleiben muss.'
+  await page.evaluate((bodyText) => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [['demo-human']],
+        emailIds: ['demo-human'],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: ['demo-human'],
+        processedIds: ['demo-human'],
+        secondaryActionIds: [],
+        replyDrafts: {
+          'demo-human': {
+            bodyText,
+            cc: [],
+            identityId: 'demo-identity',
+            revisionInstruction: '',
+            roughNotes: 'Bitte freundlich lassen.',
+            subject: 'Re: Essen nächste Woche?',
+            to: [{ email: 'mara@example.com', name: 'Mara' }],
+          },
+        },
+      }),
+    )
+  }, draftBody)
+
+  const resumed = page.waitForResponse(
+    (response) =>
+      new URL(response.url()).pathname === '/api/reviews/resume' &&
+      response.request().method() === 'POST',
+  )
+  await page.goto('/')
+  const response = await resumed
+  expect(response.status()).toBe(202)
+  const { id: snapshotId } = (await response.json()) as { id: string }
+
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible({
+    timeout: 15_000,
+  })
+  expect(new URL(page.url()).pathname).toBe(`/rounds/${snapshotId}`)
+  await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveValue(draftBody)
+
+  const checkpoint = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? 'null'),
+  )
+  expect(checkpoint).toEqual({ version: 7, roundId: snapshotId })
+  expect(JSON.stringify(checkpoint)).not.toContain(draftBody)
+
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveValue(draftBody)
+})
+
+test('reuses the staged legacy round after its first response is lost and the page reloads', async ({
+  page,
+}) => {
+  const resumeIds: string[] = []
+  await page.route('**/api/reviews/resume', async (route) => {
+    const body = route.request().postDataJSON() as { id: string }
+    resumeIds.push(body.id)
+    const response = await route.fetch()
+    if (resumeIds.length === 1) {
+      await route.abort('connectionfailed')
+      return
+    }
+    await route.fulfill({ response })
+  })
+  await page.evaluate(() => {
+    localStorage.setItem(
+      'inbox-walk:checkpoint:v1',
+      JSON.stringify({
+        version: 6,
+        bundleGroups: [['demo-human']],
+        emailIds: ['demo-human'],
+        filters: {
+          hideReviewed: false,
+          mailboxId: null,
+          newsletter: 'all',
+          spam: 'exclude',
+          timeRange: 'all',
+        },
+        index: 0,
+        keptUnreadIds: [],
+        processedIds: [],
+        secondaryActionIds: [],
+        replyDrafts: {},
+      }),
+    )
+  })
+
+  await page.goto('/')
+  await expect(page.getByRole('alert')).toContainText(
+    'Der alte Rundenstand konnte nicht übertragen werden.',
+  )
+  expect(resumeIds).toHaveLength(1)
+  const migrationId = resumeIds[0]
+  expect(migrationId).toMatch(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  )
+  await expect
+    .poll(() =>
+      page.evaluate(() => JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? 'null')),
+    )
+    .toMatchObject({ version: 6, migrationRoundId: migrationId })
+
+  const runsAfterLostResponse = await page.evaluate(async () => {
+    const response = await fetch('/api/reviews')
+    return (await response.json()) as { runs: Array<{ id: string }> }
+  })
+  expect(runsAfterLostResponse.runs.filter((run) => run.id === migrationId)).toHaveLength(1)
+
+  await page.reload()
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible({
+    timeout: 15_000,
+  })
+  expect(new URL(page.url()).pathname).toBe(`/rounds/${migrationId}`)
+  expect(resumeIds).toEqual([migrationId])
+  const checkpoint = await page.evaluate(() =>
+    JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? 'null'),
+  )
+  expect(checkpoint).toEqual({ version: 7, roundId: migrationId })
+})
+
+test('shows an invalid legacy checkpoint without deleting its draft state', async ({ page }) => {
+  const invalid = JSON.stringify({
+    version: 6,
+    emailIds: ['demo-human'],
+    replyDrafts: { 'demo-human': { bodyText: 'Nicht stillschweigend löschen' } },
+  })
+  await page.evaluate((raw) => {
+    localStorage.setItem('inbox-walk:checkpoint:v1', raw)
+  }, invalid)
+
+  await page.goto('/')
+  await expect(page.getByRole('alert')).toContainText(
+    'Der gespeicherte alte Rundenstand ist ungültig und wurde nicht gelöscht.',
+  )
+  await expect
+    .poll(() => page.evaluate(() => localStorage.getItem('inbox-walk:checkpoint:v1')))
+    .toBe(invalid)
 })
 
 test('stops a stale tab instead of silently losing later decisions', async ({ page }) => {
@@ -151,135 +592,113 @@ test('fails closed when the server acknowledges a different round state', async 
   expect(stateWrites).toBe(1)
 })
 
-test('shows analysis provenance and never leaves a blank root on bundle failure', async ({
-  page,
-}) => {
-  await expect(page.getByText('Lokale Analyse', { exact: true })).toBeVisible()
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
-  await page.route('**/api/reviews/*/bundles', async (route) => {
+test('keeps a failed analysis in the rounds table with recovery actions', async ({ page }) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  let forceFailure = false
+  await page.route('**/api/reviews', async (route) => {
+    const response = await route.fetch()
+    if (route.request().method() !== 'GET' || !forceFailure) {
+      await route.fulfill({ response })
+      return
+    }
+    const body = (await response.json()) as { runs: ReviewRunSummary[] }
+    const [latest, ...rest] = body.runs
     await route.fulfill({
-      status: 504,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        error: {
-          code: 'BUNDLE_TIMEOUT',
-          message: 'Die Analyse antwortet gerade nicht.',
-          retryable: true,
-        },
-      }),
+      response,
+      json: {
+        runs: latest
+          ? [
+              {
+                ...latest,
+                analysis: {
+                  ...latest.analysis,
+                  error: 'Codex muss erneut verbunden werden.',
+                  phase: 'failed',
+                  status: 'pending',
+                },
+                reanalyzable: true,
+                status: 'failed',
+              },
+              ...rest,
+            ]
+          : rest,
+      },
     })
   })
-  await page.getByRole('button', { name: 'Review starten' }).click()
-  await expect(page.getByRole('heading', { name: 'Zusammenhänge werden analysiert' })).toBeVisible()
-  await expect(page.getByText('Die Runde bleibt gespeichert.')).toBeVisible()
-  await expect(page.getByText('Die Analyse antwortet gerade nicht.')).toBeVisible()
-  await expect(page.locator('#root')).not.toBeEmpty()
+  await page.getByRole('button', { name: 'Runde starten' }).click()
+  forceFailure = true
+  await expect(page.getByText('Codex muss erneut verbunden werden.')).toBeVisible({
+    timeout: 5_000,
+  })
+  const failed = page.getByRole('row').filter({ hasText: 'Fehlgeschlagen' }).first()
+  await expect(failed.getByRole('button', { name: 'Runde öffnen' })).toBeDisabled()
+  await expect(failed.getByRole('button', { name: 'Mit Codex neu analysieren' })).toBeEnabled()
+  await expect(page.getByRole('button', { name: 'Ohne Codex fortsetzen' })).toHaveCount(0)
 })
 
-test('offers and applies the explicit safe view when Codex cannot resume', async ({ page }) => {
-  let waiting: ReviewSnapshot | null = null
-  let bundleRequests = 0
-  let loginPolls = 0
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
-  await page.route(/\/api\/reviews\/[^/]+\/bundles$/, async (route) => {
-    bundleRequests += 1
+test('uses the backend capability flag to disable Codex reanalysis', async ({ page }) => {
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await page.route('**/api/reviews', async (route) => {
     const response = await route.fetch()
-    const body = (await response.json()) as ReviewSnapshot
-    waiting = {
-      ...body,
-      bundleRun: undefined,
-      analysis: {
-        ...body.analysis,
-        callCount: 1,
-        engine: 'codex',
-        error: 'Codex muss erneut verbunden werden.',
-        model: 'gpt-5.6-sol',
-        phase: 'waiting_for_codex',
-        status: 'pending',
-      },
+    if (route.request().method() !== 'GET') {
+      await route.fulfill({ response })
+      return
     }
-    await route.fulfill({ response, json: waiting })
-  })
-  await page.route(/\/api\/reviews\/[^/]+\/bundles\/fallback$/, async (route) => {
-    if (!waiting) throw new Error('Expected a waiting review snapshot')
-    await new Promise((resolve) => setTimeout(resolve, 2_200))
-    const fallback: ReviewSnapshot = {
-      ...waiting,
-      analysis: {
-        ...waiting.analysis,
-        engine: 'fallback',
-        phase: 'complete',
-        processedEmailCount: waiting.emails.length,
-        progress: 1,
-        status: 'complete',
-        error: undefined,
-      },
-      bundleRun: {
-        bundles: waiting.emails.map((email) => ({
-          bundleId: `fallback-${email.id}`,
-          currentState: 'Einzelne Nachricht',
-          emailIds: [email.id],
-          kind: 'standalone',
-          linkEvidence: [],
-          membershipConfidence: 1,
-          summary: email.preview,
-          timeline: [
-            {
-              emailId: email.id,
-              event: email.subject,
-              occurredAt: email.receivedAt,
-              source: email.from[0]?.name || 'E-Mail',
-            },
-          ],
-          title: email.subject,
-        })),
-        fallback: true,
-        snapshotId: waiting.snapshotId,
-      },
-    }
-    await route.fulfill({ status: 200, json: fallback })
-  })
-  await page.route('**/api/auth/codex/start', async (route) => {
-    await route.fulfill({ status: 202, json: { id: 'fallback-race-login' } })
-  })
-  await page.route(/\/api\/auth\/codex\/fallback-race-login$/, async (route) => {
-    loginPolls += 1
+    const body = (await response.json()) as { runs: ReviewRunSummary[] }
+    const [latest, ...rest] = body.runs
     await route.fulfill({
-      json:
-        loginPolls === 1
-          ? {
-              id: 'fallback-race-login',
-              message: 'Warte auf Anmeldung.',
-              status: 'waiting',
-              url: 'https://auth.openai.com/codex/device',
-              userCode: 'TEST-CODE',
-            }
-          : {
-              id: 'fallback-race-login',
-              message: 'Codex ist verbunden.',
-              status: 'completed',
-            },
-    })
-  })
-  await page.route('**/api/auth/codex/status', async (route) => {
-    await route.fulfill({
-      json: { configured: true, model: 'gpt-5.6-sol', source: 'stored' },
+      response,
+      json: {
+        runs: latest
+          ? [
+              {
+                ...latest,
+                analysis: {
+                  ...latest.analysis,
+                  error: 'Postfach konnte nicht geladen werden.',
+                  phase: 'failed',
+                  processedEmailCount: 0,
+                  progress: 0,
+                  status: 'pending',
+                  totalEmailCount: 0,
+                },
+                emailCount: 1,
+                reanalyzable: false,
+                status: 'failed',
+              },
+              ...rest,
+            ]
+          : rest,
+      },
     })
   })
 
-  await page.getByRole('button', { name: 'Review starten' }).click()
-  await expect(page.getByRole('heading', { name: 'Codex-Anmeldung erforderlich' })).toBeVisible()
-  await expect(page.getByRole('button', { name: 'Codex wieder verbinden' })).toBeVisible()
-  await page.getByRole('button', { name: 'Codex wieder verbinden' }).click()
-  await page.getByRole('button', { name: 'Mit ChatGPT anmelden' }).click()
-  await expect.poll(() => loginPolls).toBeGreaterThan(0)
-  await page.getByRole('button', { name: 'Schließen' }).last().click()
-  const bundleRequestsBeforeFallback = bundleRequests
-  await page.getByRole('button', { name: 'Ohne Codex fortsetzen' }).click()
-  await expect.poll(() => loginPolls, { timeout: 4_000 }).toBeGreaterThan(1)
-  expect(bundleRequests).toBe(bundleRequestsBeforeFallback)
-  await expect(page.locator('.analysis-badge')).toContainText('Sichere Einzelansicht')
-  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  await page.reload()
+  const failed = page.getByRole('row').filter({ hasText: 'Postfach konnte nicht geladen werden.' })
+  await expect(failed.getByRole('button', { name: 'Mit Codex neu analysieren' })).toBeDisabled()
+})
+
+test('does not offer deletion while a round is being finalized', async ({ page }) => {
+  await page.route('**/api/reviews', async (route) => {
+    const response = await route.fetch()
+    if (route.request().method() !== 'GET') {
+      await route.fulfill({ response })
+      return
+    }
+    const body = (await response.json()) as { runs: ReviewRunSummary[] }
+    const [latest, ...rest] = body.runs
+    await route.fulfill({
+      response,
+      json: {
+        runs: latest ? [{ ...latest, reviewStatus: 'finalizing', status: 'ready' }, ...rest] : rest,
+      },
+    })
+  })
+
+  await page.getByRole('button', { name: 'Runden' }).click()
+  const finalizing = page.getByRole('row').filter({ hasText: 'Wird abgeschlossen' }).first()
+  await expect(finalizing).toBeVisible()
+  await expect(finalizing.getByRole('button', { name: /löschen/ })).toBeDisabled()
 })
 
 test('names the attempted Codex model on a safe fallback result', async ({ page }) => {
@@ -368,74 +787,14 @@ test('persists incomplete reply recipients without blocking the round', async ({
   await expect(page.getByRole('textbox', { name: 'Cc', exact: true })).toHaveValue('Team <team@')
 })
 
-test('keeps a legacy round recoverable when its server migration fails', async ({ page }) => {
-  await page.evaluate(() => {
-    localStorage.setItem(
-      'inbox-walk:checkpoint:v1',
-      JSON.stringify({
-        version: 6,
-        bundleGroups: [],
-        emailIds: ['demo-human', 'demo-train'],
-        filters: {
-          hideReviewed: false,
-          mailboxId: null,
-          newsletter: 'all',
-          spam: 'exclude',
-          timeRange: 'all',
-        },
-        index: 0,
-        keptUnreadIds: ['demo-human'],
-        processedIds: ['demo-human'],
-        secondaryActionIds: [],
-        replyDrafts: {},
-      }),
-    )
-  })
-  await page.goto('/')
-  await page.route('**/api/reviews/*/state', async (route) => {
-    await route.fulfill({
-      status: 503,
-      contentType: 'application/json',
-      body: JSON.stringify({
-        error: {
-          code: 'ROUND_PERSIST_FAILED',
-          message: 'Der Rundenstand konnte nicht dauerhaft gespeichert werden.',
-          retryable: true,
-        },
-      }),
-    })
-  })
-  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
-  await expect(
-    page.getByText('Der Rundenstand konnte nicht dauerhaft gespeichert werden.'),
-  ).toBeVisible()
-  expect(
-    await page.evaluate(
-      () => JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? '{}').version,
-    ),
-  ).toBe(6)
-
-  await page.reload()
-  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
-  await page.unroute('**/api/reviews/*/state')
-  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
-  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
-  await expect(page).toHaveURL(/\/rounds\/[0-9a-f-]+$/)
-  expect(
-    await page.evaluate(
-      () => JSON.parse(localStorage.getItem('inbox-walk:checkpoint:v1') ?? '{}').version,
-    ),
-  ).toBe(7)
-})
-
-test('flushes pending reply notes before leaving and resuming the round', async ({ page }) => {
+test('flushes pending reply notes before leaving and reopening the round', async ({ page }) => {
   const notes = 'Diese noch ungespeicherten Stichpunkte müssen einen sofortigen Wechsel überleben.'
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await page.getByLabel('Was soll die Antwort sagen?').pressSequentially(notes)
   await page.getByRole('button', { name: 'Antwort schließen' }).click()
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
-  await expect(page.getByRole('button', { name: 'Runde fortsetzen' })).toBeVisible()
-  await page.getByRole('button', { name: 'Runde fortsetzen' }).click()
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await expect(page.getByRole('button', { name: 'Runde öffnen' }).first()).toBeEnabled()
+  await page.getByRole('button', { name: 'Runde öffnen' }).first().click()
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await expect(page.getByLabel('Was soll die Antwort sagen?')).toHaveValue(notes)
 })
@@ -606,7 +965,7 @@ test('does not leave confirmation with Escape while finalization is in flight', 
   await expect(page.getByRole('button', { name: 'Fehlgeschlagene erneut versuchen' })).toBeVisible()
 })
 
-test('bundles connected GitHub and Railway notifications and keeps originals inspectable', async ({
+test('bundles connected GitHub and Railway notifications without manual grouping controls', async ({
   page,
 }) => {
   await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
@@ -619,8 +978,8 @@ test('bundles connected GitHub and Railway notifications and keeps originals ins
     .getByRole('button', { name: /GitHub · \[beasty\/inbox-walk\] Pull request #184 opened/ })
     .click()
   await expect(page.locator('.original-subject')).toHaveText(/Pull request #184 opened/)
-  await page.getByRole('button', { name: 'Ausgewähltes Original lösen' }).click()
-  await expect(page.getByText('3 Originale')).toBeVisible()
+  await expect(page.getByText('4 Originale')).toBeVisible()
+  await expect(page.locator('.bundle-tools button')).toHaveCount(0)
 })
 
 test('completes every bundle member while protecting one selected original', async ({ page }) => {
@@ -650,14 +1009,57 @@ test('opens keyboard help and closes it with Escape', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'Tastatur' })).toBeHidden()
 })
 
-test('selects the Codex model from the connection dialog', async ({ page }) => {
+test('does not apply review shortcuts behind open surfaces', async ({ page }) => {
+  const currentSubject = page.getByRole('heading', { level: 1 }).filter({
+    hasText: 'Deine Verbindung am Montag',
+  })
+  const unread = page.locator('.keep-button')
+
+  await page.keyboard.press('?')
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('heading', { name: 'Tastatur' })).toBeVisible()
+  await expect(unread).toHaveAttribute('aria-pressed', 'false')
+  await expect(currentSubject).toBeVisible()
+  await page.keyboard.press('Escape')
+
+  await page.getByRole('button', { name: 'Einstellungen' }).click()
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('heading', { name: 'Einstellungen' })).toBeVisible()
+  await expect(unread).toHaveAttribute('aria-pressed', 'false')
+  await expect(currentSubject).toBeVisible()
+  await page.keyboard.press('Escape')
+
+  await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('heading', { name: 'Nachrichten' })).toBeVisible()
+  await expect(unread).toHaveAttribute('aria-pressed', 'false')
+  await expect(currentSubject).toBeVisible()
+  await page.keyboard.press('Escape')
+
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(page.getByRole('heading', { name: 'Antwortentwurf' })).toBeVisible()
+  await page.keyboard.press('ArrowUp')
+  await page.keyboard.press('ArrowRight')
+  await expect(unread).toHaveAttribute('aria-pressed', 'false')
+  await expect(currentSubject).toBeVisible()
+})
+
+test('selects the Codex model and thinking level in settings', async ({ page }) => {
   await page.route('**/api/review/options', async (route) => {
     const response = await route.fetch()
     const body = await response.json()
     await route.fulfill({
       json: {
         ...body,
-        codex: { configured: true, model: 'gpt-5.6-sol', source: 'stored' },
+        codex: {
+          configured: true,
+          model: 'gpt-5.6-sol',
+          source: 'stored',
+          thinkingLevel: 'high',
+        },
         mode: 'live',
       },
     })
@@ -672,23 +1074,121 @@ test('selects the Codex model from the connection dialog', async ({ page }) => {
     const body = await response.json()
     await route.fulfill({ json: { ...body, mode: 'live' } })
   })
-  await page.route('**/api/auth/codex/model', async (route) => {
-    const request = route.request().postDataJSON() as { model: string }
+  await page.route('**/api/settings/codex', async (route) => {
+    if (route.request().method() === 'GET') {
+      await route.fulfill({
+        json: {
+          configured: true,
+          model: 'gpt-5.6-sol',
+          source: 'stored',
+          thinkingLevel: 'high',
+        },
+      })
+      return
+    }
+    const request = route.request().postDataJSON() as { model: string; thinkingLevel: string }
     await route.fulfill({
-      json: { configured: true, model: request.model, source: 'stored' },
+      json: {
+        configured: true,
+        model: request.model,
+        source: 'stored',
+        thinkingLevel: request.thinkingLevel,
+      },
     })
   })
 
   await page.evaluate(() => localStorage.clear())
   await page.goto('/')
-  await page.getByRole('button', { name: 'Codex einstellen' }).click()
+  await page.getByRole('button', { name: 'Einstellungen' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Codex einrichten' })).toBeVisible()
-  await expect(page.getByLabel('Sol')).toBeChecked()
-  await page.getByLabel('Terra').check()
-  await page.getByRole('button', { name: 'Modell speichern' }).click()
-  await expect(page.getByLabel('Terra')).toBeChecked()
-  await expect(page.getByRole('button', { name: 'Modell speichern' })).toBeDisabled()
+  await expect(page.getByRole('heading', { name: 'Einstellungen' })).toBeVisible()
+  await expect(page.getByLabel('Modell')).toHaveValue('gpt-5.6-sol')
+  await page.getByLabel('Modell').selectOption('gpt-5.6-terra')
+  await page.getByLabel('Denkaufwand').selectOption('xhigh')
+  await page.getByRole('button', { name: 'Speichern' }).click()
+  await expect(page.getByLabel('Modell')).toHaveValue('gpt-5.6-terra')
+  await expect(page.getByLabel('Denkaufwand')).toHaveValue('xhigh')
+  await expect(page.getByRole('button', { name: 'Speichern' })).toBeDisabled()
+})
+
+test('keeps Codex settings available during a Fastmail options outage', async ({ page }) => {
+  await page.route('**/api/review/options', async (route) => {
+    await route.fulfill({
+      status: 503,
+      json: {
+        error: {
+          code: 'FASTMAIL_UNAVAILABLE',
+          message: 'Fastmail ist gerade nicht erreichbar.',
+          retryable: true,
+        },
+      },
+    })
+  })
+  await page.route('**/api/settings/codex', async (route) => {
+    await route.fulfill({
+      json: {
+        configured: true,
+        model: 'gpt-5.6-sol',
+        source: 'stored',
+        thinkingLevel: 'high',
+      },
+    })
+  })
+
+  await page.evaluate(() => localStorage.clear())
+  await page.goto('/')
+  await expect(page.getByRole('heading', { name: 'Runden' })).toBeVisible()
+  await page.getByRole('button', { name: 'Einstellungen' }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'Einstellungen' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByLabel('Modell')).toBeEnabled()
+  await expect(dialog.getByLabel('Modell')).toHaveValue('gpt-5.6-sol')
+  await expect(dialog.getByLabel('Denkaufwand')).toHaveValue('high')
+})
+
+test('shows Codex settings failures inside the open settings dialog', async ({ page }) => {
+  await page.route('**/api/review/options', async (route) => {
+    const response = await route.fetch()
+    const body = await response.json()
+    await route.fulfill({
+      response,
+      json: {
+        ...body,
+        codex: {
+          configured: true,
+          model: 'gpt-5.6-sol',
+          source: 'stored',
+          thinkingLevel: 'high',
+        },
+        mode: 'live',
+      },
+    })
+  })
+  await page.route('**/api/settings/codex', async (route) => {
+    await route.fulfill({
+      status: 503,
+      json: {
+        error: {
+          code: 'SETTINGS_WRITE_FAILED',
+          message: 'Die Codex-Einstellungen konnten nicht gespeichert werden.',
+          retryable: true,
+        },
+      },
+    })
+  })
+
+  await page.evaluate(() => localStorage.clear())
+  await page.goto('/')
+  await page.getByRole('button', { name: 'Einstellungen' }).click()
+  await page.getByLabel('Modell').selectOption('gpt-5.6-terra')
+  await page.getByRole('button', { name: 'Speichern' }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'Einstellungen' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByRole('alert')).toHaveText(
+    'Die Codex-Einstellungen konnten nicht gespeichert werden.',
+  )
 })
 
 test('keeps mail scripts blocked while allowing authenticated same-origin images', async ({
@@ -712,9 +1212,9 @@ test('marks newsletters for deferred unsubscribe work', async ({ page }) => {
 })
 
 test('reviews Spam separately and makes Down mean Not Spam', async ({ page }) => {
-  await page.getByRole('button', { name: 'Neue Auswahl' }).click()
+  await page.getByRole('button', { name: 'Runden' }).click()
   await page.getByRole('button', { name: /Nur Spam/ }).click()
-  await page.getByRole('button', { name: 'Review starten' }).click()
+  await startAndOpenRound(page)
 
   await expect(page.getByRole('heading', { name: 'Falsch einsortierte Nachricht' })).toBeVisible()
   const action = page.getByRole('button', { name: 'Kein Spam', exact: true })

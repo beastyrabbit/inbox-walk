@@ -9,11 +9,14 @@ import {
   isCodexAuthenticationFailure,
   runCodexReply,
   selectCodexModel,
+  selectCodexSettings,
   selectedCodexModel,
+  selectedCodexSettings,
 } from './codex.ts'
 
 const originalDataDir = process.env.DATA_DIR
 const originalCodexModel = process.env.CODEX_MODEL
+const originalCodexThinkingLevel = process.env.CODEX_THINKING_LEVEL
 const temporaryDirectories: string[] = []
 
 afterEach(() => {
@@ -21,6 +24,8 @@ afterEach(() => {
   else process.env.DATA_DIR = originalDataDir
   if (originalCodexModel === undefined) delete process.env.CODEX_MODEL
   else process.env.CODEX_MODEL = originalCodexModel
+  if (originalCodexThinkingLevel === undefined) delete process.env.CODEX_THINKING_LEVEL
+  else process.env.CODEX_THINKING_LEVEL = originalCodexThinkingLevel
   for (const directory of temporaryDirectories.splice(0)) {
     fs.rmSync(directory, { force: true, recursive: true })
   }
@@ -76,6 +81,25 @@ describe('Codex provider boundary', () => {
       JSON.parse(fs.readFileSync(path.join(directory, 'codex-settings.json'), 'utf8')),
     ).toEqual({
       model: 'gpt-5.6-luna',
+      thinkingLevel: 'high',
+    })
+  })
+
+  it('persists model and thinking level as one atomic Codex setting', () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'inbox-walk-codex-settings-'))
+    temporaryDirectories.push(directory)
+    process.env.DATA_DIR = directory
+    process.env.CODEX_MODEL = 'gpt-5.6-sol'
+    process.env.CODEX_THINKING_LEVEL = 'medium'
+
+    expect(selectedCodexSettings()).toEqual({
+      model: 'gpt-5.6-sol',
+      thinkingLevel: 'medium',
+    })
+    selectCodexSettings({ model: 'gpt-5.6-terra', thinkingLevel: 'xhigh' })
+    expect(selectedCodexSettings()).toEqual({
+      model: 'gpt-5.6-terra',
+      thinkingLevel: 'xhigh',
     })
   })
 })
