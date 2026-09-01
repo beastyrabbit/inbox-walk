@@ -1,0 +1,18 @@
+name: ARC Smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: arc-inbox-walk
+    timeout-minutes: 10
+    steps:
+      - name: Verify repository-scoped runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'arc-inbox-walk runner ready\n'
