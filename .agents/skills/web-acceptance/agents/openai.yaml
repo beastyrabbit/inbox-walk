@@ -1,4 +1,0 @@
-interface:
-  display_name: "Run Web Acceptance"
-  short_description: "Verify web changes visually and technically"
-  default_prompt: "Use $web-acceptance to verify this web change end to end."
