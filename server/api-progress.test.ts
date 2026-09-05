@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { defaultReviewFilters } from '../src/shared.ts'
-import { clearApiStateForTests, createApiMiddleware } from './api.ts'
+import { type ApiOptions, clearApiStateForTests, createApiMiddleware } from './api.ts'
 import { demoEmails } from './demo.ts'
 import { createRoundStore } from './round-store.ts'
 
@@ -35,14 +35,19 @@ const emails = ['first', 'second', 'third'].map((id) => ({
   isNewsletter: true,
 }))
 
-async function serve(store: ReturnType<typeof createRoundStore>, spam = false) {
+async function serve(
+  store: ReturnType<typeof createRoundStore>,
+  spam = false,
+  overrides: ApiOptions = {},
+  reconciliation = false,
+) {
   const middleware = createApiMiddleware({
     roundStore: store,
     autoStartBundles: false,
     fastmailToken: 'synthetic-fixture',
     codexAuthStatus: () => ({ configured: false, model: 'gpt-5.6-sol' }),
     resumeMailSnapshot: async () => ({
-      context,
+      context: reconciliation ? { ...context, maxObjectsInSet: 2, maxObjectsInGet: 1 } : context,
       emails,
       filters: { ...defaultReviewFilters, spam: spam ? 'only' : 'exclude' },
       mailboxes,
@@ -50,6 +55,7 @@ async function serve(store: ReturnType<typeof createRoundStore>, spam = false) {
       totalBeforeLimit: emails.length,
       truncated: false,
     }),
+    ...overrides,
   })
   const server = createServer((req, res) => {
     void middleware(req, res, () => {
@@ -70,9 +76,73 @@ async function serve(store: ReturnType<typeof createRoundStore>, spam = false) {
 }
 
 describe('durable adapter boundaries', () => {
-  it.each(['read', 'spam', 'label'] as const)(
-    'reopens SQLite and omits confirmed %s batches on retry',
-    async (kind) => {
+  it.each([true, false])(
+    'records history once with cumulative progress callbacks enabled=%s',
+    async (withProgress) => {
+      clearApiStateForTests()
+      const store = createRoundStore(':memory:')
+      store.create({
+        id: 'history-round',
+        csrfToken: 'fixture-csrf',
+        imageToken: 'fixture-image',
+        mode: 'live',
+        emails,
+        filters: defaultReviewFilters,
+        mailboxes,
+      })
+      const remember = vi.fn()
+      const forget = vi.fn()
+      const app = await serve(store, false, {
+        reviewHistory: {
+          close() {},
+          count: () => 0,
+          forget,
+          rememberKeptUnread: remember,
+          retainedIds: () => new Set(),
+          retainOnly() {},
+        },
+        markRead: async (_context, _token, ids, onProgress) => {
+          expect(ids).toEqual(['first', 'second'])
+          const result = { markedIds: [...ids], failed: [] }
+          if (withProgress) {
+            await onProgress?.({ markedIds: ['first'], failed: [] })
+            expect(store.get('history-round')?.finalization.succeededIds).toEqual(['first'])
+            expect(forget.mock.calls).toEqual([[['first']]])
+            await onProgress?.(result)
+          }
+          return result
+        },
+      })
+      try {
+        const response = await fetch(`${app.base}/api/reviews/history-round/finalize`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'X-Inbox-Walk-CSRF': 'fixture-csrf' },
+          body: JSON.stringify({
+            revision: 0,
+            finalizeIds: emails.map((email) => email.id),
+            keepUnreadIds: ['third'],
+          }),
+        })
+        expect(response.status).toBe(200)
+        expect(remember.mock.calls).toEqual([[['third']]])
+        expect(forget.mock.calls).toEqual(
+          withProgress ? [[['first']], [['second']]] : [[['first', 'second']]],
+        )
+      } finally {
+        await app.close()
+        store.close()
+        clearApiStateForTests()
+      }
+    },
+  )
+
+  it.each(
+    (['read', 'spam', 'label'] as const).flatMap((kind) =>
+      [false, true].map((reconciliation) => ({ kind, reconciliation })),
+    ),
+  )(
+    'reopens SQLite and omits confirmed $kind batches on retry, reconciliation=$reconciliation',
+    async ({ kind, reconciliation }) => {
       clearApiStateForTests()
       const directory = mkdtempSync(join(tmpdir(), 'inbox-progress-'))
       let store = createRoundStore(join(directory, 'rounds.sqlite'))
@@ -95,20 +165,40 @@ describe('durable adapter boundaries', () => {
           const [method, args, callId] = JSON.parse(String(init?.body)).methodCalls[0]
           let result: unknown
           if (method === 'Mailbox/get') result = { list: mailboxes }
-          else if (method === 'Email/get') result = { list: [] }
-          else {
+          else if (method === 'Email/get') {
+            if (reconciliation && args.ids[0] === 'first') {
+              result = {
+                list: [
+                  {
+                    id: 'first',
+                    keywords: { $seen: true },
+                    mailboxIds: { inbox: true, label: true },
+                  },
+                ],
+              }
+            } else if (reconciliation) {
+              const saved = store.get('fixture-round')?.finalization
+              expect(
+                kind === 'read' ? saved?.succeededIds : saved?.secondaryActionSucceededIds,
+              ).toEqual(['first'])
+              throw new Error('Synthetic later read-back failure')
+            } else result = { list: [] }
+          } else {
             const id = Object.keys(args.update)[0] as string
             const action = Object.keys(args.update[id])[0]?.startsWith('mailboxIds/')
               ? 'membership'
               : 'read'
             attempts.push(`${action}:${id}`)
-            if (!retry && id === 'second') throw new Error('Synthetic later-batch failure')
-            result = { updated: { [id]: null } }
+            if (!retry && (reconciliation || id === 'second'))
+              throw new Error('Synthetic later-batch failure')
+            result = {
+              updated: Object.fromEntries(Object.keys(args.update).map((id) => [id, null])),
+            }
           }
           return new Response(JSON.stringify({ methodResponses: [[method, result, callId]] }))
         }),
       )
-      let app = await serve(store, kind === 'spam')
+      let app = await serve(store, kind === 'spam', {}, reconciliation)
       try {
         const finalize = () =>
           fetch(`${app.base}/api/reviews/fixture-round/finalize`, {
@@ -121,7 +211,19 @@ describe('durable adapter boundaries', () => {
               secondaryActionIds: kind === 'read' ? [] : emails.map((email) => email.id),
             }),
           })
-        expect((await finalize()).status).toBeGreaterThanOrEqual(500)
+        const failed = await finalize()
+        expect(failed.status).toBeGreaterThanOrEqual(500)
+        if (reconciliation) {
+          expect(await failed.json()).toMatchObject({
+            error: {
+              details: {
+                confirmedIds: ['first'],
+                unknownIds: ['second'],
+                unattemptedIds: ['third'],
+              },
+            },
+          })
+        }
         await app.close()
         store.close()
         clearApiStateForTests()
@@ -132,7 +234,7 @@ describe('durable adapter boundaries', () => {
         ).toEqual(['first'])
         retry = true
         attempts.length = 0
-        app = await serve(store, kind === 'spam')
+        app = await serve(store, kind === 'spam', {}, reconciliation)
         expect((await finalize()).status).toBe(200)
         expect(attempts).not.toContain(`${kind === 'read' ? 'read' : 'membership'}:first`)
         expect(store.get('fixture-round')?.finalization.succeededIds).toHaveLength(3)

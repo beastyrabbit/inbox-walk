@@ -785,13 +785,13 @@ function parseFilters(value: unknown) {
 
 function updateReviewHistory(
   history: ReviewHistory | undefined,
-  keptUnreadIds: ReadonlySet<string>,
+  keptUnreadIds: ReadonlySet<string> | undefined,
   markedReadIds: readonly string[],
 ) {
   if (!history) return
   try {
-    history.rememberKeptUnread([...keptUnreadIds])
-    history.forget(markedReadIds)
+    if (keptUnreadIds?.size) history.rememberKeptUnread([...keptUnreadIds])
+    if (markedReadIds.length) history.forget(markedReadIds)
   } catch (error) {
     process.stderr.write(
       `${JSON.stringify({
@@ -2779,10 +2779,17 @@ async function finalize(
         snapshot.secondaryActionFailures.set(failure.id, failure.reason)
       persistProgress()
     }
+    let keptHistoryRecorded = false
     const recordRead = (update: Awaited<ReturnType<typeof markEmailsRead>>) => {
-      for (const id of update.markedIds) snapshot.succeededIds.add(id)
+      const newlyMarkedIds = update.markedIds.filter((id) => !snapshot.succeededIds.has(id))
+      for (const id of newlyMarkedIds) snapshot.succeededIds.add(id)
       persistProgress()
-      updateReviewHistory(apiOptions.reviewHistory, requestedKeep, update.markedIds)
+      updateReviewHistory(
+        apiOptions.reviewHistory,
+        keptHistoryRecorded ? undefined : requestedKeep,
+        newlyMarkedIds,
+      )
+      keptHistoryRecorded = true
     }
     if (pendingSecondaryActions.length > 0) {
       const action =

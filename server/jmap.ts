@@ -749,9 +749,11 @@ export async function markEmailsRead(
         token,
         batch,
         (email) => email.keywords?.$seen === true,
+        (confirmed) => {
+          markedIds.push(...confirmed)
+          onProgress?.({ failed: [...failed], markedIds: [...markedIds] })
+        },
       )
-      markedIds.push(...reconciled)
-      onProgress?.({ failed: [...failed], markedIds: [...markedIds] })
       throw new JmapError(
         'Fastmail hat nicht alle Änderungen bestätigt. Bestätigte Änderungen bleiben gespeichert; prüfe unklare Ergebnisse vor einem erneuten Versuch.',
         error instanceof JmapError ? error.code : 'JMAP_MUTATION_UNCONFIRMED',
@@ -786,31 +788,41 @@ async function reconcileMutation(
   token: string,
   ids: readonly string[],
   matches: (email: JmapEmail) => boolean,
+  onConfirmed: (ids: string[]) => void,
 ) {
-  try {
-    const emails: JmapEmail[] = []
-    for (let start = 0; start < ids.length; start += context.maxObjectsInGet) {
+  const confirmed = new Set<string>()
+  for (let start = 0; start < ids.length; start += context.maxObjectsInGet) {
+    const batch = ids.slice(start, start + context.maxObjectsInGet)
+    let emails: JmapEmail[]
+    try {
       const result = await callJmap<JmapEmail>(context.apiUrl, token, [
         [
           'Email/get',
           {
             accountId: context.accountId,
-            ids: ids.slice(start, start + context.maxObjectsInGet),
+            ids: batch,
             properties: ['id', 'keywords', 'mailboxIds'],
           },
           'reconcile',
         ],
       ])
-      emails.push(...(responseFor(result, 'reconcile').list ?? []))
+      emails = responseFor(result, 'reconcile').list ?? []
+    } catch {
+      // Preserve earlier confirmations; unreadable outcomes remain pending.
+      break
     }
-    const requested = new Set(ids)
-    return emails
-      .filter((email) => requested.has(email.id) && matches(email))
-      .map((email) => email.id)
-  } catch {
-    // An unreadable remote outcome remains pending; never invent confirmation.
-    return []
+    const requested = new Set(batch)
+    const newlyConfirmed: string[] = []
+    for (const email of emails) {
+      if (requested.has(email.id) && !confirmed.has(email.id) && matches(email)) {
+        confirmed.add(email.id)
+        newlyConfirmed.push(email.id)
+      }
+    }
+    // Persistence failures must propagate, rather than being treated as failed reads.
+    if (newlyConfirmed.length) onConfirmed(newlyConfirmed)
   }
+  return [...confirmed]
 }
 
 async function updateMailboxMembership(
@@ -832,19 +844,25 @@ async function updateMailboxMembership(
         ['Email/set', { accountId: context.accountId, update }, callId],
       ])
     } catch (error) {
-      const reconciled = await reconcileMutation(context, token, batch, (email) =>
-        Object.entries(patch).every(([key, value]) => {
-          const mailboxId = key
-            .slice('mailboxIds/'.length)
-            .replaceAll('~1', '/')
-            .replaceAll('~0', '~')
-          return value === true
-            ? email.mailboxIds[mailboxId] === true
-            : !email.mailboxIds[mailboxId]
-        }),
+      const reconciled = await reconcileMutation(
+        context,
+        token,
+        batch,
+        (email) =>
+          Object.entries(patch).every(([key, value]) => {
+            const mailboxId = key
+              .slice('mailboxIds/'.length)
+              .replaceAll('~1', '/')
+              .replaceAll('~0', '~')
+            return value === true
+              ? email.mailboxIds[mailboxId] === true
+              : !email.mailboxIds[mailboxId]
+          }),
+        (confirmed) => {
+          succeededIds.push(...confirmed)
+          onProgress?.({ failed: [...failed], succeededIds: [...succeededIds] })
+        },
       )
-      succeededIds.push(...reconciled)
-      onProgress?.({ failed: [...failed], succeededIds: [...succeededIds] })
       throw new JmapError(
         'Fastmail hat nicht alle Postfachänderungen bestätigt. Bestätigte Änderungen bleiben gespeichert; prüfe unklare Ergebnisse vor einem erneuten Versuch.',
         error instanceof JmapError ? error.code : 'JMAP_MUTATION_UNCONFIRMED',
