@@ -306,12 +306,14 @@ export interface ReplyProposal {
 export interface ReplyEditorState {
   bodyText: string
   cc: MailAddress[]
+  ccText?: string
   draftRequestId?: string
   identityId: string
   revisionInstruction: string
   roughNotes: string
   subject: string
   to: MailAddress[]
+  toText?: string
 }
 
 export interface DraftResult {

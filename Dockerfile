@@ -10,7 +10,7 @@ RUN corepack enable
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --frozen-lockfile
 
-COPY tsconfig.json tsconfig.app.json tsconfig.node.json vite.config.ts biome.json index.html ./
+COPY tsconfig.app.json tsconfig.node.json vite.config.ts biome.json index.html ./
 COPY src ./src
 COPY server ./server
 RUN pnpm build && pnpm prune --prod

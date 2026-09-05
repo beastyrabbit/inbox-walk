@@ -560,7 +560,7 @@ export function validateBundleDecisionPartition(
   snapshotIds: readonly string[],
   decision: unknown,
 ): asserts decision is BundlePartitionDecision {
-  validateBundlePartitionDecisionShape(decision)
+  validateBundlePartitionDecisionShape(decision, snapshotIds.length)
   const expected = new Set(snapshotIds)
   if (expected.size !== snapshotIds.length) {
     throw new Error('The snapshot contains duplicate email IDs.')
@@ -603,17 +603,18 @@ function boundedString(value: unknown, maximum: number, label: string): asserts 
 
 export function validateBundlePartitionDecisionShape(
   decision: unknown,
+  maximum = Number.MAX_SAFE_INTEGER,
 ): asserts decision is BundlePartitionDecision {
   if (!decision || typeof decision !== 'object') {
     throw new Error('Bundle partition must be an object.')
   }
   const candidate = decision as Record<string, unknown>
-  if (!Array.isArray(candidate.stories) || candidate.stories.length > 10_000) {
-    throw new Error('Bundle partition stories must be an array of at most 10000 items.')
+  if (!Array.isArray(candidate.stories) || candidate.stories.length > maximum) {
+    throw new Error('Bundle partition stories exceed the snapshot size or are not an array.')
   }
   if (
     !Array.isArray(candidate.standaloneEmailIds) ||
-    candidate.standaloneEmailIds.length > 10_000 ||
+    candidate.standaloneEmailIds.length > maximum ||
     candidate.standaloneEmailIds.some(
       (id) => typeof id !== 'string' || id.length === 0 || id.length > 512,
     )
@@ -628,7 +629,7 @@ export function validateBundlePartitionDecisionShape(
     if (
       !Array.isArray(item.emailIds) ||
       item.emailIds.length < 2 ||
-      item.emailIds.length > 10_000 ||
+      item.emailIds.length > maximum ||
       item.emailIds.some((id) => typeof id !== 'string' || id.length === 0 || id.length > 512)
     ) {
       throw new Error('A bundle partition story must contain at least two emails with valid IDs.')
@@ -661,7 +662,7 @@ export function normalizeBundleDecisionPartition(
   snapshotIds: readonly string[],
   decision: unknown,
 ): BundlePartitionDecision {
-  validateBundlePartitionDecisionShape(decision)
+  validateBundlePartitionDecisionShape(decision, snapshotIds.length)
   const expected = new Set(snapshotIds)
   if (expected.size !== snapshotIds.length) {
     throw new Error('The snapshot contains duplicate email IDs.')
@@ -748,6 +749,7 @@ export async function buildReviewBundlesFromPartition(
   }
   const signals = new Map<string, BundleSignals>()
   const ordinalById = new Map<string, number>()
+  const emailById = new Map(emails.map((email) => [email.id, email]))
   for (const [ordinal, email] of emails.entries()) {
     options.signal?.throwIfAborted()
     signals.set(email.id, {
@@ -787,13 +789,18 @@ export async function buildReviewBundlesFromPartition(
     ...decision.standaloneEmailIds.map((id) => ({ ids: new Set([id]) })),
   ].sort((left, right) => {
     const firstOrdinal = (ids: ReadonlySet<string>) =>
-      Math.min(...[...ids].map((id) => ordinalById.get(id) ?? Number.POSITIVE_INFINITY))
+      [...ids].reduce(
+        (first, id) => Math.min(first, ordinalById.get(id) ?? Number.POSITIVE_INFINITY),
+        Number.POSITIVE_INFINITY,
+      )
     return firstOrdinal(left.ids) - firstOrdinal(right.ids)
   })
 
   const bundles = groups.map((group) => {
     options.signal?.throwIfAborted()
-    const members = emails.filter((email) => group.ids.has(email.id))
+    const members = [...group.ids]
+      .sort((left, right) => (ordinalById.get(left) ?? 0) - (ordinalById.get(right) ?? 0))
+      .map((id) => emailById.get(id) as ReviewEmailSummary)
     const bundle = asBundle(members, signals, group.metadata)
     bundle.bundleId = `bundle-${stableId(bundle.emailIds)}`
     return bundle

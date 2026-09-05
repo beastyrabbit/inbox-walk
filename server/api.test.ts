@@ -2958,7 +2958,7 @@ describe('demo API contract', () => {
     })
   })
 
-  it('does not delete a round while a draft request body is still arriving', async () => {
+  it('preserves draft ownership through cache pressure until the request settles', async () => {
     const created = await json<ReviewSnapshot>(
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
@@ -2999,6 +2999,22 @@ describe('demo API contract', () => {
     })
     slowRequest?.write(payload.slice(0, 1))
     await new Promise((resolve) => setTimeout(resolve, 25))
+
+    for (let index = 0; index < 25; index += 1) {
+      const id = crypto.randomUUID()
+      roundStore.create({
+        id,
+        csrfToken: 'fixture',
+        imageToken: 'fixture',
+        emails: [email],
+        filters: defaultReviewFilters,
+        mailboxes: [],
+        mode: 'demo',
+      })
+      const other = await fetch(`${baseUrl}/api/reviews/${id}`)
+      await other.arrayBuffer()
+      expect(other.status).toBe(200)
+    }
 
     const blocked = await fetch(`${baseUrl}/api/reviews/${created.body.snapshotId}`, {
       method: 'DELETE',

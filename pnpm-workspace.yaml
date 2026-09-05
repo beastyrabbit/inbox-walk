@@ -3,3 +3,9 @@ allowBuilds:
   esbuild: true
   lefthook: true
   protobufjs: true
+minimumReleaseAgeExclude:
+  - esbuild@0.28.1
+  - undici@8.9.0
+overrides:
+  esbuild@>=0.27.3 <0.28.1: ^0.28.1
+  undici@>=8.0.0 <8.9.0: ^8.9.0

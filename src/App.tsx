@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { api, blobUrl, ClientApiError, type CodexSettings } from './api.ts'
+import { restoreBundleGroups } from './bundle-groups.ts'
 import {
   clearCheckpoint,
   loadCheckpoint,
@@ -8,6 +9,12 @@ import {
   stageCheckpointMigration,
 } from './checkpoint.ts'
 import { emailDocument } from './email-document.ts'
+import {
+  addressesToText,
+  applyReplyProposal,
+  parseAddresses,
+  patchReplyEditor,
+} from './reply-editor.ts'
 import {
   clampIndex,
   idsToMarkRead,
@@ -78,25 +85,6 @@ function formatBytes(bytes: number) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function addressesToText(addresses: MailAddress[]) {
-  return addresses
-    .map((address) => (address.name ? `${address.name} <${address.email}>` : address.email))
-    .join(', ')
-}
-
-function parseAddresses(value: string): MailAddress[] {
-  return value
-    .split(',')
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const match = part.match(/^(.*?)\s*<([^<>]+)>$/)
-      return match
-        ? { name: match[1]?.trim() ?? '', email: match[2]?.trim() ?? '' }
-        : { name: '', email: part }
-    })
-}
-
 function errorMessage(error: unknown) {
   if (error instanceof ClientApiError) return error.message
   if (error instanceof Error) return error.message
@@ -112,56 +100,6 @@ function initialEditor(context: ThreadContext): ReplyEditorState {
     roughNotes: '',
     subject: context.recipients.subject,
     to: context.recipients.to,
-  }
-}
-
-function restoreBundleGroups(
-  run: ReviewBundleRun,
-  groups: readonly (readonly string[])[],
-  emails: ReviewSnapshot['emails'],
-) {
-  const expected = new Set(emails.map((email) => email.id))
-  const restoredIds = groups.flat()
-  if (
-    restoredIds.length !== expected.size ||
-    new Set(restoredIds).size !== expected.size ||
-    restoredIds.some((id) => !expected.has(id))
-  ) {
-    return run
-  }
-  const timelineById = new Map(
-    run.bundles.flatMap((bundle) => bundle.timeline.map((item) => [item.emailId, item] as const)),
-  )
-  return {
-    ...run,
-    bundles: groups.map((group, groupIndex) => {
-      const sources = run.bundles.filter((bundle) =>
-        bundle.emailIds.some((id) => group.includes(id)),
-      )
-      const primary = sources[0]
-      const original = emails.find((email) => email.id === group[0])
-      return {
-        bundleId: `restored-${groupIndex}-${group[0]}`,
-        currentState:
-          group.length === 1 ? 'Einzelne Nachricht' : (primary?.currentState ?? 'Letzter Stand'),
-        emailIds: [...group],
-        kind: group.length === 1 ? 'standalone' : (primary?.kind ?? 'standalone'),
-        linkEvidence: [...new Set(sources.flatMap((bundle) => bundle.linkEvidence))],
-        membershipConfidence: 1,
-        summary:
-          group.length === 1
-            ? original?.preview || original?.subject || ''
-            : sources.map((bundle) => bundle.summary).join(' '),
-        timeline: group
-          .map((id) => timelineById.get(id))
-          .filter((item): item is NonNullable<typeof item> => Boolean(item))
-          .sort((left, right) => Date.parse(left.occurredAt) - Date.parse(right.occurredAt)),
-        title:
-          group.length === 1
-            ? original?.subject || '(Kein Betreff)'
-            : primary?.title || original?.subject || '(Kein Betreff)',
-      } satisfies ReviewBundle
-    }),
   }
 }
 
@@ -356,6 +294,11 @@ function App() {
   const [creatingRun, setCreatingRun] = useState(false)
   const [loading, setLoading] = useState(true)
   const [detailLoading, setDetailLoading] = useState(false)
+  const [failedDetails, setFailedDetails] = useState<Set<string>>(new Set())
+  const [pendingDetails, setPendingDetails] = useState<Set<string>>(new Set())
+  const roundEpochRef = useRef(0)
+  const detailRequestsRef = useRef(new Map<string, Promise<ReviewEmail>>())
+  const replyBodyEditsRef = useRef(new Map<string, number>())
   const [replyLoading, setReplyLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [status, setStatus] = useState('')
@@ -415,6 +358,12 @@ function App() {
   )
 
   const applySnapshot = useCallback((nextSnapshot: ReviewSnapshot) => {
+    roundEpochRef.current += 1
+    detailRequestsRef.current.clear()
+    replyBodyEditsRef.current.clear()
+    setReplyLoading(false)
+    setFailedDetails(new Set())
+    setPendingDetails(new Set())
     if (stateSaveTimerRef.current !== null) {
       window.clearTimeout(stateSaveTimerRef.current)
       stateSaveTimerRef.current = null
@@ -1002,20 +951,38 @@ function App() {
   useEffect(() => {
     if (!snapshot || !summary || details[summary.id]) return
     let active = true
+    const epoch = roundEpochRef.current
+    const belongsToRound = () =>
+      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
+    setPendingDetails((current) => new Set(current).add(summary.id))
     setDetailLoading(true)
     setError(null)
-    void api
-      .email(snapshot.snapshotId, summary.id)
+    const requestKey = `${epoch}/${summary.id}`
+    let request = detailRequestsRef.current.get(requestKey)
+    if (!request) {
+      request = api.email(snapshot.snapshotId, summary.id)
+      detailRequestsRef.current.set(requestKey, request)
+    }
+    void request
       .then((loaded) => {
-        if (active) setDetails((current) => ({ ...current, [loaded.id]: loaded }))
+        if (belongsToRound()) setDetails((current) => ({ ...current, [loaded.id]: loaded }))
       })
       .catch((cause) => {
-        if (!active) return
+        if (!belongsToRound()) return
+        if (detailRequestsRef.current.get(requestKey) === request)
+          detailRequestsRef.current.delete(requestKey)
+        setFailedDetails((current) => new Set(current).add(summary.id))
         setKeptUnread((current) => new Set(current).add(summary.id))
         setError(`${errorMessage(cause)} Die Nachricht bleibt vorsichtshalber ungelesen.`)
         setStatus('Nachrichteninhalt nicht verfügbar; ungelesen geschützt.')
       })
       .finally(() => {
+        if (belongsToRound())
+          setPendingDetails((current) => {
+            const next = new Set(current)
+            next.delete(summary.id)
+            return next
+          })
         if (active) setDetailLoading(false)
       })
     return () => {
@@ -1035,6 +1002,7 @@ function App() {
 
   const next = useCallback(() => {
     if (view !== 'review' || !currentBundle) return
+    if (summary && !details[summary.id] && !failedDetails.has(summary.id)) return
     setReplyOpen(false)
     setProcessedIds((current) => {
       const nextProcessed = new Set(current)
@@ -1043,7 +1011,7 @@ function App() {
     })
     if (index >= bundles.length - 1) setView('confirm')
     else setIndex((current) => current + 1)
-  }, [bundles.length, currentBundle, index, view])
+  }, [bundles.length, currentBundle, index, view, summary, details, failedDetails])
 
   const finishProcessed = useCallback(() => {
     if (view !== 'review' || processedIds.size === 0) return
@@ -1074,6 +1042,9 @@ function App() {
 
   const openReply = useCallback(async () => {
     if (!snapshot || !summary) return
+    const epoch = roundEpochRef.current
+    const belongsToRound = () =>
+      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
     setReplyOpen(true)
     setHelpOpen(false)
     if (threadContexts[summary.id]) return
@@ -1081,6 +1052,7 @@ function App() {
     setError(null)
     try {
       const context = await api.thread(snapshot.snapshotId, summary.threadId, summary.id)
+      if (!belongsToRound()) return
       setThreadContexts((current) => ({ ...current, [summary.id]: context }))
       setReplyDrafts((current) => ({
         ...current,
@@ -1088,10 +1060,11 @@ function App() {
       }))
       setStatus('Antwortkontext geladen.')
     } catch (cause) {
+      if (!belongsToRound()) return
       setError(errorMessage(cause))
       setReplyOpen(false)
     } finally {
-      setReplyLoading(false)
+      if (belongsToRound()) setReplyLoading(false)
     }
   }, [snapshot, summary, threadContexts])
 
@@ -1152,21 +1125,27 @@ function App() {
 
   function updateEditor(patch: Partial<ReplyEditorState>) {
     if (!summary || !editor) return
-    const changesSavedDraft = ['bodyText', 'cc', 'identityId', 'subject', 'to'].some(
-      (key) => key in patch,
+    if ('bodyText' in patch)
+      replyBodyEditsRef.current.set(
+        summary.id,
+        (replyBodyEditsRef.current.get(summary.id) ?? 0) + 1,
+      )
+    setReplyDrafts((current) =>
+      current[summary.id]
+        ? {
+            ...current,
+            [summary.id]: patchReplyEditor(current[summary.id], patch),
+          }
+        : current,
     )
-    setReplyDrafts((current) => ({
-      ...current,
-      [summary.id]: {
-        ...editor,
-        ...patch,
-        ...(changesSavedDraft ? { draftRequestId: undefined } : {}),
-      },
-    }))
   }
 
   async function generateReply() {
     if (!snapshot || !summary || !editor) return
+    const bodyEditRevision = replyBodyEditsRef.current.get(summary.id) ?? 0
+    const epoch = roundEpochRef.current
+    const belongsToRound = () =>
+      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
     setReplyLoading(true)
     setError(null)
     try {
@@ -1177,19 +1156,40 @@ function App() {
         revisionInstruction: editor.revisionInstruction || undefined,
         roughNotes: editor.roughNotes,
       })
+      if (!belongsToRound()) return
+      if ((replyBodyEditsRef.current.get(summary.id) ?? 0) !== bodyEditRevision) {
+        setStatus('Vorschlag verworfen, weil der Antworttext zwischenzeitlich geändert wurde.')
+        return
+      }
       setReplyProposals((current) => ({ ...current, [summary.id]: nextProposal }))
-      updateEditor({ bodyText: nextProposal.bodyText, revisionInstruction: '' })
+      setReplyDrafts((current) =>
+        current[summary.id]
+          ? {
+              ...current,
+              [summary.id]: applyReplyProposal(current[summary.id], editor, nextProposal.bodyText),
+            }
+          : current,
+      )
       setStatus('Antwortentwurf erstellt. Bitte prüfen und bearbeiten.')
     } catch (cause) {
-      setError(errorMessage(cause))
+      if (belongsToRound()) setError(errorMessage(cause))
     } finally {
-      setReplyLoading(false)
+      if (belongsToRound()) setReplyLoading(false)
     }
   }
 
   async function saveDraft() {
     if (!snapshot || !summary || !editor) return
-    if (editor.to.length === 0 || !editor.subject.trim() || !editor.bodyText.trim()) {
+    let to: MailAddress[]
+    let cc: MailAddress[]
+    try {
+      to = parseAddresses(editor.toText ?? addressesToText(editor.to))
+      cc = parseAddresses(editor.ccText ?? addressesToText(editor.cc))
+    } catch (cause) {
+      setError(errorMessage(cause))
+      return
+    }
+    if (to.length === 0 || !editor.subject.trim() || !editor.bodyText.trim()) {
       setError('Empfänger, Betreff und Nachrichtentext werden für einen Draft benötigt.')
       return
     }
@@ -1198,11 +1198,11 @@ function App() {
     try {
       const draftPayload = {
         bodyText: editor.bodyText,
-        cc: editor.cc,
+        cc,
         emailId: summary.id,
         identityId: editor.identityId,
         subject: editor.subject,
-        to: editor.to,
+        to,
       }
       const requestId = editor.draftRequestId ?? crypto.randomUUID()
       if (!editor.draftRequestId) {
@@ -1229,7 +1229,7 @@ function App() {
   }
 
   async function finalizeReview() {
-    if (!snapshot) return
+    if (!snapshot || pendingDetails.size > 0) return
     setSubmitting(true)
     setError(null)
     try {
@@ -1692,7 +1692,7 @@ function App() {
             type="button"
             className="button primary"
             onClick={() => void finalizeReview()}
-            disabled={submitting}
+            disabled={submitting || pendingDetails.size > 0}
           >
             {submitting
               ? 'Wird gespeichert …'
@@ -1972,7 +1972,12 @@ function App() {
             <span className="partial-finish-wide">Bisher abschließen · {processedIds.size}</span>
             <span className="partial-finish-compact">{processedIds.size} fertig</span>
           </button>
-          <button type="button" className="control-button next" onClick={next}>
+          <button
+            type="button"
+            className="control-button next"
+            onClick={next}
+            disabled={Boolean(summary && !details[summary.id] && !failedDetails.has(summary.id))}
+          >
             <span>{index === bundles.length - 1 ? 'Abschließen' : 'Story erledigt'}</span>
             <kbd>→</kbd>
           </button>
@@ -2907,16 +2912,16 @@ function ReplyPanel({
             An
             <input
               type="text"
-              value={addressesToText(editor.to)}
-              onChange={(event) => onUpdate({ to: parseAddresses(event.target.value) })}
+              value={editor.toText ?? addressesToText(editor.to)}
+              onChange={(event) => onUpdate({ toText: event.target.value })}
             />
           </label>
           <label>
             Cc
             <input
               type="text"
-              value={addressesToText(editor.cc)}
-              onChange={(event) => onUpdate({ cc: parseAddresses(event.target.value) })}
+              value={editor.ccText ?? addressesToText(editor.cc)}
+              onChange={(event) => onUpdate({ ccText: event.target.value })}
             />
           </label>
           <label>
