@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
 import { expect, type Page, test } from '@playwright/test'
 import type { ReviewRunSummary } from '../src/shared.ts'
 
@@ -13,7 +14,15 @@ async function startAndOpenRound(page: Page) {
   await open.click()
 }
 
+async function completeStory(page: Page) {
+  await expect(page.locator('.control-button.next')).toBeEnabled()
+  await page.keyboard.press('ArrowRight')
+}
+
 test.beforeEach(async ({ page }) => {
+  const options = await page.request.get('/api/review/options')
+  expect(options.ok()).toBe(true)
+  expect((await options.json()).mode).toBe('demo')
   await page.goto('/')
   await expect(page.getByRole('heading', { name: 'Inbox Walk' })).toBeVisible()
   await startAndOpenRound(page)
@@ -60,7 +69,7 @@ test('keeps the overview visible and shows the new run before processing starts'
   await page.getByRole('button', { name: 'Runden' }).click()
   const rows = page.locator('.runs-table tbody tr')
   const countBefore = await rows.count()
-  let releaseCreate = () => undefined
+  let releaseCreate: () => void = () => {}
   const createGate = new Promise<void>((resolve) => {
     releaseCreate = resolve
   })
@@ -764,7 +773,7 @@ test('reviews mail with keyboard decisions and exact overview navigation', async
     'aria-pressed',
     'true',
   )
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
 
   await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
@@ -818,6 +827,169 @@ test('persists incomplete reply recipients without blocking the round', async ({
   await expect(page.getByRole('textbox', { name: 'Cc', exact: true })).toHaveValue('Team <team@')
 })
 
+test('preserves sequential recipient typing and newer edits during delayed inference', async ({
+  page,
+}, testInfo) => {
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  const to = page.getByRole('textbox', { name: 'An', exact: true })
+  const cc = page.getByRole('textbox', { name: 'Cc', exact: true })
+  await to.fill('')
+  await to.pressSequentially('first@example.test, second@example.test')
+  await cc.fill('')
+  await cc.pressSequentially('"Doe, Alex" <alex@example.test>, copy@example.test')
+  await to.press('ControlOrMeta+A')
+  await to.press('ArrowRight')
+  for (let index = 0; index < ' second@example.test'.length; index += 1) await to.press('Backspace')
+  await expect(to).toHaveValue('first@example.test,')
+  await to.press('Backspace')
+  await to.pressSequentially(', second@example.test')
+  const notes = page.getByLabel('Was soll die Antwort sagen?')
+  await notes.fill('Original notes')
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route('**/api/reviews/*/replies', async (route) => {
+    const response = await route.fetch()
+    await gate
+    await route.fulfill({ response })
+  })
+  await page.getByRole('button', { name: 'Entwurf erstellen' }).click()
+  await notes.fill('New notes written during generation')
+  await page.getByRole('textbox', { name: 'Betreff', exact: true }).fill('Edited subject')
+  release()
+  const body = page.getByRole('textbox', { name: 'Antwort', exact: true })
+  await expect(body).toBeVisible()
+  await expect(notes).toHaveValue('New notes written during generation')
+  await expect(to).toHaveValue('first@example.test, second@example.test')
+  await expect(cc).toHaveValue('"Doe, Alex" <alex@example.test>, copy@example.test')
+  await page.unroute('**/api/reviews/*/replies')
+  const secondGate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route('**/api/reviews/*/replies', async (route) => {
+    const response = await route.fetch()
+    await secondGate
+    await route.fulfill({ response })
+  })
+  await page.getByRole('button', { name: 'Entwurf neu erstellen' }).click()
+  await body.fill('Manual body typed during generation')
+  release()
+  await expect(page.getByRole('button', { name: 'Entwurf neu erstellen' })).toBeEnabled()
+  await expect(body).toHaveValue('Manual body typed during generation')
+  await page.getByRole('button', { name: 'Antwort schließen' }).click()
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await page.getByRole('button', { name: 'Runde öffnen' }).first().click()
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(to).toHaveValue('first@example.test, second@example.test')
+  await expect(cc).toHaveValue('"Doe, Alex" <alex@example.test>, copy@example.test')
+  await expect(body).toHaveValue('Manual body typed during generation')
+  const draftRequest = page.waitForRequest((request) => request.url().endsWith('/drafts'))
+  await page.getByRole('button', { name: 'In Fastmail als Draft speichern' }).click()
+  expect((await draftRequest).postDataJSON()).toMatchObject({
+    to: [{ email: 'first@example.test' }, { email: 'second@example.test' }],
+    cc: [{ name: 'Doe, Alex', email: 'alex@example.test' }, { email: 'copy@example.test' }],
+    bodyText: 'Manual body typed during generation',
+    subject: 'Edited subject',
+  })
+  await expect(page.getByText(/Draft gespeichert und verifiziert/)).toBeVisible()
+  if (process.env.REVIEW_EVIDENCE_DIR) {
+    await mkdir(process.env.REVIEW_EVIDENCE_DIR, { recursive: true })
+    await page.screenshot({
+      path: `${process.env.REVIEW_EVIDENCE_DIR}/reply-${testInfo.project.name}.png`,
+      fullPage: true,
+    })
+  }
+})
+
+test('protects a delayed body failure after navigation and blocks finalization while unresolved', async ({
+  page,
+}) => {
+  const roundId = new URL(page.url()).pathname.split('/').at(-1)
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route('**/api/reviews/*/emails/demo-human', async (route) => {
+    await gate
+    await route.fulfill({
+      status: 502,
+      json: { error: { code: 'FIXTURE_BODY_FAILED', message: 'Synthetic unavailable body' } },
+    })
+  })
+  // A completed story provides a partial-finalization path while another body loads.
+  await expect(page.locator('iframe.message-body')).toBeVisible()
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
+  await expect(page.getByRole('button', { name: /Story erledigt/ })).toBeDisabled()
+  await page.keyboard.press('ArrowRight')
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
+  await page.getByRole('button', { name: /bereits bearbeitete Nachrichten abschließen/ }).click()
+  await expect(page.getByRole('button', { name: 'Änderungen speichern' })).toBeDisabled()
+  release()
+  await expect(page.getByRole('button', { name: 'Änderungen speichern' })).toBeEnabled()
+  await page.getByRole('button', { name: 'Zurück', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await expect
+    .poll(async () => {
+      const round = await (await page.request.get(`/api/reviews/${roundId}`)).json()
+      return round.userState.keptUnreadIds
+    })
+    .toContain('demo-human')
+})
+
+test('discards delayed reply results after leaving a round', async ({ page }) => {
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await page.getByLabel('Was soll die Antwort sagen?').fill('Old round notes')
+  let release: () => void = () => {}
+  const gate = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  await page.route('**/api/reviews/*/replies', async (route) => {
+    const response = await route.fetch()
+    await gate
+    await route.fulfill({ response })
+  })
+  await page.getByRole('button', { name: 'Entwurf erstellen' }).click()
+  await page.getByRole('button', { name: 'Antwort schließen' }).click()
+  await page.getByRole('button', { name: 'Runden' }).click()
+  await startAndOpenRound(page)
+  release()
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(page.getByLabel('Was soll die Antwort sagen?')).toHaveValue('')
+  await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveCount(0)
+})
+
+test('loads a proxied image without any direct sender request', async ({ page }) => {
+  const external: string[] = []
+  await page.route('https://**/*', (route) => {
+    external.push(route.request().url())
+    return route.abort()
+  })
+  await page.route('**/api/reviews/*/emails/demo-shop/images/*', (route) =>
+    route.fulfill({
+      contentType: 'image/png',
+      headers: { 'Cache-Control': 'private, no-store' },
+      body: Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+        'base64',
+      ),
+    }),
+  )
+  await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
+  await page.getByRole('button', { name: /03 DHL Sendungsnummer/ }).click()
+  const image = page.frameLocator('iframe.message-body').locator('img').first()
+  await expect
+    .poll(() =>
+      image.evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth > 0),
+    )
+    .toBe(true)
+  expect(external).toEqual([])
+})
+
 test('flushes pending reply notes before leaving and reopening the round', async ({ page }) => {
   const notes = 'Diese noch ungespeicherten Stichpunkte müssen einen sofortigen Wechsel überleben.'
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
@@ -831,7 +1003,7 @@ test('flushes pending reply notes before leaving and reopening the round', async
 })
 
 test('requires confirmation before finalizing the fixed snapshot', async ({ page }) => {
-  for (let index = 0; index < 5; index += 1) await page.keyboard.press('ArrowRight')
+  for (let index = 0; index < 5; index += 1) await completeStory(page)
   await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
   await expect(page.getByText('Bereits bearbeitet')).toBeVisible()
   await expect(page.getByText('Neue Nachrichten seit dem Start')).toBeVisible()
@@ -865,7 +1037,7 @@ test('requires confirmation before finalizing the fixed snapshot', async ({ page
 
 test('can finalize only messages already confirmed with Weiter', async ({ page }) => {
   await page.keyboard.press('ArrowUp')
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
 
   await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
@@ -926,7 +1098,7 @@ test('restores a partial finalization in the locked retry view after reload', as
     await route.fulfill({ status: 207, json: partialResult })
   })
 
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
   await page.getByRole('button', { name: 'Änderungen speichern' }).click()
   await expect(page.getByRole('button', { name: 'Fehlgeschlagene erneut versuchen' })).toBeVisible()
@@ -969,7 +1141,7 @@ test('refreshes the durable lock after a post-lock finalization error', async ({
     })
   })
 
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
   await page.getByRole('button', { name: 'Änderungen speichern' }).click()
   await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
@@ -1010,7 +1182,7 @@ test('does not leave confirmation with Escape while finalization is in flight', 
     })
   })
 
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }).click()
   await page.getByRole('button', { name: 'Änderungen speichern' }).click()
   await expect(page.getByRole('button', { name: 'Wird gespeichert …' })).toBeDisabled()
@@ -1044,7 +1216,7 @@ test('completes every bundle member while protecting one selected original', asy
     .getByRole('button', { name: /GitHub · \[beasty\/inbox-walk\] Pull request #184 opened/ })
     .click()
   await page.keyboard.press('ArrowUp')
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await page.getByRole('button', { name: '4 bereits bearbeitete Nachrichten abschließen' }).click()
   await expect(
     page.locator('.review-summary div').filter({ hasText: 'Bereits bearbeitet' }),
@@ -1072,7 +1244,7 @@ test('does not apply review shortcuts behind open surfaces', async ({ page }) =>
 
   await page.keyboard.press('?')
   await page.keyboard.press('ArrowUp')
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await expect(page.getByRole('heading', { name: 'Tastatur' })).toBeVisible()
   await expect(unread).toHaveAttribute('aria-pressed', 'false')
   await expect(currentSubject).toBeVisible()
@@ -1080,7 +1252,7 @@ test('does not apply review shortcuts behind open surfaces', async ({ page }) =>
 
   await page.getByRole('button', { name: 'Einstellungen' }).click()
   await page.keyboard.press('ArrowUp')
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await expect(page.getByRole('heading', { name: 'Einstellungen' })).toBeVisible()
   await expect(unread).toHaveAttribute('aria-pressed', 'false')
   await expect(currentSubject).toBeVisible()
@@ -1088,7 +1260,7 @@ test('does not apply review shortcuts behind open surfaces', async ({ page }) =>
 
   await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
   await page.keyboard.press('ArrowUp')
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await expect(page.getByRole('heading', { name: 'Nachrichten' })).toBeVisible()
   await expect(unread).toHaveAttribute('aria-pressed', 'false')
   await expect(currentSubject).toBeVisible()
@@ -1097,7 +1269,7 @@ test('does not apply review shortcuts behind open surfaces', async ({ page }) =>
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await expect(page.getByRole('heading', { name: 'Antwortentwurf' })).toBeVisible()
   await page.keyboard.press('ArrowUp')
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await expect(unread).toHaveAttribute('aria-pressed', 'false')
   await expect(currentSubject).toBeVisible()
 })
@@ -1258,9 +1430,7 @@ test('shows Codex settings failures inside the open settings dialog', async ({ p
   )
 })
 
-test('keeps mail scripts blocked while allowing authenticated same-origin images', async ({
-  page,
-}) => {
+test('uses a script-disabled same-origin mail sandbox', async ({ page }) => {
   const frame = page.locator('iframe.message-body')
   await expect(frame).toHaveAttribute('sandbox', /allow-same-origin/)
   await expect(frame).not.toHaveAttribute('sandbox', /allow-scripts/)
@@ -1290,7 +1460,7 @@ test('reviews Spam separately and makes Down mean Not Spam', async ({ page }) =>
     'aria-pressed',
     'true',
   )
-  await page.keyboard.press('ArrowRight')
+  await completeStory(page)
   await expect(page.getByText('Aus Spam in die Inbox')).toBeVisible()
   await expect(page.locator('.review-summary div').filter({ hasText: 'Aus Spam' })).toContainText(
     '1',

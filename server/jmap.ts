@@ -8,6 +8,7 @@ import type {
   ReviewFilters,
   ThreadMessage,
 } from '../src/shared.ts'
+import { abortable, ioSignal, readBoundedBody } from './io.ts'
 
 const CORE = 'urn:ietf:params:jmap:core'
 const MAIL = 'urn:ietf:params:jmap:mail'
@@ -46,6 +47,7 @@ interface JmapMailAddress {
 }
 
 interface JmapEmail {
+  keywords?: Record<string, boolean>
   attachments?: BodyPart[]
   bodyStructure?: BodyPart
   bodyValues?: Record<string, { isTruncated?: boolean; value: string }>
@@ -144,21 +146,28 @@ export class JmapError extends Error {
     message: string,
     readonly code: string,
     readonly status?: number,
+    readonly details?: { confirmedIds: string[]; unknownIds: string[]; unattemptedIds: string[] },
   ) {
     super(message)
   }
 }
 
 async function getSession(token: string, signal?: AbortSignal): Promise<JmapSession> {
-  const response = await fetch(SESSION_URL, {
-    headers: { Authorization: `Bearer ${token}` },
+  signal = ioSignal(30_000, signal)
+  const response = await abortable(
+    fetch(SESSION_URL, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal,
+    }),
     signal,
-  })
+  )
   if (!response.ok) {
     const code = response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'FASTMAIL_SESSION_FAILED'
     throw new JmapError(`Fastmail session failed (${response.status})`, code, response.status)
   }
-  return (await response.json()) as JmapSession
+  return JSON.parse(
+    (await readBoundedBody(response, 32 * 1024 * 1024, signal)).toString('utf8'),
+  ) as JmapSession
 }
 
 async function accountContext(token: string, signal?: AbortSignal): Promise<MailAccountContext> {
@@ -183,23 +192,29 @@ async function callJmap<T>(
   includeSubmission = false,
   signal?: AbortSignal,
 ): Promise<ResponseTuple<T>[]> {
+  signal = ioSignal(30_000, signal)
   if (methodCalls.some(([name]) => String(name).startsWith('EmailSubmission/'))) {
     throw new JmapError('Email submission is not supported by Inbox Walk', 'SUBMISSION_FORBIDDEN')
   }
-  const response = await fetch(apiUrl, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      using: includeSubmission ? [CORE, MAIL, SUBMISSION] : [CORE, MAIL],
-      methodCalls,
+  const response = await abortable(
+    fetch(apiUrl, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        using: includeSubmission ? [CORE, MAIL, SUBMISSION] : [CORE, MAIL],
+        methodCalls,
+      }),
+      signal,
     }),
     signal,
-  })
+  )
   if (!response.ok) {
     const code = response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'FASTMAIL_REQUEST_FAILED'
     throw new JmapError(`Fastmail request failed (${response.status})`, code, response.status)
   }
-  const payload = (await response.json()) as { methodResponses?: ResponseTuple<T>[] }
+  const payload = JSON.parse(
+    (await readBoundedBody(response, 32 * 1024 * 1024, signal)).toString('utf8'),
+  ) as { methodResponses?: ResponseTuple<T>[] }
   if (!payload.methodResponses)
     throw new JmapError('Fastmail returned no responses', 'INVALID_JMAP')
   const error = payload.methodResponses.find(([name]) => name === 'error')
@@ -716,15 +731,38 @@ export async function markEmailsRead(
   context: MailAccountContext,
   token: string,
   ids: readonly string[],
+  onProgress?: (result: MarkReadResult) => void,
 ): Promise<MarkReadResult> {
   const failed: MarkReadResult['failed'] = []
   const markedIds: string[] = []
   for (let start = 0; start < ids.length; start += context.maxObjectsInSet) {
     const batch = ids.slice(start, start + context.maxObjectsInSet)
     const update = Object.fromEntries(batch.map((id) => [id, { 'keywords/$seen': true }]))
-    const responses = await callJmap<never>(context.apiUrl, token, [
-      ['Email/set', { accountId: context.accountId, update }, 'mark-read'],
-    ])
+    let responses: ResponseTuple<never>[]
+    try {
+      responses = await callJmap<never>(context.apiUrl, token, [
+        ['Email/set', { accountId: context.accountId, update }, 'mark-read'],
+      ])
+    } catch (error) {
+      const reconciled = await reconcileMutation(
+        context,
+        token,
+        batch,
+        (email) => email.keywords?.$seen === true,
+      )
+      markedIds.push(...reconciled)
+      onProgress?.({ failed: [...failed], markedIds: [...markedIds] })
+      throw new JmapError(
+        'Fastmail hat nicht alle Änderungen bestätigt. Bestätigte Änderungen bleiben gespeichert; prüfe unklare Ergebnisse vor einem erneuten Versuch.',
+        error instanceof JmapError ? error.code : 'JMAP_MUTATION_UNCONFIRMED',
+        error instanceof JmapError ? error.status : 502,
+        {
+          confirmedIds: [...markedIds],
+          unknownIds: batch.filter((id) => !reconciled.includes(id)),
+          unattemptedIds: ids.slice(start + batch.length),
+        },
+      )
+    }
     const result = responseFor(responses, 'mark-read')
     const notUpdated = result.notUpdated ?? {}
     const updated = new Set(Object.keys(result.updated ?? {}))
@@ -734,6 +772,7 @@ export async function markEmailsRead(
         failed.push({ id, reason: notUpdated[id].description ?? notUpdated[id].type })
       else failed.push({ id, reason: 'Fastmail hat die Änderung nicht bestätigt.' })
     }
+    onProgress?.({ failed: [...failed], markedIds: [...markedIds] })
   }
   return { failed, markedIds }
 }
@@ -742,21 +781,81 @@ function patchPathSegment(value: string) {
   return value.replaceAll('~', '~0').replaceAll('/', '~1')
 }
 
+async function reconcileMutation(
+  context: MailAccountContext,
+  token: string,
+  ids: readonly string[],
+  matches: (email: JmapEmail) => boolean,
+) {
+  try {
+    const emails: JmapEmail[] = []
+    for (let start = 0; start < ids.length; start += context.maxObjectsInGet) {
+      const result = await callJmap<JmapEmail>(context.apiUrl, token, [
+        [
+          'Email/get',
+          {
+            accountId: context.accountId,
+            ids: ids.slice(start, start + context.maxObjectsInGet),
+            properties: ['id', 'keywords', 'mailboxIds'],
+          },
+          'reconcile',
+        ],
+      ])
+      emails.push(...(responseFor(result, 'reconcile').list ?? []))
+    }
+    const requested = new Set(ids)
+    return emails
+      .filter((email) => requested.has(email.id) && matches(email))
+      .map((email) => email.id)
+  } catch {
+    // An unreadable remote outcome remains pending; never invent confirmation.
+    return []
+  }
+}
+
 async function updateMailboxMembership(
   context: MailAccountContext,
   token: string,
   ids: readonly string[],
   patch: Record<string, boolean | null>,
   callId: string,
+  onProgress?: (result: MailboxActionResult) => void,
 ): Promise<MailboxActionResult> {
   const failed: MailboxActionResult['failed'] = []
   const succeededIds: string[] = []
   for (let start = 0; start < ids.length; start += context.maxObjectsInSet) {
     const batch = ids.slice(start, start + context.maxObjectsInSet)
     const update = Object.fromEntries(batch.map((id) => [id, patch]))
-    const responses = await callJmap<never>(context.apiUrl, token, [
-      ['Email/set', { accountId: context.accountId, update }, callId],
-    ])
+    let responses: ResponseTuple<never>[]
+    try {
+      responses = await callJmap<never>(context.apiUrl, token, [
+        ['Email/set', { accountId: context.accountId, update }, callId],
+      ])
+    } catch (error) {
+      const reconciled = await reconcileMutation(context, token, batch, (email) =>
+        Object.entries(patch).every(([key, value]) => {
+          const mailboxId = key
+            .slice('mailboxIds/'.length)
+            .replaceAll('~1', '/')
+            .replaceAll('~0', '~')
+          return value === true
+            ? email.mailboxIds[mailboxId] === true
+            : !email.mailboxIds[mailboxId]
+        }),
+      )
+      succeededIds.push(...reconciled)
+      onProgress?.({ failed: [...failed], succeededIds: [...succeededIds] })
+      throw new JmapError(
+        'Fastmail hat nicht alle Postfachänderungen bestätigt. Bestätigte Änderungen bleiben gespeichert; prüfe unklare Ergebnisse vor einem erneuten Versuch.',
+        error instanceof JmapError ? error.code : 'JMAP_MUTATION_UNCONFIRMED',
+        error instanceof JmapError ? error.status : 502,
+        {
+          confirmedIds: [...succeededIds],
+          unknownIds: batch.filter((id) => !reconciled.includes(id)),
+          unattemptedIds: ids.slice(start + batch.length),
+        },
+      )
+    }
     const result = responseFor(responses, callId)
     const notUpdated = result.notUpdated ?? {}
     const updated = new Set(Object.keys(result.updated ?? {}))
@@ -766,6 +865,7 @@ async function updateMailboxMembership(
         failed.push({ id, reason: notUpdated[id].description ?? notUpdated[id].type })
       else failed.push({ id, reason: 'Fastmail hat die Änderung nicht bestätigt.' })
     }
+    onProgress?.({ failed: [...failed], succeededIds: [...succeededIds] })
   }
   return { failed, succeededIds }
 }
@@ -774,6 +874,7 @@ export async function moveEmailsOutOfSpam(
   context: MailAccountContext,
   token: string,
   ids: readonly string[],
+  onProgress?: (result: MailboxActionResult) => void,
 ): Promise<MailboxActionResult> {
   if (ids.length === 0) return { failed: [], succeededIds: [] }
   const mailboxes = await fetchMailboxes(context, token)
@@ -794,6 +895,7 @@ export async function moveEmailsOutOfSpam(
       [`mailboxIds/${patchPathSegment(inbox.id)}`]: true,
     },
     'not-spam',
+    onProgress,
   )
 }
 
@@ -837,6 +939,7 @@ export async function tagEmailsForLaterUnsubscribe(
   context: MailAccountContext,
   token: string,
   ids: readonly string[],
+  onProgress?: (result: MailboxActionResult) => void,
 ): Promise<MailboxActionResult> {
   if (ids.length === 0) return { failed: [], succeededIds: [] }
   const mailboxId = await deferredUnsubscribeMailboxId(context, token)
@@ -846,6 +949,7 @@ export async function tagEmailsForLaterUnsubscribe(
     ids,
     { [`mailboxIds/${patchPathSegment(mailboxId)}`]: true },
     'tag-unsubscribe',
+    onProgress,
   )
 }
 
@@ -863,10 +967,15 @@ export async function downloadBlob(
   context: MailAccountContext,
   token: string,
   resource: MailResource,
+  signal?: AbortSignal,
 ) {
-  const response = await fetch(
-    downloadUrl(context, resource.blobId, resource.name, resource.type),
-    { headers: { Authorization: `Bearer ${token}` } },
+  signal = ioSignal(120_000, signal)
+  const response = await abortable(
+    fetch(downloadUrl(context, resource.blobId, resource.name, resource.type), {
+      headers: { Authorization: `Bearer ${token}` },
+      signal,
+    }),
+    signal,
   )
   if (!response.ok) {
     throw new JmapError(

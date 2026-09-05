@@ -32,6 +32,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Check release version and dependency advisories
+        run: |
+          pnpm exec tsx scripts/check-release-version.ts
+          pnpm exec tsx scripts/check-advisories.ts
+
       - name: Run static and unit checks
         run: pnpm check
 
@@ -42,7 +47,9 @@ jobs:
         run: pnpm exec playwright install --with-deps chromium
 
       - name: Run browser tests
-        run: pnpm test:e2e
+        run: |
+          pnpm exec tsx scripts/check-e2e-isolation.ts
+          pnpm test:e2e
 
   container:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
@@ -87,6 +94,17 @@ jobs:
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build runtime candidate
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: inbox-walk:ci-candidate
+
+      - name: Boot non-root Node 24 runtime in demo mode
+        run: bash scripts/smoke-container.sh inbox-walk:ci-candidate
 
       - name: Build and publish image
         uses: docker/build-push-action@v7

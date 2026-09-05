@@ -11,4 +11,4 @@ playwright-report
 test-results
 *.log
 docs
-e2e
+project-review.html

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { MailIdentity, MailResource, ThreadMessage } from '../src/shared.ts'
 import {
   appendSignature,
@@ -15,6 +15,11 @@ const identity: MailIdentity = {
   textSignature: 'Viele Grüße\nAlex',
   htmlSignature: '',
 }
+
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
 
 const message: ThreadMessage = {
   id: 'mail-1',
@@ -44,6 +49,153 @@ const message: ThreadMessage = {
 }
 
 describe('reply construction', () => {
+  const context = {
+    accountId: 'account-1',
+    apiUrl: 'https://api.example/jmap',
+    downloadUrl: 'https://api.example/{blobId}',
+    maxObjectsInGet: 10,
+    maxObjectsInSet: 10,
+    username: 'alex@example.com',
+  }
+  const request = { requestId: 'fixture', roughNotes: 'Bestätigen.' }
+  const document = { blobId: 'document', name: 'brief.pdf', type: 'application/pdf', size: 8 }
+
+  it('uses the outgoing sender identity and its signature when continuing a thread', () => {
+    const second = {
+      ...identity,
+      id: 'identity-2',
+      email: 'second@example.com',
+      textSignature: 'Second signature',
+    }
+    const recipients = computeReplyRecipients(
+      {
+        ...message,
+        from: [{ name: 'Second', email: second.email }],
+        to: [{ name: 'Mara', email: 'mara@example.com' }],
+      },
+      [identity, second],
+    )
+    expect(recipients).toMatchObject({
+      identityId: second.id,
+      from: { email: second.email },
+      to: [{ email: 'mara@example.com' }],
+      cc: [{ email: 'kai@example.com' }],
+    })
+    expect(appendSignature('Reply', second)).toBe('Reply\n\nSecond signature')
+  })
+
+  it('rejects a truncated older body before any download, extraction or inference', async () => {
+    const dependencies = { download: vi.fn(), extractDocument: vi.fn(), runCodex: vi.fn() }
+    await expect(
+      generateReply(
+        context,
+        'fixture',
+        [
+          { ...message, bodyTruncated: true, attachments: [document] },
+          { ...message, id: 'latest' },
+        ],
+        request,
+        dependencies,
+      ),
+    ).rejects.toMatchObject({ code: 'INCOMPLETE_THREAD' })
+    for (const call of Object.values(dependencies)) expect(call).not.toHaveBeenCalled()
+  })
+
+  it.each(['failed', 'empty', 'large', 'interrupted'] as const)(
+    'rejects %s attachment processing before inference',
+    async (failure) => {
+      const runCodex = vi.fn()
+      const download = vi.fn(async () =>
+        failure === 'interrupted'
+          ? new Response(
+              new ReadableStream({
+                start(controller) {
+                  controller.error(new Error('interrupted'))
+                },
+              }),
+            )
+          : new Response('pdf-data'),
+      )
+      const extractDocument = vi.fn(async () => {
+        if (failure === 'failed') throw new Error('extractor failed')
+        return failure === 'empty' ? '' : 'x'.repeat(1_000_001)
+      })
+      await expect(
+        generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+          download,
+          extractDocument,
+          runCodex,
+        }),
+      ).rejects.toBeInstanceOf(ReplyError)
+      expect(runCodex).not.toHaveBeenCalled()
+    },
+  )
+
+  it('cancels an extraction that never settles without calling the provider', async () => {
+    const runCodex = vi.fn()
+    const { withIoDeadline } = await import('./io.ts')
+    const pending = withIoDeadline(
+      () =>
+        generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+          download: async () => new Response('pdf'),
+          extractDocument: () => new Promise(() => {}),
+          runCodex,
+        }),
+      15,
+    )
+    await expect(pending).rejects.toMatchObject({ code: 'ATTACHMENT_EXTRACTION_TIMEOUT' })
+    expect(runCodex).not.toHaveBeenCalled()
+  })
+
+  it('bounds actual attachment bytes before buffering a falsely small manifest', async () => {
+    const runCodex = vi.fn()
+    let cancelled = false
+    let chunks = 0
+    const download = async () =>
+      new Response(
+        new ReadableStream({
+          pull(controller) {
+            chunks += 1
+            controller.enqueue(new Uint8Array(1024 * 1024))
+          },
+          cancel() {
+            cancelled = true
+          },
+        }),
+      )
+    await expect(
+      generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+        download,
+        runCodex,
+      }),
+    ).rejects.toMatchObject({ code: 'ATTACHMENTS_TOO_LARGE' })
+    expect(cancelled).toBe(true)
+    expect(chunks).toBeLessThan(49)
+    expect(runCodex).not.toHaveBeenCalled()
+  })
+
+  it.each(['failure', 'empty', 'oversized'] as const)(
+    'checks %s Tika responses through the actual adapter',
+    async (kind) => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(
+          async () =>
+            new Response(kind === 'oversized' ? 'x'.repeat(1_000_001) : '', {
+              status: kind === 'failure' ? 502 : 200,
+            }),
+        ),
+      )
+      const runCodex = vi.fn()
+      await expect(
+        generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+          download: async () => new Response('pdf'),
+          runCodex,
+        }),
+      ).rejects.toBeInstanceOf(ReplyError)
+      expect(runCodex).not.toHaveBeenCalled()
+    },
+  )
   it('computes reply-all while excluding every own identity', () => {
     expect(computeReplyRecipients(message, [identity])).toMatchObject({
       identityId: 'identity-1',
@@ -157,7 +309,7 @@ describe('reply construction', () => {
     },
   )
 
-  it('includes every supported attachment and fails closed through injected processing', async () => {
+  it('includes all supported documents and images in the injected provider input', async () => {
     const withAttachments: ThreadMessage = {
       ...message,
       hasAttachment: true,

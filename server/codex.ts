@@ -214,6 +214,17 @@ function hasStoredAuth(file: string) {
   }
 }
 
+export function isolatedResourceOptions() {
+  return {
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    appendSystemPrompt: [] as string[],
+  }
+}
+
 export function codexAuthStoragePath() {
   const dataDir = process.env.DATA_DIR ?? path.resolve('data')
   const persistentPath = path.join(dataDir, 'pi', 'auth.json')
@@ -313,11 +324,7 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: input.systemPrompt,
   })
   await resourceLoader.reload()
@@ -453,48 +460,50 @@ const bundleBatchToolSchema = Type.Object(
   { additionalProperties: false },
 )
 
-const bundlePartitionToolSchema = Type.Object(
-  {
-    stories: Type.Array(
-      Type.Object(
-        {
-          emailIds: Type.Array(Type.String({ maxLength: 512 }), {
-            description: 'Exact IDs from emails. Each story must contain at least two unique IDs.',
-            maxItems: 10_000,
-            minItems: 2,
-            uniqueItems: true,
-          }),
-          kind: Type.Union(
-            [
-              Type.Literal('development_workstream'),
-              Type.Literal('order_delivery'),
-              Type.Literal('incident'),
-              Type.Literal('conversation'),
-              Type.Literal('standalone'),
-            ],
-            {
+export const bundlePartitionToolSchema = (snapshotSize: number) =>
+  Type.Object(
+    {
+      stories: Type.Array(
+        Type.Object(
+          {
+            emailIds: Type.Array(Type.String({ maxLength: 512 }), {
               description:
-                'order_delivery for an order lifecycle; development_workstream for repository, CI, or deployment work; incident for an operational incident; conversation for a commission or human exchange; otherwise standalone.',
-            },
-          ),
-          title: Type.String({ maxLength: 500 }),
-          currentState: Type.String({ maxLength: 500 }),
-          summary: Type.String({ maxLength: 4_000 }),
-          linkEvidence: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 100 }),
-          membershipConfidence: Type.Number({ minimum: 0, maximum: 1 }),
-        },
-        { additionalProperties: false },
+                'Exact IDs from emails. Each story must contain at least two unique IDs.',
+              maxItems: snapshotSize,
+              minItems: 2,
+              uniqueItems: true,
+            }),
+            kind: Type.Union(
+              [
+                Type.Literal('development_workstream'),
+                Type.Literal('order_delivery'),
+                Type.Literal('incident'),
+                Type.Literal('conversation'),
+                Type.Literal('standalone'),
+              ],
+              {
+                description:
+                  'order_delivery for an order lifecycle; development_workstream for repository, CI, or deployment work; incident for an operational incident; conversation for a commission or human exchange; otherwise standalone.',
+              },
+            ),
+            title: Type.String({ maxLength: 500 }),
+            currentState: Type.String({ maxLength: 500 }),
+            summary: Type.String({ maxLength: 4_000 }),
+            linkEvidence: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 100 }),
+            membershipConfidence: Type.Number({ minimum: 0, maximum: 1 }),
+          },
+          { additionalProperties: false },
+        ),
+        { maxItems: snapshotSize },
       ),
-      { maxItems: 10_000 },
-    ),
-    standaloneEmailIds: Type.Array(Type.String({ maxLength: 512 }), {
-      description: 'Every email ID that does not belong to a multi-email story.',
-      maxItems: 10_000,
-      uniqueItems: true,
-    }),
-  },
-  { additionalProperties: false },
-)
+      standaloneEmailIds: Type.Array(Type.String({ maxLength: 512 }), {
+        description: 'Every email ID that does not belong to a multi-email story.',
+        maxItems: snapshotSize,
+        uniqueItems: true,
+      }),
+    },
+    { additionalProperties: false },
+  )
 
 function bundleEmailSummary(email: BundleDecisionInput['seed'][number]) {
   return {
@@ -639,11 +648,7 @@ export async function runCodexBundleDecision(
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: bundleDecisionSystemPrompt(false),
   })
   await resourceLoader.reload()
@@ -766,11 +771,7 @@ export async function runCodexBundleDecisionBatch(
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: bundleDecisionSystemPrompt(true),
   })
   await resourceLoader.reload()
@@ -886,7 +887,7 @@ export async function runCodexBundlePartition(
     label: 'Globale Gruppierung übernehmen',
     description:
       'Submit one complete partition of every supplied email ID into multi-email stories and standalone IDs.',
-    parameters: bundlePartitionToolSchema,
+    parameters: bundlePartitionToolSchema(input.emails.length),
     async execute(_callId, args) {
       submitted.push(args)
       return finalCodexToolResult('Globale Gruppierung übernommen.')
@@ -903,11 +904,7 @@ export async function runCodexBundlePartition(
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: bundlePartitionSystemPrompt(),
   })
   await resourceLoader.reload()

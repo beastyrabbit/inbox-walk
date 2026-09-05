@@ -9,6 +9,7 @@ import type {
   ThreadMessage,
 } from '../src/shared.ts'
 import { type CodexReplyInput, runCodexReply } from './codex.ts'
+import { abortable, IoError, ioSignal, readBoundedBody } from './io.ts'
 import { downloadBlob, type MailAccountContext } from './jmap.ts'
 
 const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024
@@ -102,7 +103,10 @@ export function computeReplyRecipients(
   const addressedIdentity = concreteIdentities.find((identity) =>
     [...target.to, ...target.cc].some((address) => identityMatches(identity, address.email)),
   )
-  const identity = addressedIdentity ?? concreteIdentities[0]
+  const outgoingIdentity = concreteIdentities.find((identity) =>
+    target.from.some((address) => identityMatches(identity, address.email)),
+  )
+  const identity = outgoingIdentity ?? addressedIdentity ?? concreteIdentities[0]
   const own = new Set(concreteIdentities.map((item) => normalizeEmail(item.email)))
   const targetFromIsSelf = target.from.some((address) =>
     concreteIdentities.some((item) => identityMatches(item, address.email)),
@@ -174,27 +178,55 @@ interface PreparedAttachments {
 
 interface ReplyDependencies {
   download?: typeof downloadBlob
-  extractDocument?: (resource: MailResource, bytes: Buffer, timeoutMs: number) => Promise<string>
+  extractDocument?: (
+    resource: MailResource,
+    bytes: Buffer,
+    timeoutMs: number,
+    signal: AbortSignal,
+    maximumCharacters: number,
+  ) => Promise<string>
   runCodex?: (input: CodexReplyInput) => Promise<unknown>
 }
 
-async function extractWithTika(resource: MailResource, bytes: Buffer, timeoutMs: number) {
+async function extractWithTika(
+  resource: MailResource,
+  bytes: Buffer,
+  timeoutMs: number,
+  signal: AbortSignal,
+  maximumCharacters: number,
+) {
   const tikaUrl = process.env.TIKA_URL?.trim().replace(/\/$/, '') || 'http://127.0.0.1:9998'
   const mime = resource.type.toLowerCase().split(';')[0]?.trim() || 'application/octet-stream'
   let response: Response
-  const timeoutSignal = AbortSignal.timeout(Math.max(1, Math.min(120_000, timeoutMs)))
+  const timeoutSignal = ioSignal(Math.max(1, Math.min(120_000, timeoutMs)), signal)
+  let text: string
   try {
-    response = await fetch(`${tikaUrl}/tika`, {
-      method: 'PUT',
-      headers: {
-        Accept: 'text/plain',
-        'Content-Type': mime,
-        'X-Tika-PDFOcrStrategy': 'ocr_and_text',
-      },
-      body: new Uint8Array(bytes),
-      signal: timeoutSignal,
-    })
-  } catch {
+    response = await abortable(
+      fetch(`${tikaUrl}/tika`, {
+        method: 'PUT',
+        headers: {
+          Accept: 'text/plain',
+          'Content-Type': mime,
+          'X-Tika-PDFOcrStrategy': 'ocr_and_text',
+        },
+        body: new Uint8Array(bytes),
+        signal: timeoutSignal,
+      }),
+      timeoutSignal,
+    )
+    if (!response.ok) throw new Error('Tika extraction failed')
+    text = (await readBoundedBody(response, maximumCharacters * 4, timeoutSignal))
+      .toString('utf8')
+      .replaceAll('\u0000', '')
+      .trim()
+    if (text.length > maximumCharacters)
+      throw new IoError('Extracted text exceeds the context budget.', 'RESPONSE_TOO_LARGE')
+  } catch (error) {
+    if (error instanceof IoError && error.code === 'RESPONSE_TOO_LARGE')
+      throw new ReplyError(
+        'Der extrahierte Anhang überschreitet das sichere Textlimit.',
+        'THREAD_TOO_LARGE_FOR_AI',
+      )
     if (timeoutSignal.aborted) {
       throw new ReplyError(
         `Das Auslesen des Anhangs „${resource.name}“ hat das Zeitlimit überschritten.`,
@@ -220,7 +252,6 @@ async function extractWithTika(resource: MailResource, bytes: Buffer, timeoutMs:
       true,
     )
   }
-  const text = (await response.text()).replaceAll('\u0000', '').trim()
   if (bytes.length > 0 && !text) {
     throw new ReplyError(
       `Der Anhang „${resource.name}“ enthält keinen zuverlässig extrahierbaren Text.`,
@@ -245,9 +276,35 @@ async function prepareAttachments(
   const download = dependencies.download ?? downloadBlob
   const extractDocument = dependencies.extractDocument ?? extractWithTika
   const extractionDeadline = Date.now() + MAX_ATTACHMENT_EXTRACTION_MS
+  const signal = ioSignal(MAX_ATTACHMENT_EXTRACTION_MS)
+  let remainingCharacters = 1_000_000
   for (const resource of resources) {
-    const response = await download(context, token, resource)
-    const bytes = Buffer.from(await response.arrayBuffer())
+    const mime = resource.type.toLowerCase().split(';')[0]?.trim() || 'application/octet-stream'
+    let bytes: Buffer
+    try {
+      const response = await abortable(download(context, token, resource, signal), signal)
+      bytes = await readBoundedBody(
+        response,
+        Math.min(
+          MAX_ATTACHMENT_BYTES - actualBytes,
+          IMAGE_TYPES.has(mime) ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES,
+        ),
+        signal,
+      )
+    } catch (error) {
+      if (error instanceof IoError && error.code === 'RESPONSE_TOO_LARGE')
+        throw new ReplyError(
+          'Die Anhänge überschreiten das sichere Größenlimit.',
+          'ATTACHMENTS_TOO_LARGE',
+        )
+      throw new ReplyError(
+        'Ein Anhang konnte nicht vollständig innerhalb des Zeitlimits geladen werden.',
+        signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_DOWNLOAD_FAILED',
+        undefined,
+        signal.aborted ? 504 : 502,
+        true,
+      )
+    }
     actualBytes += bytes.length
     if (actualBytes > MAX_ATTACHMENT_BYTES) {
       throw new ReplyError(
@@ -256,7 +313,6 @@ async function prepareAttachments(
         { bytes: actualBytes, limit: MAX_ATTACHMENT_BYTES },
       )
     }
-    const mime = resource.type.toLowerCase().split(';')[0]?.trim() || 'application/octet-stream'
     if (IMAGE_TYPES.has(mime)) {
       if (bytes.length > MAX_IMAGE_BYTES) {
         throw new ReplyError(
@@ -277,10 +333,37 @@ async function prepareAttachments(
           504,
         )
       }
+      let text: string
+      try {
+        text = await abortable(
+          extractDocument(resource, bytes, extractionTimeRemaining, signal, remainingCharacters),
+          signal,
+        )
+      } catch (error) {
+        if (error instanceof ReplyError) throw error
+        throw new ReplyError(
+          'Ein Anhang konnte nicht vollständig ausgelesen werden.',
+          signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_EXTRACTION_FAILED',
+          undefined,
+          signal.aborted ? 504 : 502,
+          true,
+        )
+      }
+      if (bytes.length > 0 && !text.trim())
+        throw new ReplyError(
+          'Ein Anhang enthält keinen zuverlässig extrahierbaren Text.',
+          'ATTACHMENT_EXTRACTION_EMPTY',
+        )
+      remainingCharacters -= text.length
+      if (remainingCharacters < 0)
+        throw new ReplyError(
+          'Die Anhänge überschreiten das sichere Textlimit.',
+          'THREAD_TOO_LARGE_FOR_AI',
+        )
       documents.push({
         name: resource.name,
         type: mime,
-        text: await extractDocument(resource, bytes, extractionTimeRemaining),
+        text,
       })
     }
   }
@@ -375,6 +458,12 @@ export async function generateReply(
   request: ReplyRequest,
   dependencies: ReplyDependencies = {},
 ): Promise<ReplyProposal> {
+  if (messages.some((message) => message.bodyTruncated)) {
+    throw new ReplyError(
+      'Mindestens eine Thread-Nachricht ist unvollständig. Es wurde kein Entwurf erzeugt.',
+      'INCOMPLETE_THREAD',
+    )
+  }
   const resources = allAttachments(messages)
   const attachments = await prepareAttachments(context, token, resources, dependencies)
   const inputText = JSON.stringify({

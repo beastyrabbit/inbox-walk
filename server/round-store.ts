@@ -20,7 +20,7 @@ import {
   type BundleExample,
   type BundlePartitionDecision,
   hashLearningSignal,
-  validateBundlePartitionDecisionShape,
+  validateBundleDecisionPartition,
 } from './bundles.ts'
 
 const { DatabaseSync } = createRequire(import.meta.url)(
@@ -449,12 +449,14 @@ function cleanReplyDraft(draft: ReplyEditorState): ReplyEditorState {
   return {
     bodyText: draft.bodyText,
     cc: draft.cc.map(cleanAddress),
+    ...(draft.ccText === undefined ? {} : { ccText: draft.ccText }),
     ...(draft.draftRequestId === undefined ? {} : { draftRequestId: draft.draftRequestId }),
     identityId: draft.identityId,
     revisionInstruction: draft.revisionInstruction,
     roughNotes: draft.roughNotes,
     subject: draft.subject,
     to: draft.to.map(cleanAddress),
+    ...(draft.toText === undefined ? {} : { toText: draft.toText }),
   }
 }
 
@@ -521,8 +523,11 @@ function cleanBundleDecision(decision: BundleDecision): BundleDecision {
   }
 }
 
-function cleanBundlePartition(decision: unknown): BundlePartitionDecision {
-  validateBundlePartitionDecisionShape(decision)
+function cleanBundlePartition(
+  decision: unknown,
+  snapshotIds: readonly string[],
+): BundlePartitionDecision {
+  validateBundleDecisionPartition(snapshotIds, decision)
   return {
     standaloneEmailIds: [...decision.standaloneEmailIds],
     stories: decision.stories.map((story) => ({
@@ -1413,7 +1418,12 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
         | { decision_json: string }
         | undefined
       return row
-        ? cleanBundlePartition(jsonParse<BundlePartitionDecision>(row.decision_json))
+        ? cleanBundlePartition(
+            jsonParse<BundlePartitionDecision>(row.decision_json),
+            (selectMessages.all(roundId) as unknown as MessageRow[]).map(
+              (message) => message.email_id,
+            ),
+          )
         : null
     },
     get,
@@ -1610,7 +1620,10 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
     },
     saveBundlePartition(roundId, decisionKey, decision, expectedGeneration) {
       assertNonEmpty(decisionKey, 'Bundle partition key')
-      const clean = cleanBundlePartition(decision)
+      const clean = cleanBundlePartition(
+        decision,
+        (selectMessages.all(roundId) as unknown as MessageRow[]).map((message) => message.email_id),
+      )
       const now = new Date().toISOString()
       const saved = transaction(() => {
         const row = selectRound.get(roundId) as RoundRow | undefined
@@ -1627,7 +1640,12 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
         | { decision_json: string }
         | undefined
       return persisted
-        ? cleanBundlePartition(jsonParse<BundlePartitionDecision>(persisted.decision_json))
+        ? cleanBundlePartition(
+            jsonParse<BundlePartitionDecision>(persisted.decision_json),
+            (selectMessages.all(roundId) as unknown as MessageRow[]).map(
+              (message) => message.email_id,
+            ),
+          )
         : null
     },
     saveBundleRun(roundId, bundleRun, analysisPatch = {}, expectedGeneration) {

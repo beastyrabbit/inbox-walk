@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { Readable } from 'node:stream'
+import { Readable, Transform } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { z } from 'zod'
 import type {
@@ -57,6 +57,7 @@ import {
   selectedCodexSettings,
 } from './codex.ts'
 import { demoEmails } from './demo.ts'
+import { IoError, ioSignal, withIoDeadline } from './io.ts'
 import {
   createAndVerifyDraft,
   downloadBlob,
@@ -127,12 +128,14 @@ const replyEditorAddressSchema = z.object({
 const replyEditorSchema = z.object({
   bodyText: z.string().max(256_000),
   cc: z.array(replyEditorAddressSchema).max(100),
+  ccText: z.string().max(64_000).optional(),
   draftRequestId: z.string().uuid().optional(),
   identityId: z.string().max(512),
   revisionInstruction: z.string().max(64_000),
   roughNotes: z.string().max(64_000),
   subject: z.string().max(998),
   to: z.array(replyEditorAddressSchema).max(100),
+  toText: z.string().max(64_000).optional(),
 })
 
 interface StoredSnapshot {
@@ -313,14 +316,19 @@ function validateOrigin(req: IncomingMessage) {
   }
 }
 
+function ownsRoundWork(snapshot: StoredSnapshot) {
+  return (
+    snapshot.finalizationState === 'finalizing' ||
+    snapshot.nonAbortableRequests > 0 ||
+    snapshot.replyInFlight.size > 0 ||
+    snapshot.draftWork.size > 0
+  )
+}
+
 function pruneSnapshots() {
   const cutoff = Date.now() - SNAPSHOT_TTL_MS
   for (const [id, snapshot] of snapshots) {
-    if (
-      snapshot.lastAccessedAt < cutoff &&
-      !bundleJobs.has(id) &&
-      snapshot.finalizationState !== 'finalizing'
-    )
+    if (snapshot.lastAccessedAt < cutoff && !bundleJobs.has(id) && !ownsRoundWork(snapshot))
       snapshots.delete(id)
   }
   if (snapshots.size <= MAX_SNAPSHOTS) return
@@ -331,7 +339,7 @@ function pruneSnapshots() {
   for (const [id] of oldest) {
     if (remaining <= 0) break
     const snapshot = snapshots.get(id)
-    if (bundleJobs.has(id) || snapshot?.finalizationState === 'finalizing') continue
+    if (bundleJobs.has(id) || (snapshot && ownsRoundWork(snapshot))) continue
     snapshots.delete(id)
     remaining -= 1
   }
@@ -2755,6 +2763,27 @@ async function finalize(
     const pendingSecondaryActions = [...requestedSecondaryAction].filter(
       (id) => !snapshot.secondaryActionSucceededIds.has(id),
     )
+    const persistProgress = () =>
+      persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
+        secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
+        succeededIds: [...snapshot.succeededIds],
+        actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({ id, reason })),
+        state: 'finalizing',
+      })
+    const recordAction = (action: Awaited<ReturnType<typeof moveEmailsOutOfSpam>>) => {
+      for (const id of action.succeededIds) {
+        snapshot.secondaryActionSucceededIds.add(id)
+        snapshot.secondaryActionFailures.delete(id)
+      }
+      for (const failure of action.failed)
+        snapshot.secondaryActionFailures.set(failure.id, failure.reason)
+      persistProgress()
+    }
+    const recordRead = (update: Awaited<ReturnType<typeof markEmailsRead>>) => {
+      for (const id of update.markedIds) snapshot.succeededIds.add(id)
+      persistProgress()
+      updateReviewHistory(apiOptions.reviewHistory, requestedKeep, update.markedIds)
+    }
     if (pendingSecondaryActions.length > 0) {
       const action =
         snapshot.filters.spam === 'only'
@@ -2762,23 +2791,23 @@ async function finalize(
               snapshot.context,
               token,
               pendingSecondaryActions,
+              recordAction,
             )
           : await (apiOptions.tagForLaterUnsubscribe ?? tagEmailsForLaterUnsubscribe)(
               snapshot.context,
               token,
               pendingSecondaryActions,
+              recordAction,
             )
-      for (const id of action.succeededIds) {
-        snapshot.secondaryActionSucceededIds.add(id)
-        snapshot.secondaryActionFailures.delete(id)
-      }
-      for (const failure of action.failed) {
-        snapshot.secondaryActionFailures.set(failure.id, failure.reason)
-      }
+      recordAction(action)
     }
-    const update = await (apiOptions.markRead ?? markEmailsRead)(snapshot.context, token, toMark)
-    for (const id of update.markedIds) snapshot.succeededIds.add(id)
-    updateReviewHistory(apiOptions.reviewHistory, requestedKeep, update.markedIds)
+    const update = await (apiOptions.markRead ?? markEmailsRead)(
+      snapshot.context,
+      token,
+      toMark,
+      recordRead,
+    )
+    recordRead(update)
     const remainingRead = [...requestedFinalize].filter(
       (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
     ).length
@@ -2848,7 +2877,8 @@ async function blob(
   const token = apiOptions.fastmailToken?.trim()
   if (!token || !snapshot.context)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-  const upstream = await downloadBlob(snapshot.context, token, resource)
+  const signal = ioSignal(120_000)
+  const upstream = await downloadBlob(snapshot.context, token, resource, signal)
   if (!upstream.body)
     throw new ApiHttpError(502, 'EMPTY_BLOB', 'Fastmail hat keine Dateidaten geliefert.', true)
   const inline =
@@ -2862,9 +2892,25 @@ async function blob(
     `${inline ? 'inline' : 'attachment'}; filename*=UTF-8''${encodeURIComponent(resource.name.slice(0, 240))}`,
   )
   const contentLength = upstream.headers.get('content-length')
+  if (Number(contentLength) > MAX_DOWNLOAD_BYTES) {
+    void upstream.body.cancel().catch(() => {})
+    throw new ApiHttpError(413, 'BLOB_TOO_LARGE', 'Datei ist größer als 100 MiB.')
+  }
   if (contentLength) res.setHeader('Content-Length', contentLength)
   try {
-    await pipeline(Readable.fromWeb(upstream.body as never), res)
+    let size = 0
+    const bound = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        size += chunk.length
+        callback(
+          size > MAX_DOWNLOAD_BYTES
+            ? new IoError('Datei ist größer als 100 MiB.', 'BLOB_TOO_LARGE')
+            : null,
+          chunk,
+        )
+      },
+    })
+    await pipeline(Readable.fromWeb(upstream.body as never), bound, res, { signal })
   } catch (error) {
     process.stderr.write(
       `${JSON.stringify({ event: 'blob_stream_error', message: error instanceof Error ? error.message : 'unknown' })}\n`,
@@ -3084,152 +3130,173 @@ function handleError(res: ServerResponse, error: unknown) {
   }
   if (error instanceof JmapError) {
     const status = error.status === 401 ? 401 : error.status === 404 ? 404 : 502
-    return apiError(res, status, error.code, error.message, status >= 500)
+    return apiError(res, status, error.code, error.message, status >= 500, error.details)
   }
   if (error instanceof ReplyError) {
     return apiError(res, error.status, error.code, error.message, error.retryable, error.details)
+  }
+  if (
+    error instanceof IoError ||
+    (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name))
+  ) {
+    return apiError(
+      res,
+      504,
+      error instanceof IoError ? error.code : 'IO_TIMEOUT',
+      'Der externe Abruf konnte nicht innerhalb der sicheren Grenzen abgeschlossen werden. Bestätigte Änderungen bleiben gespeichert.',
+      true,
+    )
   }
   return apiError(res, 500, 'INTERNAL_ERROR', 'Ein interner Fehler ist aufgetreten.', true)
 }
 
 export function createApiMiddleware(apiOptions: ApiOptions = {}) {
-  return async (req: IncomingMessage, res: ServerResponse, next: () => void) => {
-    if (!req.url?.startsWith('/api/')) return next()
-    const url = new URL(req.url, 'http://localhost')
-    const parts = url.pathname.split('/').filter(Boolean)
-    try {
-      if (req.method === 'GET' && url.pathname === '/api/auth/codex/status') {
-        return json(
-          res,
-          200,
-          apiOptions.forceDemo
-            ? { configured: false, ...selectedCodexSettings() }
-            : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
-        )
-      }
-      if (req.method === 'GET' && url.pathname === '/api/settings/codex') {
-        return json(
-          res,
-          200,
-          apiOptions.forceDemo
-            ? { configured: false, ...selectedCodexSettings() }
-            : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
-        )
-      }
-      if (
-        (req.method === 'POST' || req.method === 'PUT') &&
-        url.pathname === '/api/settings/codex'
-      ) {
-        validateOrigin(req)
-        if (apiOptions.forceDemo) {
-          throw new ApiHttpError(403, 'DEMO_MODE', 'Codex-Einstellungen sind im Demo-Modus fest.')
+  return (req: IncomingMessage, res: ServerResponse, next: () => void) =>
+    withIoDeadline(async () => {
+      if (!req.url?.startsWith('/api/')) return next()
+      const url = new URL(req.url, 'http://localhost')
+      const parts = url.pathname.split('/').filter(Boolean)
+      try {
+        if (req.method === 'GET' && url.pathname === '/api/auth/codex/status') {
+          return json(
+            res,
+            200,
+            apiOptions.forceDemo
+              ? { configured: false, ...selectedCodexSettings() }
+              : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
+          )
         }
-        const parsed = codexSettingsSchema.safeParse(await readJson(req))
-        if (!parsed.success) {
-          throw new ApiHttpError(400, 'INVALID_CODEX_SETTINGS', 'Ungültige Codex-Einstellungen.')
+        if (req.method === 'GET' && url.pathname === '/api/settings/codex') {
+          return json(
+            res,
+            200,
+            apiOptions.forceDemo
+              ? { configured: false, ...selectedCodexSettings() }
+              : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
+          )
         }
-        return json(res, 200, (apiOptions.codexSettingsSelect ?? selectCodexSettings)(parsed.data))
-      }
-      if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
-        validateOrigin(req)
-        return await startCodexLogin(res, apiOptions)
-      }
-      if (req.method === 'POST' && url.pathname === '/api/auth/codex/model') {
-        validateOrigin(req)
-        if (apiOptions.forceDemo)
-          throw new ApiHttpError(403, 'DEMO_MODE', 'Das Codex-Modell ist im Demo-Modus fest.')
-        const parsed = codexModelSchema.safeParse(await readJson(req))
-        if (!parsed.success)
-          throw new ApiHttpError(400, 'INVALID_CODEX_MODEL', 'Unbekanntes Codex-Modell.')
-        return json(res, 200, (apiOptions.codexModelSelect ?? selectCodexModel)(parsed.data.model))
-      }
-      if (
-        req.method === 'GET' &&
-        parts[0] === 'api' &&
-        parts[1] === 'auth' &&
-        parts[2] === 'codex' &&
-        parts[3]
-      ) {
-        return codexLoginState(res, parts[3])
-      }
-      if (req.method === 'GET' && url.pathname === '/api/review/options') {
-        return await options(res, apiOptions)
-      }
-      if (req.method === 'GET' && url.pathname === '/api/reviews') {
-        validateOrigin(req)
-        return listReviews(res, apiOptions)
-      }
-      if (req.method === 'POST' && url.pathname === '/api/reviews') {
-        validateOrigin(req)
-        return await createReview(res, await readJson(req), apiOptions)
-      }
-      if (req.method === 'POST' && url.pathname === '/api/reviews/resume') {
-        validateOrigin(req)
-        return await resumeReview(res, await readJson(req, MAX_SELECTION_JSON_BYTES), apiOptions)
-      }
-      if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
-        const snapshotId = parts[2]
-        if (req.method === 'DELETE' && !parts[3]) {
-          return deleteReview(req, res, snapshotId, apiOptions)
-        }
-        if (req.method === 'POST' && parts[3] === 'reanalyze' && !parts[4]) {
-          return reanalyzeReview(req, res, snapshotId, apiOptions)
-        }
-        if (req.method === 'GET' && !parts[3] && apiOptions.roundStore) {
-          resumeIncompleteRuns(apiOptions)
-        }
-        requireReadyStoredRound(snapshotId, apiOptions)
-        await ensureSnapshot(snapshotId, apiOptions)
-        if (req.method === 'GET' && !parts[3]) {
+        if (
+          (req.method === 'POST' || req.method === 'PUT') &&
+          url.pathname === '/api/settings/codex'
+        ) {
           validateOrigin(req)
-          const snapshot = getSnapshot(snapshotId)
-          return json(res, 200, snapshotPayload(snapshotId, snapshot))
+          if (apiOptions.forceDemo) {
+            throw new ApiHttpError(403, 'DEMO_MODE', 'Codex-Einstellungen sind im Demo-Modus fest.')
+          }
+          const parsed = codexSettingsSchema.safeParse(await readJson(req))
+          if (!parsed.success) {
+            throw new ApiHttpError(400, 'INVALID_CODEX_SETTINGS', 'Ungültige Codex-Einstellungen.')
+          }
+          return json(
+            res,
+            200,
+            (apiOptions.codexSettingsSelect ?? selectCodexSettings)(parsed.data),
+          )
+        }
+        if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
+          validateOrigin(req)
+          return await startCodexLogin(res, apiOptions)
+        }
+        if (req.method === 'POST' && url.pathname === '/api/auth/codex/model') {
+          validateOrigin(req)
+          if (apiOptions.forceDemo)
+            throw new ApiHttpError(403, 'DEMO_MODE', 'Das Codex-Modell ist im Demo-Modus fest.')
+          const parsed = codexModelSchema.safeParse(await readJson(req))
+          if (!parsed.success)
+            throw new ApiHttpError(400, 'INVALID_CODEX_MODEL', 'Unbekanntes Codex-Modell.')
+          return json(
+            res,
+            200,
+            (apiOptions.codexModelSelect ?? selectCodexModel)(parsed.data.model),
+          )
         }
         if (
           req.method === 'GET' &&
-          parts[3] === 'emails' &&
-          parts[4] &&
-          parts[5] === 'images' &&
-          parts[6]
+          parts[0] === 'api' &&
+          parts[1] === 'auth' &&
+          parts[2] === 'codex' &&
+          parts[3]
         ) {
-          return await remoteImage(res, url, snapshotId, parts[4], parts[6])
+          return codexLoginState(res, parts[3])
         }
-        if (req.method === 'GET' && parts[3] === 'emails' && parts[4] && !parts[5]) {
-          return await emailDetail(res, snapshotId, parts[4], apiOptions)
+        if (req.method === 'GET' && url.pathname === '/api/review/options') {
+          return await options(res, apiOptions)
         }
-        if (req.method === 'GET' && parts[3] === 'threads' && parts[4]) {
-          return await threadContext(
-            res,
-            snapshotId,
-            parts[4],
-            url.searchParams.get('emailId') ?? '',
-            apiOptions,
-          )
+        if (req.method === 'GET' && url.pathname === '/api/reviews') {
+          validateOrigin(req)
+          return listReviews(res, apiOptions)
         }
-        if (req.method === 'GET' && parts[3] === 'blobs' && parts[4]) {
-          return await blob(res, url, snapshotId, parts[4], apiOptions)
+        if (req.method === 'POST' && url.pathname === '/api/reviews') {
+          validateOrigin(req)
+          return await createReview(res, await readJson(req), apiOptions)
         }
-        if (req.method === 'POST' && parts[3] === 'finalize') {
-          return await finalize(req, res, snapshotId, apiOptions)
+        if (req.method === 'POST' && url.pathname === '/api/reviews/resume') {
+          validateOrigin(req)
+          return await resumeReview(res, await readJson(req, MAX_SELECTION_JSON_BYTES), apiOptions)
         }
-        if (req.method === 'POST' && parts[3] === 'bundles' && !parts[4]) {
-          return await bundles(req, res, snapshotId, apiOptions)
+        if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
+          const snapshotId = parts[2]
+          if (req.method === 'DELETE' && !parts[3]) {
+            return deleteReview(req, res, snapshotId, apiOptions)
+          }
+          if (req.method === 'POST' && parts[3] === 'reanalyze' && !parts[4]) {
+            return reanalyzeReview(req, res, snapshotId, apiOptions)
+          }
+          if (req.method === 'GET' && !parts[3] && apiOptions.roundStore) {
+            resumeIncompleteRuns(apiOptions)
+          }
+          requireReadyStoredRound(snapshotId, apiOptions)
+          await ensureSnapshot(snapshotId, apiOptions)
+          if (req.method === 'GET' && !parts[3]) {
+            validateOrigin(req)
+            const snapshot = getSnapshot(snapshotId)
+            return json(res, 200, snapshotPayload(snapshotId, snapshot))
+          }
+          if (
+            req.method === 'GET' &&
+            parts[3] === 'emails' &&
+            parts[4] &&
+            parts[5] === 'images' &&
+            parts[6]
+          ) {
+            return await remoteImage(res, url, snapshotId, parts[4], parts[6])
+          }
+          if (req.method === 'GET' && parts[3] === 'emails' && parts[4] && !parts[5]) {
+            return await emailDetail(res, snapshotId, parts[4], apiOptions)
+          }
+          if (req.method === 'GET' && parts[3] === 'threads' && parts[4]) {
+            return await threadContext(
+              res,
+              snapshotId,
+              parts[4],
+              url.searchParams.get('emailId') ?? '',
+              apiOptions,
+            )
+          }
+          if (req.method === 'GET' && parts[3] === 'blobs' && parts[4]) {
+            return await blob(res, url, snapshotId, parts[4], apiOptions)
+          }
+          if (req.method === 'POST' && parts[3] === 'finalize') {
+            return await finalize(req, res, snapshotId, apiOptions)
+          }
+          if (req.method === 'POST' && parts[3] === 'bundles' && !parts[4]) {
+            return await bundles(req, res, snapshotId, apiOptions)
+          }
+          if (req.method === 'POST' && parts[3] === 'state') {
+            return await updateRoundState(req, res, snapshotId, apiOptions)
+          }
+          if (req.method === 'POST' && parts[3] === 'replies') {
+            return await reply(req, res, snapshotId, apiOptions)
+          }
+          if (req.method === 'POST' && parts[3] === 'drafts') {
+            return await draft(req, res, snapshotId, apiOptions)
+          }
         }
-        if (req.method === 'POST' && parts[3] === 'state') {
-          return await updateRoundState(req, res, snapshotId, apiOptions)
-        }
-        if (req.method === 'POST' && parts[3] === 'replies') {
-          return await reply(req, res, snapshotId, apiOptions)
-        }
-        if (req.method === 'POST' && parts[3] === 'drafts') {
-          return await draft(req, res, snapshotId, apiOptions)
-        }
+        return apiError(res, 404, 'NOT_FOUND', 'Not found')
+      } catch (error) {
+        return handleError(res, error)
       }
-      return apiError(res, 404, 'NOT_FOUND', 'Not found')
-    } catch (error) {
-      return handleError(res, error)
-    }
-  }
+    })
 }
 
 export function clearApiStateForTests() {

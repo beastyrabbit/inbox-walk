@@ -1,6 +1,7 @@
 import { lookup } from 'node:dns/promises'
 import { request } from 'node:https'
 import { isIP } from 'node:net'
+import { abortable, ioSignal } from './io.ts'
 
 const REQUEST_TIMEOUT_MS = 10_000
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024
@@ -62,6 +63,12 @@ function isBlockedAddress(address: string) {
   const normalized = address.toLowerCase()
   const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1]
   if (mapped) return isBlockedAddress(mapped)
+  const mappedHex = normalized.match(/^(?:::ffff:|0:0:0:0:0:ffff:)([\da-f]{1,4}):([\da-f]{1,4})$/)
+  if (mappedHex) {
+    const high = Number.parseInt(mappedHex[1] ?? '', 16)
+    const low = Number.parseInt(mappedHex[2] ?? '', 16)
+    return isBlockedAddress(`${high >>> 8}.${high & 255}.${low >>> 8}.${low & 255}`)
+  }
   return (
     normalized === '::' ||
     normalized === '::1' ||
@@ -114,9 +121,10 @@ async function pinnedRequest(
     headers?: Record<string, string>
     maxBytes: number
     method: 'GET' | 'POST'
+    signal: AbortSignal
   },
 ): Promise<PinnedResponse> {
-  const resolved = await publicAddress(url.hostname)
+  const resolved = await abortable(publicAddress(url.hostname), options.signal)
   return await new Promise((resolve, reject) => {
     const req = request(
       {
@@ -128,6 +136,7 @@ async function pinnedRequest(
         port: 443,
         servername: url.hostname,
         timeout: REQUEST_TIMEOUT_MS,
+        signal: options.signal,
       },
       (response) => {
         const chunks: Buffer[] = []
@@ -218,6 +227,7 @@ export function detectSafeImageType(body: Buffer) {
 }
 
 export async function fetchRemoteImage(value: string) {
+  const signal = ioSignal(REQUEST_TIMEOUT_MS)
   let url = parsePublicHttpsUrl(value)
   for (let redirect = 0; redirect <= MAX_REDIRECTS; redirect += 1) {
     const response = await pinnedRequest(url, {
@@ -229,6 +239,7 @@ export async function fetchRemoteImage(value: string) {
       },
       maxBytes: MAX_IMAGE_BYTES,
       method: 'GET',
+      signal,
     })
     if (response.status >= 300 && response.status < 400 && response.headers.location) {
       if (redirect === MAX_REDIRECTS)
