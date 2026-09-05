@@ -4,8 +4,14 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { defaultReviewFilters } from '../src/shared.ts'
-import { type ApiOptions, clearApiStateForTests, createApiMiddleware } from './api.ts'
+import {
+  type ApiOptions,
+  clearApiStateForTests,
+  createApiMiddleware,
+  waitForApiJobs,
+} from './api.ts'
 import { demoEmails } from './demo.ts'
+import { ioSignal } from './io.ts'
 import { createRoundStore } from './round-store.ts'
 
 vi.mock('./safe-http.ts', async (importOriginal) => ({
@@ -76,6 +82,72 @@ async function serve(
 }
 
 describe('durable adapter boundaries', () => {
+  it.each(['create', 'snapshot', 'analysis'] as const)(
+    'detaches %s jobs from the spawning request deadline',
+    async (kind) => {
+      clearApiStateForTests()
+      const store = createRoundStore(':memory:')
+      if (kind !== 'create')
+        store.create({
+          id: 'background-round',
+          csrfToken: 'fixture-csrf',
+          imageToken: 'fixture-image',
+          mode: 'live',
+          emails: kind === 'snapshot' ? [] : emails,
+          filters: defaultReviewFilters,
+          mailboxes,
+          runStatus: kind === 'snapshot' ? 'queued' : 'analyzing',
+        })
+      const timeout = AbortSignal.timeout.bind(AbortSignal)
+      const deadline = vi
+        .spyOn(AbortSignal, 'timeout')
+        .mockImplementation((ms) => timeout(ms === 5 * 60_000 ? 5 : ms))
+      const signals: boolean[] = []
+      const probe = async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+        signals.push(ioSignal().aborted)
+      }
+      const app = await serve(store, false, {
+        fetchMailSnapshot: async () => {
+          await probe()
+          return {
+            context,
+            emails,
+            filters: defaultReviewFilters,
+            mailboxes,
+            missingIds: [],
+            totalBeforeLimit: emails.length,
+            truncated: false,
+          }
+        },
+        bundlePartitionDecider: async () => {
+          await probe()
+          return { standaloneEmailIds: emails.map((email) => email.id), stories: [] }
+        },
+      })
+      try {
+        const response = await fetch(
+          `${app.base}/api/reviews`,
+          kind === 'create'
+            ? {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filters: defaultReviewFilters }),
+              }
+            : undefined,
+        )
+        expect(response.status).toBe(kind === 'create' ? 202 : 200)
+        await waitForApiJobs()
+        expect(signals).toEqual(kind === 'analysis' ? [false] : [false, false])
+      } finally {
+        await app.close()
+        await waitForApiJobs()
+        deadline.mockRestore()
+        store.close()
+        clearApiStateForTests()
+      }
+    },
+  )
   it.each([true, false])(
     'records history once with cumulative progress callbacks enabled=%s',
     async (withProgress) => {

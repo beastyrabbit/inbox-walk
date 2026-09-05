@@ -41,7 +41,7 @@ export function parseAddresses(value: string): MailAddress[] {
         throw new Error('Bitte prüfe die Empfängeradressen und trenne sie mit Kommas.')
       }
       return {
-        name: name.startsWith('"') ? name.slice(1, -1).replace(/\\(.)/g, '$1') : name,
+        name: /^"(?:[^"\\]|\\.)*"$/.test(name) ? name.slice(1, -1).replace(/\\(.)/g, '$1') : name,
         email,
       }
     })

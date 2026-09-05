@@ -57,7 +57,7 @@ import {
   selectedCodexSettings,
 } from './codex.ts'
 import { demoEmails } from './demo.ts'
-import { IoError, ioSignal, withIoDeadline } from './io.ts'
+import { IoError, ioSignal, withIoDeadline, withoutIoDeadline } from './io.ts'
 import {
   createAndVerifyDraft,
   downloadBlob,
@@ -924,7 +924,7 @@ function startSnapshotJob(round: StoredReviewRound, apiOptions: ApiOptions) {
     if (jobControllers.get(round.id)?.controller === controller) jobControllers.delete(round.id)
     return
   }
-  const work = (async () => {
+  const work = withoutIoDeadline(async () => {
     await new Promise<void>((resolve) => setImmediate(resolve))
     controller.signal.throwIfAborted()
     const retainedIds = apiOptions.reviewHistory?.retainedIds() ?? new Set<string>()
@@ -1008,7 +1008,7 @@ function startSnapshotJob(round: StoredReviewRound, apiOptions: ApiOptions) {
       failClosed: true,
       signal: controller.signal,
     })
-  })()
+  })
     .catch((error) => {
       if (controller.signal.aborted || isAbortError(error)) return
       process.stderr.write(
@@ -2148,7 +2148,7 @@ function startBundleJob(
       return Promise.resolve()
     }
   }
-  const work = (async () => {
+  const work = withoutIoDeadline(async () => {
     await new Promise<void>((resolve) => setImmediate(resolve))
     jobContext.signal?.throwIfAborted()
     try {
@@ -2335,7 +2335,7 @@ function startBundleJob(
         if (!persisted) markAnalysisPersistenceFailure(snapshot)
       }
     }
-  })()
+  })
     .catch((error) => {
       if (
         jobContext.signal?.aborted ||
@@ -3150,7 +3150,7 @@ function handleError(res: ServerResponse, error: unknown) {
       res,
       504,
       error instanceof IoError ? error.code : 'IO_TIMEOUT',
-      'Der externe Abruf konnte nicht innerhalb der sicheren Grenzen abgeschlossen werden. Bestätigte Änderungen bleiben gespeichert.',
+      'Der externe Abruf konnte nicht innerhalb der sicheren Grenzen abgeschlossen werden.',
       true,
     )
   }

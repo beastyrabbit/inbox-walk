@@ -298,6 +298,7 @@ function App() {
   const [pendingDetails, setPendingDetails] = useState<Set<string>>(new Set())
   const roundEpochRef = useRef(0)
   const detailRequestsRef = useRef(new Map<string, Promise<ReviewEmail>>())
+  const replyBodyEditsRef = useRef(new Map<string, number>())
   const [replyLoading, setReplyLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [status, setStatus] = useState('')
@@ -359,6 +360,8 @@ function App() {
   const applySnapshot = useCallback((nextSnapshot: ReviewSnapshot) => {
     roundEpochRef.current += 1
     detailRequestsRef.current.clear()
+    replyBodyEditsRef.current.clear()
+    setReplyLoading(false)
     setFailedDetails(new Set())
     setPendingDetails(new Set())
     if (stateSaveTimerRef.current !== null) {
@@ -966,6 +969,8 @@ function App() {
       })
       .catch((cause) => {
         if (!belongsToRound()) return
+        if (detailRequestsRef.current.get(requestKey) === request)
+          detailRequestsRef.current.delete(requestKey)
         setFailedDetails((current) => new Set(current).add(summary.id))
         setKeptUnread((current) => new Set(current).add(summary.id))
         setError(`${errorMessage(cause)} Die Nachricht bleibt vorsichtshalber ungelesen.`)
@@ -1120,6 +1125,11 @@ function App() {
 
   function updateEditor(patch: Partial<ReplyEditorState>) {
     if (!summary || !editor) return
+    if ('bodyText' in patch)
+      replyBodyEditsRef.current.set(
+        summary.id,
+        (replyBodyEditsRef.current.get(summary.id) ?? 0) + 1,
+      )
     setReplyDrafts((current) =>
       current[summary.id]
         ? {
@@ -1132,6 +1142,7 @@ function App() {
 
   async function generateReply() {
     if (!snapshot || !summary || !editor) return
+    const bodyEditRevision = replyBodyEditsRef.current.get(summary.id) ?? 0
     const epoch = roundEpochRef.current
     const belongsToRound = () =>
       activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
@@ -1146,6 +1157,10 @@ function App() {
         roughNotes: editor.roughNotes,
       })
       if (!belongsToRound()) return
+      if ((replyBodyEditsRef.current.get(summary.id) ?? 0) !== bodyEditRevision) {
+        setStatus('Vorschlag verworfen, weil der Antworttext zwischenzeitlich geändert wurde.')
+        return
+      }
       setReplyProposals((current) => ({ ...current, [summary.id]: nextProposal }))
       setReplyDrafts((current) =>
         current[summary.id]
@@ -1155,9 +1170,7 @@ function App() {
             }
           : current,
       )
-      setStatus(
-        'Antwortentwurf erstellt. Zwischenzeitliche Textänderungen bleiben erhalten. Bitte prüfen.',
-      )
+      setStatus('Antwortentwurf erstellt. Bitte prüfen und bearbeiten.')
     } catch (cause) {
       if (belongsToRound()) setError(errorMessage(cause))
     } finally {

@@ -1,7 +1,24 @@
 import { describe, expect, it } from 'vitest'
-import { abortable, ioSignal, readBoundedBody, withIoDeadline } from './io.ts'
+import { abortable, ioSignal, readBoundedBody, withIoDeadline, withoutIoDeadline } from './io.ts'
 
 describe('upstream operation budgets', () => {
+  it('detaches background work while preserving explicit cancellation and per-call deadlines', async () => {
+    const controller = new AbortController()
+    const job = withIoDeadline(
+      () =>
+        withoutIoDeadline(async () => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 25))
+          expect(ioSignal(1000).aborted).toBe(false)
+          controller.abort()
+          expect(ioSignal(1000, controller.signal).aborted).toBe(true)
+          await expect(abortable(new Promise(() => {}), ioSignal(10))).rejects.toMatchObject({
+            code: 'IO_TIMEOUT',
+          })
+        }),
+      5,
+    )
+    await job
+  })
   it('observes an already-rejected read when cancellation predates the call', async () => {
     const signal = AbortSignal.abort(new Error('Already cancelled'))
     await expect(abortable(Promise.reject(new Error('Read cancelled')), signal)).rejects.toThrow(

@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { MailIdentity, MailResource, ThreadMessage } from '../src/shared.ts'
+import { IoError, withIoDeadline } from './io.ts'
+import { JmapError } from './jmap.ts'
 import {
   appendSignature,
   computeReplyRecipients,
@@ -130,6 +132,45 @@ describe('reply construction', () => {
       expect(runCodex).not.toHaveBeenCalled()
     },
   )
+
+  it.each([
+    new JmapError('Session expired', 'FASTMAIL_AUTH_EXPIRED', 401),
+    new JmapError('Attachment missing', 'BLOB_NOT_FOUND', 404),
+    new IoError('Upstream deadline', 'IO_TIMEOUT'),
+  ])('preserves attachment error $code before inference', async (error) => {
+    const runCodex = vi.fn()
+    await expect(
+      generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+        download: async () => {
+          throw error
+        },
+        runCodex,
+      }),
+    ).rejects.toBe(error)
+    expect(runCodex).not.toHaveBeenCalled()
+  })
+
+  it('distinguishes interrupted downloads from expired deadlines before inference', async () => {
+    const runCodex = vi.fn()
+    const generate = (download: () => Promise<Response>) =>
+      generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+        download,
+        runCodex,
+      })
+    await expect(
+      generate(async () => {
+        throw new Error('Network interrupted')
+      }),
+    ).rejects.toMatchObject({
+      code: 'ATTACHMENT_DOWNLOAD_FAILED',
+      status: 502,
+      message: 'Ein Anhang konnte nicht vollständig geladen werden. Bitte erneut versuchen.',
+    })
+    await expect(
+      withIoDeadline(() => generate(() => new Promise(() => {})), 10),
+    ).rejects.toMatchObject({ code: 'IO_TIMEOUT' })
+    expect(runCodex).not.toHaveBeenCalled()
+  })
 
   it('cancels an extraction that never settles without calling the provider', async () => {
     const runCodex = vi.fn()

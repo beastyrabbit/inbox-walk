@@ -10,7 +10,7 @@ import type {
 } from '../src/shared.ts'
 import { type CodexReplyInput, runCodexReply } from './codex.ts'
 import { abortable, IoError, ioSignal, readBoundedBody } from './io.ts'
-import { downloadBlob, type MailAccountContext } from './jmap.ts'
+import { downloadBlob, JmapError, type MailAccountContext } from './jmap.ts'
 
 const MAX_ATTACHMENT_BYTES = 45 * 1024 * 1024
 const MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -297,8 +297,11 @@ async function prepareAttachments(
           'Die Anhänge überschreiten das sichere Größenlimit.',
           'ATTACHMENTS_TOO_LARGE',
         )
+      if (error instanceof JmapError || error instanceof IoError) throw error
       throw new ReplyError(
-        'Ein Anhang konnte nicht vollständig innerhalb des Zeitlimits geladen werden.',
+        signal.aborted
+          ? 'Ein Anhang konnte nicht vollständig innerhalb des Zeitlimits geladen werden.'
+          : 'Ein Anhang konnte nicht vollständig geladen werden. Bitte erneut versuchen.',
         signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_DOWNLOAD_FAILED',
         undefined,
         signal.aborted ? 504 : 502,

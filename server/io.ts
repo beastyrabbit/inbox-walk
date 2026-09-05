@@ -15,6 +15,11 @@ export function withIoDeadline<T>(work: () => T, timeoutMs = 5 * 60_000): T {
   return operationSignal.run(AbortSignal.timeout(timeoutMs), work)
 }
 
+// Detached jobs retain their own cancellation signal and per-call I/O limits.
+export function withoutIoDeadline<T>(work: () => T): T {
+  return operationSignal.exit(work)
+}
+
 export function ioSignal(timeoutMs = 30_000, signal?: AbortSignal) {
   return AbortSignal.any([
     AbortSignal.timeout(timeoutMs),

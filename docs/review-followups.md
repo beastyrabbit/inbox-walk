@@ -19,6 +19,10 @@ This change addresses the [5 September project review](https://schaffa.dev/p/4ne
 
 Remote-success/local-crash ambiguity remains possible. A successful reconciliation can confirm the current remote state, but an unreachable read-back leaves that batch pending. Error responses distinguish confirmed, unknown and unattempted IDs. Persisted confirmed batches are never retried. For unresolved outcomes, inspect Fastmail before retrying if intervening changes matter; this is not an exactly-once protocol.
 
+Blob downloads have a 100 MiB size limit and a 120-second total transfer limit, including the transfer to the browser. Slow client connections can therefore time out after response headers have been sent, and the browser will report an incomplete download. This limit deliberately bounds the entire streaming operation. Background snapshot and analysis jobs do not inherit the spawning HTTP request's five-minute budget; they keep their own cancellation and per-call limits.
+
+Named recipients are displayed as `"Name" <email>`, including restored drafts that predate raw recipient fields. Partially quoted display names retain their full text.
+
 ## Dependencies and delivery checks
 
 DOMPurify, Vite, tsx and their compatible transitive dependencies were updated with pnpm. Pi releases after the installed adapter version remove its authentication API, so Pi stays at 0.80.7 with pnpm-generated patched Undici and esbuild overrides. The overrides can be removed when a compatible dependency update incorporates the fixes. No authentication migration or live inference was needed.

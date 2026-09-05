@@ -870,13 +870,25 @@ test('preserves sequential recipient typing and newer edits during delayed infer
   await page.route('**/api/reviews/*/replies', async (route) => {
     const response = await route.fetch()
     await secondGate
-    await route.fulfill({ response })
+    await route.fulfill({
+      response,
+      json: {
+        ...(await response.json()),
+        warnings: ['Discarded proposal warning'],
+        questions: ['Discarded proposal question'],
+      },
+    })
   })
   await page.getByRole('button', { name: 'Entwurf neu erstellen' }).click()
   await body.fill('Manual body typed during generation')
   release()
   await expect(page.getByRole('button', { name: 'Entwurf neu erstellen' })).toBeEnabled()
   await expect(body).toHaveValue('Manual body typed during generation')
+  await expect(
+    page.getByText('Vorschlag verworfen, weil der Antworttext zwischenzeitlich geändert wurde.'),
+  ).toBeVisible()
+  await expect(page.getByText('Discarded proposal warning')).toHaveCount(0)
+  await expect(page.getByText('Discarded proposal question')).toHaveCount(0)
   await page.getByRole('button', { name: 'Antwort schließen' }).click()
   await page.getByRole('button', { name: 'Runden' }).click()
   await page.getByRole('button', { name: 'Runde öffnen' }).first().click()
@@ -941,6 +953,39 @@ test('protects a delayed body failure after navigation and blocks finalization w
     .toContain('demo-human')
 })
 
+test('retries a failed body on revisit while keeping unread protection', async ({ page }) => {
+  let attempts = 0
+  await page.route('**/api/reviews/*/emails/demo-human', async (route) => {
+    attempts += 1
+    if (attempts === 1) {
+      await route.fulfill({
+        status: 502,
+        json: {
+          error: { code: 'FIXTURE_BODY_FAILED', message: 'Temporary body failure' },
+        },
+      })
+    } else await route.continue()
+  })
+  await completeStory(page)
+  await expect(
+    page.getByText('Nachrichteninhalt nicht verfügbar; ungelesen geschützt.'),
+  ).toBeVisible()
+  await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+  await page.keyboard.press('ArrowLeft')
+  await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+  await completeStory(page)
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
+  await expect(page.locator('iframe.message-body')).toBeVisible()
+  expect(attempts).toBe(2)
+  await expect(page.getByRole('button', { name: 'Bleibt ungelesen', exact: true })).toHaveAttribute(
+    'aria-pressed',
+    'true',
+  )
+})
+
 test('discards delayed reply results after leaving a round', async ({ page }) => {
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await page.getByLabel('Was soll die Antwort sagen?').fill('Old round notes')
@@ -958,6 +1003,9 @@ test('discards delayed reply results after leaving a round', async ({ page }) =>
   await page.getByRole('button', { name: 'Runden' }).click()
   await startAndOpenRound(page)
   release()
+  await expect(page.locator('iframe.message-body')).toBeVisible()
+  await completeStory(page)
+  await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
   await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
   await expect(page.getByLabel('Was soll die Antwort sagen?')).toHaveValue('')
   await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveCount(0)

@@ -20,6 +20,9 @@ describe('reply editor updates', () => {
     expect(parseAddresses(addressesToText(addresses))).toEqual(addresses)
     expect(() => parseAddresses('"unfinished')).toThrow()
     expect(() => parseAddresses('incomplete@')).toThrow()
+    expect(parseAddresses('"Alex" Doe <a@example.test>')).toEqual([
+      { name: '"Alex" Doe', email: 'a@example.test' },
+    ])
   })
   it('merges a proposal into the current editor while preserving other edits', () => {
     expect(
