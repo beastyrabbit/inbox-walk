@@ -127,6 +127,7 @@ beforeAll(async () => {
           retainedIds.add(emailId)
         }),
       retainedIds: () => new Set(retainedIds),
+      retainedSnapshot: () => new Map([...retainedIds].map((id) => [id, 'fixture'])),
       retainOnly: (emailIds) => {
         for (const emailId of retainedIds) {
           if (!emailIds.has(emailId)) retainedIds.delete(emailId)

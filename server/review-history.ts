@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto'
 import { chmodSync, mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
@@ -12,7 +13,8 @@ export interface ReviewHistory {
   forget(emailIds: readonly string[]): void
   rememberKeptUnread(emailIds: readonly string[]): void
   retainedIds(): Set<string>
-  retainOnly(emailIds: ReadonlySet<string>): void
+  retainedSnapshot(): Map<string, string>
+  retainOnly(emailIds: ReadonlySet<string>, snapshot: ReadonlyMap<string, string>): void
 }
 
 export function reviewHistoryPath() {
@@ -50,20 +52,31 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
       DROP TABLE viewed_email;
     `)
   }
+  // Existing databases acquire versions without rewriting retained decisions.
+  const columns = database.prepare('PRAGMA table_info(kept_unread_email)').all()
+  if (!columns.some((column) => column.name === 'revision')) {
+    database.exec("ALTER TABLE kept_unread_email ADD COLUMN revision TEXT NOT NULL DEFAULT ''")
+  }
   const record = database.prepare(`
     INSERT INTO kept_unread_email (
       email_id,
       first_retained_at,
       last_retained_at,
-      retain_count
+      retain_count,
+      revision
     )
-    VALUES (?, ?, ?, 1)
+    VALUES (?, ?, ?, 1, ?)
     ON CONFLICT(email_id) DO UPDATE SET
       last_retained_at = excluded.last_retained_at,
-      retain_count = kept_unread_email.retain_count + 1
+      retain_count = kept_unread_email.retain_count + 1,
+      revision = excluded.revision
   `)
   const remove = database.prepare('DELETE FROM kept_unread_email WHERE email_id = ?')
   const list = database.prepare('SELECT email_id FROM kept_unread_email')
+  const listVersions = database.prepare('SELECT email_id, revision FROM kept_unread_email')
+  const removeVersion = database.prepare(
+    'DELETE FROM kept_unread_email WHERE email_id = ? AND revision = ?',
+  )
   const count = database.prepare('SELECT COUNT(*) AS count FROM kept_unread_email')
 
   const normalizedIds = (emailIds: readonly string[]) =>
@@ -110,16 +123,24 @@ export function createReviewHistory(databasePath = reviewHistoryPath()): ReviewH
     },
     rememberKeptUnread(emailIds: readonly string[]) {
       const now = new Date().toISOString()
-      for (const emailId of normalizedIds(emailIds)) record.run(emailId, now, now)
+      for (const emailId of normalizedIds(emailIds)) record.run(emailId, now, now, randomUUID())
     },
     retainedIds() {
       return readRetainedIds()
     },
-    retainOnly(emailIds: ReadonlySet<string>) {
+    retainedSnapshot() {
+      return new Map(
+        (listVersions.all() as Array<{ email_id: string; revision: string }>).map((row) => [
+          row.email_id,
+          row.revision,
+        ]),
+      )
+    },
+    retainOnly(emailIds: ReadonlySet<string>, snapshot: ReadonlyMap<string, string>) {
       const retained = normalizedIds([...emailIds])
       let removed = 0
-      for (const emailId of readRetainedIds()) {
-        if (!retained.has(emailId)) removed += Number(remove.run(emailId).changes)
+      for (const [emailId, revision] of snapshot) {
+        if (!retained.has(emailId)) removed += Number(removeVersion.run(emailId, revision).changes)
       }
       if (removed > 0) checkpointDeletedPages()
     },

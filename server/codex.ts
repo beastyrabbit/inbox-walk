@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { AssistantMessage, ImageContent } from '@earendil-works/pi-ai/compat'
 import {
-  AuthStorage,
+  type AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   defineTool,
@@ -27,6 +27,8 @@ import type {
   BundlePartitionInput,
 } from './bundles.ts'
 import { normalizeBundleDecisionPartition } from './bundles.ts'
+import { codexRequestSignal, createCodexAuthStorage, withCodexRequest } from './codex-request.ts'
+import { abortable } from './io.ts'
 
 const CODEX_PROVIDER = 'openai-codex'
 const DEFAULT_CODEX_MODEL: CodexModelId = 'gpt-5.6-sol'
@@ -113,7 +115,10 @@ async function requireCodexRequestAuth(
   registry: ModelRegistry,
   model: NonNullable<ReturnType<ModelRegistry['find']>>,
 ) {
-  const auth = await registry.getApiKeyAndHeaders(model)
+  const signal = codexRequestSignal()
+  signal.throwIfAborted()
+  const auth = await abortable(registry.getApiKeyAndHeaders(model), signal)
+  signal.throwIfAborted()
   if (!auth.ok) {
     rethrowCodexAuthenticationFailure(new Error(auth.error))
   }
@@ -249,7 +254,7 @@ export function getCodexAuthStorage() {
   let storage = authStores.get(authPath)
   if (!storage) {
     fs.mkdirSync(path.dirname(authPath), { recursive: true })
-    storage = AuthStorage.create(authPath)
+    storage = createCodexAuthStorage(authPath)
     authStores.set(authPath, storage)
   }
   return storage
@@ -285,7 +290,18 @@ const replyToolSchema = Type.Object(
   { additionalProperties: false },
 )
 
+function codexInferenceTimeoutMs() {
+  const configured = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
+  return Number.isFinite(configured)
+    ? Math.min(15 * 60_000, Math.max(30_000, configured))
+    : 5 * 60_000
+}
+
 export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyOutput> {
+  return withCodexRequest(() => codexReply(input), codexInferenceTimeoutMs())
+}
+
+async function codexReply(input: CodexReplyInput): Promise<CodexReplyOutput> {
   if (process.env.VITEST) {
     throw new Error(
       'Live AI inference is disabled in automated tests. A manual live run requires an explicit user request.',
@@ -327,7 +343,8 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
     ...isolatedResourceOptions(),
     systemPrompt: input.systemPrompt,
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
 
   const { session } = await createAgentSession({
     cwd: sessionCwd,
@@ -344,11 +361,8 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
     resourceLoader,
   })
 
-  const configuredTimeout = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(15 * 60_000, Math.max(30_000, configuredTimeout))
-    : 5 * 60_000
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const timeoutMs = codexInferenceTimeoutMs()
+  const timeoutSignal = codexRequestSignal()
   const abortSession = () => {
     void session.abort().catch(() => {})
   }
@@ -363,6 +377,7 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
   timeoutSignal.addEventListener('abort', failOnTimeout, { once: true })
   try {
     try {
+      timeoutSignal.throwIfAborted()
       await Promise.race([
         session.prompt(input.prompt, {
           expandPromptTemplates: false,
@@ -613,6 +628,19 @@ export async function runCodexBundleDecision(
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
   signal?: AbortSignal,
 ): Promise<BundleDecision> {
+  return withCodexRequest(
+    () => codexBundleDecision(input, frozenModelId, frozenThinkingLevel, signal),
+    codexInferenceTimeoutMs(),
+    signal,
+  )
+}
+
+async function codexBundleDecision(
+  input: BundleDecisionInput,
+  frozenModelId: CodexModelId,
+  frozenThinkingLevel: CodexThinkingLevel,
+  signal?: AbortSignal,
+): Promise<BundleDecision> {
   if (process.env.VITEST) {
     throw new Error(
       'Live AI inference is disabled in automated tests. A manual live run requires an explicit user request.',
@@ -651,7 +679,8 @@ export async function runCodexBundleDecision(
     ...isolatedResourceOptions(),
     systemPrompt: bundleDecisionSystemPrompt(false),
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
   const { session } = await createAgentSession({
     cwd: sessionCwd,
     agentDir,
@@ -666,12 +695,8 @@ export async function runCodexBundleDecision(
     settingsManager,
     resourceLoader,
   })
-  const configuredTimeout = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(15 * 60_000, Math.max(30_000, configuredTimeout))
-    : 5 * 60_000
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const inferenceSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const timeoutMs = codexInferenceTimeoutMs()
+  const inferenceSignal = codexRequestSignal()
   const abortSession = () => void session.abort().catch(() => {})
   let rejectAbort: (error: Error) => void = () => {}
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -690,12 +715,9 @@ export async function runCodexBundleDecision(
   }
   inferenceSignal.addEventListener('abort', abortSession, { once: true })
   inferenceSignal.addEventListener('abort', failOnAbort, { once: true })
-  if (inferenceSignal.aborted) {
-    abortSession()
-    failOnAbort()
-  }
   try {
     try {
+      inferenceSignal.throwIfAborted()
       await Promise.race([
         session.prompt(bundlePrompt(input), { expandPromptTemplates: false, source: 'rpc' }),
         aborted,
@@ -725,6 +747,19 @@ export async function runCodexBundleDecisionBatch(
   cohorts: readonly BundleDecisionCohort[],
   frozenModelId = selectedCodexModel(),
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
+  signal?: AbortSignal,
+): Promise<BundleDecisionResult[]> {
+  return withCodexRequest(
+    () => codexBundleDecisionBatch(cohorts, frozenModelId, frozenThinkingLevel, signal),
+    codexInferenceTimeoutMs(),
+    signal,
+  )
+}
+
+async function codexBundleDecisionBatch(
+  cohorts: readonly BundleDecisionCohort[],
+  frozenModelId: CodexModelId,
+  frozenThinkingLevel: CodexThinkingLevel,
   signal?: AbortSignal,
 ): Promise<BundleDecisionResult[]> {
   if (process.env.VITEST) {
@@ -774,7 +809,8 @@ export async function runCodexBundleDecisionBatch(
     ...isolatedResourceOptions(),
     systemPrompt: bundleDecisionSystemPrompt(true),
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
   const { session } = await createAgentSession({
     cwd: sessionCwd,
     agentDir,
@@ -789,12 +825,8 @@ export async function runCodexBundleDecisionBatch(
     settingsManager,
     resourceLoader,
   })
-  const configuredTimeout = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(15 * 60_000, Math.max(30_000, configuredTimeout))
-    : 5 * 60_000
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const inferenceSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const timeoutMs = codexInferenceTimeoutMs()
+  const inferenceSignal = codexRequestSignal()
   const abortSession = () => void session.abort().catch(() => {})
   let rejectAbort: (error: Error) => void = () => {}
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -813,12 +845,9 @@ export async function runCodexBundleDecisionBatch(
   }
   inferenceSignal.addEventListener('abort', abortSession, { once: true })
   inferenceSignal.addEventListener('abort', failOnAbort, { once: true })
-  if (inferenceSignal.aborted) {
-    abortSession()
-    failOnAbort()
-  }
   try {
     try {
+      inferenceSignal.throwIfAborted()
       await Promise.race([
         session.prompt(bundleBatchPrompt(cohorts), {
           expandPromptTemplates: false,
@@ -860,6 +889,19 @@ export async function runCodexBundlePartition(
   input: BundlePartitionInput,
   frozenModelId = selectedCodexModel(),
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
+  signal?: AbortSignal,
+): Promise<BundlePartitionDecision> {
+  return withCodexRequest(
+    () => codexBundlePartition(input, frozenModelId, frozenThinkingLevel, signal),
+    codexBundleTimeoutMs(process.env.CODEX_BUNDLE_TIMEOUT_MS),
+    signal,
+  )
+}
+
+async function codexBundlePartition(
+  input: BundlePartitionInput,
+  frozenModelId: CodexModelId,
+  frozenThinkingLevel: CodexThinkingLevel,
   signal?: AbortSignal,
 ): Promise<BundlePartitionDecision> {
   if (process.env.VITEST) {
@@ -907,7 +949,8 @@ export async function runCodexBundlePartition(
     ...isolatedResourceOptions(),
     systemPrompt: bundlePartitionSystemPrompt(),
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
   const { session } = await createAgentSession({
     cwd: sessionCwd,
     agentDir,
@@ -923,8 +966,7 @@ export async function runCodexBundlePartition(
     resourceLoader,
   })
   const timeoutMs = codexBundleTimeoutMs(process.env.CODEX_BUNDLE_TIMEOUT_MS)
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const inferenceSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const inferenceSignal = codexRequestSignal()
   const abortSession = () => void session.abort().catch(() => {})
   let rejectAbort: (error: Error) => void = () => {}
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -943,12 +985,9 @@ export async function runCodexBundlePartition(
   }
   inferenceSignal.addEventListener('abort', abortSession, { once: true })
   inferenceSignal.addEventListener('abort', failOnAbort, { once: true })
-  if (inferenceSignal.aborted) {
-    abortSession()
-    failOnAbort()
-  }
   try {
     try {
+      inferenceSignal.throwIfAborted()
       await Promise.race([
         session.prompt(bundlePartitionPrompt(input), {
           expandPromptTemplates: false,

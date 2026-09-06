@@ -12,6 +12,7 @@ import {
 } from './api.ts'
 import { demoEmails } from './demo.ts'
 import { ioSignal } from './io.ts'
+import { createReviewHistory } from './review-history.ts'
 import { createRoundStore } from './round-store.ts'
 
 vi.mock('./safe-http.ts', async (importOriginal) => ({
@@ -21,6 +22,14 @@ vi.mock('./safe-http.ts', async (importOriginal) => ({
     contentType: 'image/png',
   })),
 }))
+
+function deferred() {
+  let resolve = () => {}
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
 
 const context = {
   accountId: 'fixture',
@@ -82,6 +91,152 @@ async function serve(
 }
 
 describe('durable adapter boundaries', () => {
+  it('rejects a finalization displaced by cache eviction without overwriting a newer result', async () => {
+    clearApiStateForTests()
+    const store = createRoundStore(':memory:')
+    for (const id of ['target', ...Array.from({ length: 22 }, (_, i) => `pressure-${i}`)]) {
+      store.create({
+        id,
+        csrfToken: 'fixture-csrf',
+        imageToken: 'fixture-image',
+        mode: 'live',
+        emails,
+        filters: defaultReviewFilters,
+        mailboxes,
+      })
+    }
+    const gate = deferred()
+    const started = deferred()
+    let calls = 0
+    const marked: string[][] = []
+    const app = await serve(store, false, {
+      resumeMailSnapshot: async () => {
+        if (++calls === 1) {
+          started.resolve()
+          await gate.promise
+        }
+        return {
+          context,
+          emails,
+          filters: defaultReviewFilters,
+          mailboxes,
+          missingIds: [],
+          totalBeforeLimit: emails.length,
+          truncated: false,
+        }
+      },
+      markRead: async (_context, _token, ids) => {
+        marked.push([...ids])
+        return { failed: [], markedIds: [...ids] }
+      },
+    })
+    const finalize = (id: string) =>
+      fetch(`${app.base}/api/reviews/target/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Inbox-Walk-CSRF': 'fixture-csrf' },
+        body: JSON.stringify({ revision: 0, finalizeIds: [id], keepUnreadIds: [] }),
+      })
+    try {
+      const first = finalize('first')
+      await started.promise
+      for (let i = 0; i < 22; i++) {
+        const response = await fetch(`${app.base}/api/reviews/pressure-${i}`)
+        expect(response.ok).toBe(true)
+        await response.arrayBuffer()
+      }
+      const second = await finalize('second')
+      expect(second.status).toBe(200)
+      await second.arrayBuffer()
+      gate.resolve()
+      const stale = await first
+      expect(stale.status).toBe(409)
+      expect(await stale.json()).toMatchObject({ error: { code: 'ROUND_RELOAD_REQUIRED' } })
+      expect(marked).toEqual([['second']])
+      expect(store.get('target')?.finalization).toMatchObject({
+        state: 'finalized',
+        finalizeIds: ['second'],
+        succeededIds: ['second'],
+      })
+    } finally {
+      gate.resolve()
+      await app.close()
+      store.close()
+      clearApiStateForTests()
+    }
+  })
+
+  it('preserves a newly deferred message while an older options query reconciles history', async () => {
+    clearApiStateForTests()
+    const directory = mkdtempSync(join(tmpdir(), 'inbox-reconciliation-'))
+    const store = createRoundStore(':memory:')
+    const history = createReviewHistory(join(directory, 'history.sqlite'))
+    history.rememberKeptUnread(['prior'])
+    store.create({
+      id: 'target',
+      csrfToken: 'fixture-csrf',
+      imageToken: 'fixture-image',
+      mode: 'live',
+      emails,
+      filters: defaultReviewFilters,
+      mailboxes,
+    })
+    const gate = deferred()
+    const started = deferred()
+    const realFetch = globalThis.fetch
+    const transport = vi.spyOn(globalThis, 'fetch').mockImplementation(async (url, init) => {
+      if (String(url) === 'https://api.fastmail.com/jmap/session')
+        return new Response(
+          JSON.stringify({
+            apiUrl: context.apiUrl,
+            downloadUrl: context.downloadUrl,
+            primaryAccounts: { 'urn:ietf:params:jmap:mail': context.accountId },
+            capabilities: {},
+          }),
+        )
+      if (String(url) !== context.apiUrl) throw new Error('Unexpected external request blocked')
+      const [method, args, id] = JSON.parse(String(init?.body)).methodCalls[0]
+      if (method === 'Mailbox/get')
+        return new Response(
+          JSON.stringify({ methodResponses: [[method, { list: mailboxes }, id]] }),
+        )
+      expect(method).toBe('Email/get')
+      expect(args.ids).toEqual(['prior'])
+      started.resolve()
+      await gate.promise
+      return new Response(
+        JSON.stringify({
+          methodResponses: [[method, { list: [{ id: 'prior', keywords: {} }] }, id]],
+        }),
+      )
+    })
+    const app = await serve(store, false, {
+      reviewHistory: history,
+      markRead: async () => ({ failed: [], markedIds: [] }),
+    })
+    try {
+      const options = realFetch(`${app.base}/api/review/options`)
+      await started.promise
+      const result = await realFetch(`${app.base}/api/reviews/target/finalize`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Inbox-Walk-CSRF': 'fixture-csrf' },
+        body: JSON.stringify({ revision: 0, finalizeIds: ['first'], keepUnreadIds: ['first'] }),
+      })
+      expect(result.status).toBe(200)
+      await result.arrayBuffer()
+      gate.resolve()
+      expect((await options).status).toBe(200)
+      expect(history.retainedIds()).toEqual(new Set(['prior', 'first']))
+    } finally {
+      gate.resolve()
+      await app.close()
+      transport.mockRestore()
+      history.close()
+      store.close()
+      clearApiStateForTests()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
   it.each(['create', 'snapshot', 'analysis'] as const)(
     'detaches %s jobs from the spawning request deadline',
     async (kind) => {
@@ -171,6 +326,7 @@ describe('durable adapter boundaries', () => {
           forget,
           rememberKeptUnread: remember,
           retainedIds: () => new Set(),
+          retainedSnapshot: () => new Map(),
           retainOnly() {},
         },
         markRead: async (_context, _token, ids, onProgress) => {

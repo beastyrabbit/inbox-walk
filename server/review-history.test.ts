@@ -16,6 +16,28 @@ afterEach(() => {
 })
 
 describe('SQLite review history', () => {
+  it('reconciles only captured versions across additions, updates and delete/reinsert', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'inbox-walk-history-'))
+    directories.push(directory)
+    const databasePath = join(directory, 'history.sqlite')
+    const history = createReviewHistory(databasePath)
+    history.rememberKeptUnread(['unchanged-read', 'still-unread', 'updated', 'reinserted'])
+    const snapshot = history.retainedSnapshot()
+    const concurrent = createReviewHistory(databasePath)
+    concurrent.rememberKeptUnread(['new', 'updated'])
+    concurrent.forget(['reinserted'])
+    concurrent.rememberKeptUnread(['reinserted'])
+    history.retainOnly(new Set(['still-unread']), snapshot)
+    expect(history.retainedIds()).toEqual(new Set(['still-unread', 'new', 'updated', 'reinserted']))
+    concurrent.close()
+    history.close()
+    const reopened = createReviewHistory(databasePath)
+    expect(reopened.retainedIds()).toEqual(
+      new Set(['still-unread', 'new', 'updated', 'reinserted']),
+    )
+    reopened.close()
+  })
+
   it('persists only deliberately retained unread IDs', () => {
     const directory = mkdtempSync(join(tmpdir(), 'inbox-walk-history-'))
     directories.push(directory)
@@ -80,7 +102,7 @@ describe('SQLite review history', () => {
 
     const history = createReviewHistory(databasePath)
     expect(history.retainedIds()).toEqual(new Set(['still-unread', 'now-read']))
-    history.retainOnly(new Set(['still-unread']))
+    history.retainOnly(new Set(['still-unread']), history.retainedSnapshot())
     expect(history.retainedIds()).toEqual(new Set(['still-unread']))
     history.close()
   })

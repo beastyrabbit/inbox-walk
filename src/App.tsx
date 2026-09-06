@@ -362,6 +362,7 @@ function App() {
     detailRequestsRef.current.clear()
     replyBodyEditsRef.current.clear()
     setReplyLoading(false)
+    setSubmitting(false)
     setFailedDetails(new Set())
     setPendingDetails(new Set())
     if (stateSaveTimerRef.current !== null) {
@@ -799,6 +800,8 @@ function App() {
         }
         if (generation !== currentGeneration) return
         restoredRef.current = false
+        roundEpochRef.current += 1
+        setSubmitting(false)
         activeRoundIdRef.current = null
         activeSnapshotRef.current = null
         setError(null)
@@ -1230,10 +1233,13 @@ function App() {
 
   async function finalizeReview() {
     if (!snapshot || pendingDetails.size > 0) return
+    const epoch = roundEpochRef.current
+    const belongsToRound = () =>
+      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
     setSubmitting(true)
     setError(null)
     try {
-      if (!(await flushState()) || !restoredRef.current) return
+      if (!(await flushState()) || !restoredRef.current || !belongsToRound()) return
       const nextResult = await api.finalize(
         snapshot,
         stateRevisionRef.current,
@@ -1241,6 +1247,8 @@ function App() {
         finalizedKeptUnreadIds,
         finalizedSecondaryActionIds,
       )
+      if (!belongsToRound()) return
+      setSubmitting(false)
       setResult(nextResult)
       setSnapshot((current) =>
         current
@@ -1268,15 +1276,18 @@ function App() {
         setStatus('Review teilweise gespeichert.')
       }
     } catch (cause) {
+      if (!belongsToRound()) return
       try {
         const latest = await api.review(snapshot.snapshotId)
+        if (!belongsToRound()) return
+        setError(errorMessage(cause))
         if (latest.finalization.selectionLocked) applySnapshot(latest)
       } catch {
         // Keep the original finalization error. Reload remains available if recovery also fails.
+        if (belongsToRound()) setError(errorMessage(cause))
       }
-      setError(errorMessage(cause))
     } finally {
-      setSubmitting(false)
+      if (belongsToRound()) setSubmitting(false)
     }
   }
 
@@ -1362,6 +1373,8 @@ function App() {
     if (snapshot && restoredRef.current && !(await flushState())) return
     if (snapshot) saveCheckpoint({ version: 7, roundId: snapshot.snapshotId })
     restoredRef.current = false
+    roundEpochRef.current += 1
+    setSubmitting(false)
     activeRoundIdRef.current = null
     activeSnapshotRef.current = null
     setSnapshot(null)

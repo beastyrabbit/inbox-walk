@@ -1547,10 +1547,11 @@ async function options(res: ServerResponse, apiOptions: ApiOptions) {
   if (!token)
     throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
   const result = await fetchReviewOptions(token)
-  const retainedIds = apiOptions.reviewHistory?.retainedIds() ?? new Set<string>()
+  const retained = apiOptions.reviewHistory?.retainedSnapshot() ?? new Map<string, string>()
+  const retainedIds = new Set(retained.keys())
   if (retainedIds.size > 0 && apiOptions.reviewHistory) {
     const unreadIds = await fetchUnreadEmailIds(result.context, token, [...retainedIds])
-    apiOptions.reviewHistory.retainOnly(unreadIds)
+    apiOptions.reviewHistory.retainOnly(unreadIds, retained)
   }
   return json(res, 200, {
     codex,
@@ -2600,6 +2601,16 @@ async function finalize(
     }
   }
   const requireFinalizeAvailable = () => {
+    // A pre-lock await may outlive cache eviction or deletion. Never lock using
+    // an object replaced by a subsequently hydrated, possibly finalized round.
+    if (snapshots.get(snapshotId) !== snapshot) {
+      throw new ApiHttpError(
+        409,
+        'ROUND_RELOAD_REQUIRED',
+        'Der Rundenstand wurde neu geladen. Bitte die Runde erneut öffnen.',
+        true,
+      )
+    }
     if (snapshot.finalizationState === 'finalizing') {
       throw new ApiHttpError(
         409,

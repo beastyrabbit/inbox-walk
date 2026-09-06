@@ -7,6 +7,14 @@ const { version: appVersion } = JSON.parse(
   readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
 ) as { version: string }
 
+function deferred() {
+  let resolve = () => {}
+  const promise = new Promise<void>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
 async function startAndOpenRound(page: Page) {
   await page.getByRole('button', { name: 'Runde starten' }).click()
   const open = page.getByRole('button', { name: 'Runde öffnen' }).first()
@@ -1196,6 +1204,69 @@ test('refreshes the durable lock after a post-lock finalization error', async ({
   await expect(page.getByRole('button', { name: 'Zurück' })).toBeDisabled()
   await expect(page.getByText('Fastmail hat nach dem Lock nicht geantwortet.')).toBeVisible()
 })
+
+for (const responseKind of ['success', 'error'] as const) {
+  test(`ignores a late finalization ${responseKind} after browser Back opens another round`, async ({
+    page,
+  }) => {
+    const originalUrl = page.url()
+    const started = deferred()
+    const release = deferred()
+    await page.route('**/api/reviews/*/finalize', async (route) => {
+      const response = await route.fetch()
+      started.resolve()
+      await release.promise
+      if (responseKind === 'success') await route.fulfill({ response })
+      else
+        await route.fulfill({
+          status: 502,
+          json: {
+            error: {
+              code: 'SYNTHETIC_FAILURE',
+              message: 'Synthetic delayed finalization error',
+              retryable: true,
+            },
+          },
+        })
+    })
+    await completeStory(page)
+    await page
+      .getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' })
+      .click()
+    await page.getByRole('button', { name: 'Änderungen speichern' }).click()
+    await started.promise
+    await page.goBack()
+    await expect(page.getByRole('heading', { name: 'Runden', exact: true })).toBeVisible()
+    await startAndOpenRound(page)
+    const newUrl = page.url()
+    expect(newUrl).not.toBe(originalUrl)
+    await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+    const checkpoint = await page.evaluate(() => localStorage.getItem('inbox-walk:checkpoint:v1'))
+    const settled = page.waitForResponse('**/api/reviews/*/finalize')
+    release.resolve()
+    await settled
+    await expect(
+      page.getByRole('heading', { name: 'Review abgeschlossen', exact: true }),
+    ).toHaveCount(0)
+    await expect(page.getByText('Synthetic delayed finalization error')).toHaveCount(0)
+    await expect(page.locator('.control-button.next')).toBeEnabled()
+    await completeStory(page)
+    await expect(
+      page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }),
+    ).toBeVisible()
+    expect(await page.evaluate(() => localStorage.getItem('inbox-walk:checkpoint:v1'))).toBe(
+      checkpoint,
+    )
+    await page.reload()
+    await expect(
+      page.getByRole('button', { name: '1 bereits bearbeitete Nachrichten abschließen' }),
+    ).toBeVisible()
+    await page.goto(originalUrl)
+    await expect(
+      page.getByRole('heading', { name: 'Review abgeschlossen', exact: true }),
+    ).toBeVisible()
+  })
+}
 
 test('does not leave confirmation with Escape while finalization is in flight', async ({
   page,
