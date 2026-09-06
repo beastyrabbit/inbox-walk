@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type { AssistantMessage, ImageContent } from '@earendil-works/pi-ai/compat'
 import {
-  AuthStorage,
+  type AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   defineTool,
@@ -27,6 +27,8 @@ import type {
   BundlePartitionInput,
 } from './bundles.ts'
 import { normalizeBundleDecisionPartition } from './bundles.ts'
+import { codexRequestSignal, createCodexAuthStorage, withCodexRequest } from './codex-request.ts'
+import { abortable } from './io.ts'
 
 const CODEX_PROVIDER = 'openai-codex'
 const DEFAULT_CODEX_MODEL: CodexModelId = 'gpt-5.6-sol'
@@ -113,7 +115,10 @@ async function requireCodexRequestAuth(
   registry: ModelRegistry,
   model: NonNullable<ReturnType<ModelRegistry['find']>>,
 ) {
-  const auth = await registry.getApiKeyAndHeaders(model)
+  const signal = codexRequestSignal()
+  signal.throwIfAborted()
+  const auth = await abortable(registry.getApiKeyAndHeaders(model), signal)
+  signal.throwIfAborted()
   if (!auth.ok) {
     rethrowCodexAuthenticationFailure(new Error(auth.error))
   }
@@ -214,6 +219,17 @@ function hasStoredAuth(file: string) {
   }
 }
 
+export function isolatedResourceOptions() {
+  return {
+    noExtensions: true,
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    appendSystemPrompt: [] as string[],
+  }
+}
+
 export function codexAuthStoragePath() {
   const dataDir = process.env.DATA_DIR ?? path.resolve('data')
   const persistentPath = path.join(dataDir, 'pi', 'auth.json')
@@ -238,7 +254,7 @@ export function getCodexAuthStorage() {
   let storage = authStores.get(authPath)
   if (!storage) {
     fs.mkdirSync(path.dirname(authPath), { recursive: true })
-    storage = AuthStorage.create(authPath)
+    storage = createCodexAuthStorage(authPath)
     authStores.set(authPath, storage)
   }
   return storage
@@ -274,7 +290,18 @@ const replyToolSchema = Type.Object(
   { additionalProperties: false },
 )
 
+function codexInferenceTimeoutMs() {
+  const configured = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
+  return Number.isFinite(configured)
+    ? Math.min(15 * 60_000, Math.max(30_000, configured))
+    : 5 * 60_000
+}
+
 export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyOutput> {
+  return withCodexRequest(() => codexReply(input), codexInferenceTimeoutMs())
+}
+
+async function codexReply(input: CodexReplyInput): Promise<CodexReplyOutput> {
   if (process.env.VITEST) {
     throw new Error(
       'Live AI inference is disabled in automated tests. A manual live run requires an explicit user request.',
@@ -313,14 +340,11 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: input.systemPrompt,
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
 
   const { session } = await createAgentSession({
     cwd: sessionCwd,
@@ -337,11 +361,8 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
     resourceLoader,
   })
 
-  const configuredTimeout = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(15 * 60_000, Math.max(30_000, configuredTimeout))
-    : 5 * 60_000
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
+  const timeoutMs = codexInferenceTimeoutMs()
+  const timeoutSignal = codexRequestSignal()
   const abortSession = () => {
     void session.abort().catch(() => {})
   }
@@ -356,6 +377,7 @@ export async function runCodexReply(input: CodexReplyInput): Promise<CodexReplyO
   timeoutSignal.addEventListener('abort', failOnTimeout, { once: true })
   try {
     try {
+      timeoutSignal.throwIfAborted()
       await Promise.race([
         session.prompt(input.prompt, {
           expandPromptTemplates: false,
@@ -453,48 +475,50 @@ const bundleBatchToolSchema = Type.Object(
   { additionalProperties: false },
 )
 
-const bundlePartitionToolSchema = Type.Object(
-  {
-    stories: Type.Array(
-      Type.Object(
-        {
-          emailIds: Type.Array(Type.String({ maxLength: 512 }), {
-            description: 'Exact IDs from emails. Each story must contain at least two unique IDs.',
-            maxItems: 10_000,
-            minItems: 2,
-            uniqueItems: true,
-          }),
-          kind: Type.Union(
-            [
-              Type.Literal('development_workstream'),
-              Type.Literal('order_delivery'),
-              Type.Literal('incident'),
-              Type.Literal('conversation'),
-              Type.Literal('standalone'),
-            ],
-            {
+export const bundlePartitionToolSchema = (snapshotSize: number) =>
+  Type.Object(
+    {
+      stories: Type.Array(
+        Type.Object(
+          {
+            emailIds: Type.Array(Type.String({ maxLength: 512 }), {
               description:
-                'order_delivery for an order lifecycle; development_workstream for repository, CI, or deployment work; incident for an operational incident; conversation for a commission or human exchange; otherwise standalone.',
-            },
-          ),
-          title: Type.String({ maxLength: 500 }),
-          currentState: Type.String({ maxLength: 500 }),
-          summary: Type.String({ maxLength: 4_000 }),
-          linkEvidence: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 100 }),
-          membershipConfidence: Type.Number({ minimum: 0, maximum: 1 }),
-        },
-        { additionalProperties: false },
+                'Exact IDs from emails. Each story must contain at least two unique IDs.',
+              maxItems: snapshotSize,
+              minItems: 2,
+              uniqueItems: true,
+            }),
+            kind: Type.Union(
+              [
+                Type.Literal('development_workstream'),
+                Type.Literal('order_delivery'),
+                Type.Literal('incident'),
+                Type.Literal('conversation'),
+                Type.Literal('standalone'),
+              ],
+              {
+                description:
+                  'order_delivery for an order lifecycle; development_workstream for repository, CI, or deployment work; incident for an operational incident; conversation for a commission or human exchange; otherwise standalone.',
+              },
+            ),
+            title: Type.String({ maxLength: 500 }),
+            currentState: Type.String({ maxLength: 500 }),
+            summary: Type.String({ maxLength: 4_000 }),
+            linkEvidence: Type.Array(Type.String({ maxLength: 500 }), { maxItems: 100 }),
+            membershipConfidence: Type.Number({ minimum: 0, maximum: 1 }),
+          },
+          { additionalProperties: false },
+        ),
+        { maxItems: snapshotSize },
       ),
-      { maxItems: 10_000 },
-    ),
-    standaloneEmailIds: Type.Array(Type.String({ maxLength: 512 }), {
-      description: 'Every email ID that does not belong to a multi-email story.',
-      maxItems: 10_000,
-      uniqueItems: true,
-    }),
-  },
-  { additionalProperties: false },
-)
+      standaloneEmailIds: Type.Array(Type.String({ maxLength: 512 }), {
+        description: 'Every email ID that does not belong to a multi-email story.',
+        maxItems: snapshotSize,
+        uniqueItems: true,
+      }),
+    },
+    { additionalProperties: false },
+  )
 
 function bundleEmailSummary(email: BundleDecisionInput['seed'][number]) {
   return {
@@ -604,6 +628,19 @@ export async function runCodexBundleDecision(
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
   signal?: AbortSignal,
 ): Promise<BundleDecision> {
+  return withCodexRequest(
+    () => codexBundleDecision(input, frozenModelId, frozenThinkingLevel, signal),
+    codexInferenceTimeoutMs(),
+    signal,
+  )
+}
+
+async function codexBundleDecision(
+  input: BundleDecisionInput,
+  frozenModelId: CodexModelId,
+  frozenThinkingLevel: CodexThinkingLevel,
+  signal?: AbortSignal,
+): Promise<BundleDecision> {
   if (process.env.VITEST) {
     throw new Error(
       'Live AI inference is disabled in automated tests. A manual live run requires an explicit user request.',
@@ -639,14 +676,11 @@ export async function runCodexBundleDecision(
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: bundleDecisionSystemPrompt(false),
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
   const { session } = await createAgentSession({
     cwd: sessionCwd,
     agentDir,
@@ -661,12 +695,8 @@ export async function runCodexBundleDecision(
     settingsManager,
     resourceLoader,
   })
-  const configuredTimeout = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(15 * 60_000, Math.max(30_000, configuredTimeout))
-    : 5 * 60_000
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const inferenceSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const timeoutMs = codexInferenceTimeoutMs()
+  const inferenceSignal = codexRequestSignal()
   const abortSession = () => void session.abort().catch(() => {})
   let rejectAbort: (error: Error) => void = () => {}
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -685,12 +715,9 @@ export async function runCodexBundleDecision(
   }
   inferenceSignal.addEventListener('abort', abortSession, { once: true })
   inferenceSignal.addEventListener('abort', failOnAbort, { once: true })
-  if (inferenceSignal.aborted) {
-    abortSession()
-    failOnAbort()
-  }
   try {
     try {
+      inferenceSignal.throwIfAborted()
       await Promise.race([
         session.prompt(bundlePrompt(input), { expandPromptTemplates: false, source: 'rpc' }),
         aborted,
@@ -720,6 +747,19 @@ export async function runCodexBundleDecisionBatch(
   cohorts: readonly BundleDecisionCohort[],
   frozenModelId = selectedCodexModel(),
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
+  signal?: AbortSignal,
+): Promise<BundleDecisionResult[]> {
+  return withCodexRequest(
+    () => codexBundleDecisionBatch(cohorts, frozenModelId, frozenThinkingLevel, signal),
+    codexInferenceTimeoutMs(),
+    signal,
+  )
+}
+
+async function codexBundleDecisionBatch(
+  cohorts: readonly BundleDecisionCohort[],
+  frozenModelId: CodexModelId,
+  frozenThinkingLevel: CodexThinkingLevel,
   signal?: AbortSignal,
 ): Promise<BundleDecisionResult[]> {
   if (process.env.VITEST) {
@@ -766,14 +806,11 @@ export async function runCodexBundleDecisionBatch(
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: bundleDecisionSystemPrompt(true),
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
   const { session } = await createAgentSession({
     cwd: sessionCwd,
     agentDir,
@@ -788,12 +825,8 @@ export async function runCodexBundleDecisionBatch(
     settingsManager,
     resourceLoader,
   })
-  const configuredTimeout = Number(process.env.CODEX_INFERENCE_TIMEOUT_MS ?? 5 * 60_000)
-  const timeoutMs = Number.isFinite(configuredTimeout)
-    ? Math.min(15 * 60_000, Math.max(30_000, configuredTimeout))
-    : 5 * 60_000
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const inferenceSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const timeoutMs = codexInferenceTimeoutMs()
+  const inferenceSignal = codexRequestSignal()
   const abortSession = () => void session.abort().catch(() => {})
   let rejectAbort: (error: Error) => void = () => {}
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -812,12 +845,9 @@ export async function runCodexBundleDecisionBatch(
   }
   inferenceSignal.addEventListener('abort', abortSession, { once: true })
   inferenceSignal.addEventListener('abort', failOnAbort, { once: true })
-  if (inferenceSignal.aborted) {
-    abortSession()
-    failOnAbort()
-  }
   try {
     try {
+      inferenceSignal.throwIfAborted()
       await Promise.race([
         session.prompt(bundleBatchPrompt(cohorts), {
           expandPromptTemplates: false,
@@ -861,6 +891,19 @@ export async function runCodexBundlePartition(
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
   signal?: AbortSignal,
 ): Promise<BundlePartitionDecision> {
+  return withCodexRequest(
+    () => codexBundlePartition(input, frozenModelId, frozenThinkingLevel, signal),
+    codexBundleTimeoutMs(process.env.CODEX_BUNDLE_TIMEOUT_MS),
+    signal,
+  )
+}
+
+async function codexBundlePartition(
+  input: BundlePartitionInput,
+  frozenModelId: CodexModelId,
+  frozenThinkingLevel: CodexThinkingLevel,
+  signal?: AbortSignal,
+): Promise<BundlePartitionDecision> {
   if (process.env.VITEST) {
     throw new Error(
       'Live AI inference is disabled in automated tests. A manual live run requires an explicit user request.',
@@ -886,7 +929,7 @@ export async function runCodexBundlePartition(
     label: 'Globale Gruppierung übernehmen',
     description:
       'Submit one complete partition of every supplied email ID into multi-email stories and standalone IDs.',
-    parameters: bundlePartitionToolSchema,
+    parameters: bundlePartitionToolSchema(input.emails.length),
     async execute(_callId, args) {
       submitted.push(args)
       return finalCodexToolResult('Globale Gruppierung übernommen.')
@@ -903,14 +946,11 @@ export async function runCodexBundlePartition(
     cwd: sessionCwd,
     agentDir,
     settingsManager,
-    noExtensions: true,
-    noSkills: true,
-    noPromptTemplates: true,
-    noThemes: true,
-    noContextFiles: true,
+    ...isolatedResourceOptions(),
     systemPrompt: bundlePartitionSystemPrompt(),
   })
-  await resourceLoader.reload()
+  await abortable(resourceLoader.reload(), codexRequestSignal())
+  codexRequestSignal().throwIfAborted()
   const { session } = await createAgentSession({
     cwd: sessionCwd,
     agentDir,
@@ -926,8 +966,7 @@ export async function runCodexBundlePartition(
     resourceLoader,
   })
   const timeoutMs = codexBundleTimeoutMs(process.env.CODEX_BUNDLE_TIMEOUT_MS)
-  const timeoutSignal = AbortSignal.timeout(timeoutMs)
-  const inferenceSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal
+  const inferenceSignal = codexRequestSignal()
   const abortSession = () => void session.abort().catch(() => {})
   let rejectAbort: (error: Error) => void = () => {}
   const aborted = new Promise<never>((_resolve, reject) => {
@@ -946,12 +985,9 @@ export async function runCodexBundlePartition(
   }
   inferenceSignal.addEventListener('abort', abortSession, { once: true })
   inferenceSignal.addEventListener('abort', failOnAbort, { once: true })
-  if (inferenceSignal.aborted) {
-    abortSession()
-    failOnAbort()
-  }
   try {
     try {
+      inferenceSignal.throwIfAborted()
       await Promise.race([
         session.prompt(bundlePartitionPrompt(input), {
           expandPromptTemplates: false,

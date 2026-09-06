@@ -1,6 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
-const baseURL = 'http://127.0.0.1:4173'
+const port = process.env.MAIL_REVIEW_TEST_PORT ?? '4173'
+const baseURL = `http://127.0.0.1:${port}`
 
 export default defineConfig({
   testDir: './e2e',
@@ -15,6 +16,7 @@ export default defineConfig({
     baseURL,
     screenshot: 'only-on-failure',
     trace: 'retain-on-failure',
+    video: process.env.REVIEW_EVIDENCE_DIR ? 'on' : 'off',
   },
   webServer: {
     command: 'pnpm build && pnpm start',
@@ -22,10 +24,10 @@ export default defineConfig({
       DATA_DIR: 'test-results/runtime-data',
       HOST: '127.0.0.1',
       MAIL_REVIEW_DEMO: '1',
-      PORT: '4173',
+      PORT: port,
     },
     url: `${baseURL}/api/review/options`,
-    reuseExistingServer: !process.env.CI,
+    reuseExistingServer: false,
     timeout: 120_000,
   },
   projects: [

@@ -53,6 +53,37 @@ function partitionStory(emailIds: string[]) {
 }
 
 describe('global bundle partition builder', () => {
+  it('accepts and materializes partitions beyond 10000 items without repeated snapshot scans', async () => {
+    let reads = 0
+    const emails = Array.from({ length: 10_001 }, (_, index) => ({
+      ...mail(String(index), 'Fixture', 'Synthetic'),
+      get id() {
+        reads += 1
+        return String(index)
+      },
+      receivedAt: new Date(index * 1000).toISOString(),
+    }))
+    const ids = emails.map((email) => email.id)
+    const standalone = normalizeBundleDecisionPartition(ids, {
+      standaloneEmailIds: ids,
+      stories: [],
+    })
+    expect(standalone.standaloneEmailIds).toHaveLength(ids.length)
+    const oneStory = normalizeBundleDecisionPartition(ids, {
+      standaloneEmailIds: [],
+      stories: [partitionStory([...ids].reverse())],
+    })
+    expect(oneStory.stories[0]?.emailIds).toHaveLength(ids.length)
+    reads = 0
+    const run = await buildReviewBundlesFromPartition('large', emails, async () => ({
+      ...standalone,
+      standaloneEmailIds: [...ids].reverse(),
+    }))
+    expect(run.bundles.flatMap((bundle) => bundle.emailIds)).toEqual(ids)
+    expect(reads).toBeLessThan(ids.length * 30)
+    const grouped = await buildReviewBundlesFromPartition('large', emails, async () => oneStory)
+    expect(grouped.bundles[0]?.emailIds).toEqual(ids)
+  })
   it.each([379, 500])(
     'passes all %i summaries to exactly one global decision and materializes a full partition',
     async (messageCount) => {
@@ -171,7 +202,7 @@ describe('global bundle partition builder', () => {
     },
     {
       decision: { standaloneEmailIds: ['one', 'one', 'two'], stories: [] },
-      message: 'more than once',
+      message: 'standalone IDs are invalid',
       name: 'duplicate IDs',
     },
     {

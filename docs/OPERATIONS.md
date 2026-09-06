@@ -2,11 +2,11 @@
 
 ## Production contract
 
-- Release described by this source tree: `v0.9.1`
+- Release described by this source tree: `v0.9.2`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
-- GitOps source: `beasty/kub-homelab`
+- GitOps source: `beastyrabbit/kub-homelab` on GitHub
 
 ## Runtime contract
 
@@ -61,7 +61,18 @@ model exhausts its context or output length, the run remains stored and reports
 that condition separately; choose a narrower time range or another available
 model and reanalyze the same round.
 
-## Upgrade to v0.9.1
+## Upgrade to v0.9.2
+
+No manual migration is required from v0.9.1. Startup adds a revision column to
+retained-unread history so concurrent reconciliation preserves new decisions.
+Keep the existing `/data` volume and one application replica. Review rounds,
+drafts, and the server-side Codex login survive the upgrade.
+
+This release preserves completed mailbox batches across retries, keeps edits
+and background callbacks attached to their original round, and rejects reply
+generation when attachment or thread context is incomplete.
+
+## Earlier upgrades
 
 No manual database migration is required. Startup upgrades
 `inbox-walk.sqlite` from schema v4 through v7 before accepting requests.
@@ -87,9 +98,9 @@ content. Current releases do not expose manual relationship-label controls.
 
 ## Deployment path
 
-1. Forgejo Actions validates the project and publishes the tagged OCI image.
+1. GitHub Actions runs on `arc-inbox-walk`, validates the project, boots a demo container, and publishes `ghcr.io/beastyrabbit/inbox-walk` for `v*` tags. The tag must match the package version.
 2. The Infisical Operator syncs the Fastmail token to namespace `tools`.
-3. Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources.
+3. Pin the verified image tag and digest in `cluster/homelab/apps/tools/inbox-walk/helmrelease.yaml` in `beastyrabbit/kub-homelab`. Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources.
 4. The tools Pangolin blueprint exposes `https://inbox-walk.heerlab.com` to the `BeastyOnly` role.
 5. Homepage lists the service under Additional Services.
 

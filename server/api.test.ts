@@ -127,6 +127,7 @@ beforeAll(async () => {
           retainedIds.add(emailId)
         }),
       retainedIds: () => new Set(retainedIds),
+      retainedSnapshot: () => new Map([...retainedIds].map((id) => [id, 'fixture'])),
       retainOnly: (emailIds) => {
         for (const emailId of retainedIds) {
           if (!emailIds.has(emailId)) retainedIds.delete(emailId)
@@ -2890,75 +2891,105 @@ describe('demo API contract', () => {
     expect(restored.body.userState).toMatchObject(winner.body)
   })
 
-  it('rejects a slow state upload when another request finalizes before its write', async () => {
-    const created = await json<ReviewSnapshot>(
-      '/api/reviews',
-      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
-    )
-    const emailId = created.body.emails[0]?.id
-    expect(emailId).toBeDefined()
-    if (!emailId) return
-    const payload = JSON.stringify({
-      revision: created.body.userState.revision,
-      state: {
-        bundleGroups: [],
-        index: 0,
-        keptUnreadIds: [emailId],
-        processedIds: [emailId],
-        replyDrafts: {},
-        secondaryActionIds: [],
-        selectedMemberId: emailId,
-      },
-    })
-    let slowRequest: ReturnType<typeof httpRequest> | undefined
-    const slowResponse = new Promise<{ body: { error: { code: string } }; status: number }>(
-      (resolve, reject) => {
-        slowRequest = httpRequest(
-          `${baseUrl}/api/reviews/${created.body.snapshotId}/state`,
-          {
-            method: 'POST',
-            headers: {
-              'Content-Length': Buffer.byteLength(payload),
-              'Content-Type': 'application/json',
-              'X-Inbox-Walk-CSRF': created.body.csrfToken,
+  it.each([false, true])(
+    'rejects a slow state upload when another request finalizes (cache eviction=%s)',
+    async (evict) => {
+      const created = await json<ReviewSnapshot>(
+        '/api/reviews',
+        post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+      )
+      const emailId = created.body.emails[0]?.id
+      expect(emailId).toBeDefined()
+      if (!emailId) return
+      const payload = JSON.stringify({
+        revision: created.body.userState.revision,
+        state: {
+          bundleGroups: [],
+          index: 0,
+          keptUnreadIds: [emailId],
+          processedIds: [emailId],
+          replyDrafts: {},
+          secondaryActionIds: [],
+          selectedMemberId: emailId,
+        },
+      })
+      let slowRequest: ReturnType<typeof httpRequest> | undefined
+      const slowResponse = new Promise<{ body: { error: { code: string } }; status: number }>(
+        (resolve, reject) => {
+          slowRequest = httpRequest(
+            `${baseUrl}/api/reviews/${created.body.snapshotId}/state`,
+            {
+              method: 'POST',
+              headers: {
+                'Content-Length': Buffer.byteLength(payload),
+                'Content-Type': 'application/json',
+                'X-Inbox-Walk-CSRF': created.body.csrfToken,
+              },
             },
-          },
-          (response) => {
-            const chunks: Buffer[] = []
-            response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
-            response.on('end', () =>
-              resolve({
-                body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
-                  error: { code: string }
-                },
-                status: response.statusCode ?? 0,
-              }),
-            )
-          },
-        )
-        slowRequest.on('error', reject)
-      },
-    )
-    slowRequest?.write(payload.slice(0, 1))
-    await new Promise((resolve) => setTimeout(resolve, 25))
+            (response) => {
+              const chunks: Buffer[] = []
+              response.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+              response.on('end', () =>
+                resolve({
+                  body: JSON.parse(Buffer.concat(chunks).toString('utf8')) as {
+                    error: { code: string }
+                  },
+                  status: response.statusCode ?? 0,
+                }),
+              )
+            },
+          )
+          slowRequest.on('error', reject)
+        },
+      )
+      slowRequest?.write(payload.slice(0, 1))
+      await new Promise((resolve) => setTimeout(resolve, 25))
 
-    const finalized = await json<FinalizeResult>(
-      `/api/reviews/${created.body.snapshotId}/finalize`,
-      post(
-        finalizationBody(created.body, { finalizeIds: [emailId], keepUnreadIds: [] }),
-        created.body.csrfToken,
-      ),
-    )
-    expect(finalized.response.status).toBe(200)
-    slowRequest?.end(payload.slice(1))
+      if (evict) {
+        for (let index = 0; index < 22; index++) {
+          const id = crypto.randomUUID()
+          roundStore.create({
+            id,
+            csrfToken: 'fixture',
+            imageToken: 'fixture',
+            emails: created.body.emails,
+            filters: created.body.filters,
+            mailboxes: [],
+            mode: 'demo',
+          })
+          const other = await fetch(`${baseUrl}/api/reviews/${id}`)
+          await other.arrayBuffer()
+          expect(other.status).toBe(200)
+        }
+      }
 
-    await expect(slowResponse).resolves.toMatchObject({
-      body: { error: { code: 'ROUND_FINALIZED' } },
-      status: 409,
-    })
-  })
+      const finalized = await json<FinalizeResult>(
+        `/api/reviews/${created.body.snapshotId}/finalize`,
+        post(
+          finalizationBody(created.body, { finalizeIds: [emailId], keepUnreadIds: [] }),
+          created.body.csrfToken,
+        ),
+      )
+      expect(finalized.response.status).toBe(200)
+      slowRequest?.end(payload.slice(1))
 
-  it('does not delete a round while a draft request body is still arriving', async () => {
+      await expect(slowResponse).resolves.toMatchObject({
+        body: { error: { code: evict ? 'ROUND_RELOAD_REQUIRED' : 'ROUND_FINALIZED' } },
+        status: 409,
+      })
+      expect(roundStore.get(created.body.snapshotId)?.userState).toMatchObject({
+        revision: created.body.userState.revision,
+        keptUnreadIds: [],
+      })
+      expect(roundStore.get(created.body.snapshotId)?.finalization).toMatchObject({
+        state: 'finalized',
+        keepUnreadIds: [],
+        finalizeIds: [emailId],
+      })
+    },
+  )
+
+  it('preserves draft ownership through cache pressure until the request settles', async () => {
     const created = await json<ReviewSnapshot>(
       '/api/reviews',
       post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
@@ -2999,6 +3030,22 @@ describe('demo API contract', () => {
     })
     slowRequest?.write(payload.slice(0, 1))
     await new Promise((resolve) => setTimeout(resolve, 25))
+
+    for (let index = 0; index < 25; index += 1) {
+      const id = crypto.randomUUID()
+      roundStore.create({
+        id,
+        csrfToken: 'fixture',
+        imageToken: 'fixture',
+        emails: [email],
+        filters: defaultReviewFilters,
+        mailboxes: [],
+        mode: 'demo',
+      })
+      const other = await fetch(`${baseUrl}/api/reviews/${id}`)
+      await other.arrayBuffer()
+      expect(other.status).toBe(200)
+    }
 
     const blocked = await fetch(`${baseUrl}/api/reviews/${created.body.snapshotId}`, {
       method: 'DELETE',

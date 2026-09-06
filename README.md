@@ -125,13 +125,13 @@ lefthook run pre-commit
 ```
 
 Lefthook runs Biome, TypeScript, unit/API tests, and a redacted staged Gitleaks
-scan before commits. The Forgejo workflow repeats quality and browser tests,
+scan before commits. The GitHub Actions workflow repeats quality and browser tests,
 builds the production container through the shared BuildKit service, and
-publishes it to `git.heerlab.com/beasty/inbox-walk`.
+publishes it to `ghcr.io/beastyrabbit/inbox-walk` on the repository's ARC runners.
 
 ## Production
 
-This source tree describes release `v0.9.1`. Production releases are deployed at
+This source tree describes release `v0.9.2`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
@@ -139,7 +139,7 @@ The Codex OAuth record, review rounds, retained-unread history, and bundle
 learning data are stored under `DATA_DIR`; `TIKA_URL` points to the
 document-extraction sidecar.
 
-Deployment is managed from `beasty/kub-homelab`. Runtime secrets are synced by
+Deployment is managed from `beastyrabbit/kub-homelab` on GitHub. Runtime secrets are synced by
 the Infisical Operator; no secret values belong in this repository or in the
 container image.
 

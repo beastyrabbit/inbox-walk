@@ -63,6 +63,183 @@ function jmapResponse(methodResponses: unknown[]) {
 afterEach(() => vi.unstubAllGlobals())
 
 describe('Fastmail JMAP adapter', () => {
+  it.each(['read', 'spam', 'label'] as const)(
+    'exposes every confirmed %s batch before a later transport failure',
+    async (kind) => {
+      const events: string[] = []
+      const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+        const [method, args, callId] = JSON.parse(String(init?.body)).methodCalls[0]
+        if (method === 'Mailbox/get')
+          return jmapResponse([
+            [
+              method,
+              {
+                list: [
+                  { id: 'junk', name: 'Spam', role: 'junk' },
+                  { id: 'inbox', name: 'Inbox', role: 'inbox' },
+                  { id: 'label', name: 'Newsletter abmelden' },
+                ],
+              },
+              callId,
+            ],
+          ])
+        if (method === 'Email/get') throw new Error('Reconciliation unavailable')
+        const ids = Object.keys(args.update)
+        events.push(`attempt:${ids.join()}`)
+        if (ids.includes('second')) throw new Error('Lost connection')
+        return jmapResponse([[method, { updated: { first: null } }, callId]])
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      const context = { ...draftContext, maxObjectsInSet: 1 }
+      const work =
+        kind === 'read'
+          ? markEmailsRead(context, 'fixture', ['first', 'second', 'third'], (result) =>
+              events.push(`persist:${result.markedIds.join()}`),
+            )
+          : (kind === 'spam' ? moveEmailsOutOfSpam : tagEmailsForLaterUnsubscribe)(
+              context,
+              'fixture',
+              ['first', 'second', 'third'],
+              (result) => events.push(`persist:${result.succeededIds.join()}`),
+            )
+      await expect(work).rejects.toMatchObject({
+        code: 'JMAP_MUTATION_UNCONFIRMED',
+        details: { confirmedIds: ['first'], unknownIds: ['second'], unattemptedIds: ['third'] },
+      })
+      expect(events.slice(0, 3)).toEqual(['attempt:first', 'persist:first', 'attempt:second'])
+      expect(events).not.toContain('attempt:third')
+    },
+  )
+
+  it('reconciles an ambiguous mark-read response before reporting the transport error', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async (_input, init) => {
+        const [method, , callId] = JSON.parse(String(init?.body)).methodCalls[0]
+        if (method === 'Email/set') throw new Error('Response lost')
+        return jmapResponse([
+          [method, { list: [{ id: 'first', keywords: { $seen: true } }] }, callId],
+        ])
+      }),
+    )
+    const progress = vi.fn()
+    await expect(
+      markEmailsRead(draftContext, 'fixture', ['first'], progress),
+    ).rejects.toMatchObject({
+      code: 'JMAP_MUTATION_UNCONFIRMED',
+      details: { confirmedIds: ['first'], unknownIds: [], unattemptedIds: [] },
+    })
+    expect(progress).toHaveBeenCalledWith({ failed: [], markedIds: ['first'] })
+  })
+
+  it.each(['retry', 'exhaust'] as const)(
+    'handles mid-pagination query-state changes with %s',
+    async (mode) => {
+      let attempts = 0
+      const ids = Array.from({ length: 251 }, (_, i) => `mail-${i}`)
+      vi.stubGlobal(
+        'fetch',
+        vi.fn<typeof fetch>(async (input, init) => {
+          if (String(input).endsWith('/jmap/session'))
+            return new Response(
+              JSON.stringify({
+                apiUrl: draftContext.apiUrl,
+                downloadUrl: draftContext.downloadUrl,
+                primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acc-1' },
+                capabilities: {},
+              }),
+            )
+          const [method, args, callId] = JSON.parse(String(init?.body)).methodCalls[0]
+          if (method === 'Mailbox/get')
+            return jmapResponse([[method, { list: [{ id: 'inbox', role: 'inbox' }] }, callId]])
+          if (method === 'Email/query') {
+            if (args.position === 0 && callId !== 'query-check') attempts += 1
+            const changed = args.position > 0 && (mode === 'exhaust' || attempts === 1)
+            return jmapResponse([
+              [
+                method,
+                {
+                  ids: ids.slice(args.position, args.position + args.limit),
+                  total: ids.length,
+                  queryState: changed ? 'changed' : 'stable',
+                },
+                callId,
+              ],
+            ])
+          }
+          return jmapResponse([
+            [
+              method,
+              {
+                list: args.ids.map((id: string) => ({
+                  ...storedDraft(id, `thread-${id}`),
+                  mailboxIds: { inbox: true },
+                })),
+              },
+              callId,
+            ],
+          ])
+        }),
+      )
+      if (mode === 'retry') {
+        expect((await fetchUnreadSnapshot('fixture')).emails.map((email) => email.id)).toEqual(ids)
+        expect(attempts).toBe(2)
+      } else {
+        await expect(fetchUnreadSnapshot('fixture')).rejects.toThrow()
+        expect(attempts).toBe(3)
+      }
+    },
+  )
+
+  it.each(['recipients', 'body', 'thread', 'readback'] as const)(
+    'rejects a %s mismatch after creation and recovers a matching draft on retry',
+    async (failure) => {
+      let created = false
+      let retry = false
+      let creates = 0
+      const fetchMock = vi.fn<typeof fetch>(async (_input, init) => {
+        const [method, args, callId] = JSON.parse(String(init?.body)).methodCalls[0]
+        if (method === 'Mailbox/get')
+          return jmapResponse([[method, { list: [{ id: 'drafts', role: 'drafts' }] }, callId]])
+        if (method === 'Thread/get')
+          return jmapResponse([
+            [
+              method,
+              { list: [{ id: 'thread-1', emailIds: created ? ['new-draft'] : [] }] },
+              callId,
+            ],
+          ])
+        if (method === 'Email/set') {
+          created = true
+          creates += 1
+          expect(args.create).toBeDefined()
+          return jmapResponse([
+            [method, { created: { draft: { id: 'new-draft', threadId: 'thread-1' } } }, callId],
+          ])
+        }
+        if (failure === 'readback' && !retry) throw new Error('Read-back unavailable')
+        const draft = storedDraft('new-draft', 'thread-1')
+        if (!retry) {
+          if (failure === 'recipients') draft.to = [{ name: '', email: 'different@example.test' }]
+          if (failure === 'body') draft.bodyValues.text.value = 'Different body'
+          if (failure === 'thread') draft.threadId = 'different-thread'
+        }
+        return jmapResponse([[method, { list: [draft] }, callId]])
+      })
+      vi.stubGlobal('fetch', fetchMock)
+      await expect(createAndVerifyDraft(draftContext, 'fixture', draftInput)).rejects.toThrow()
+      retry = true
+      await expect(
+        createAndVerifyDraft(draftContext, 'fixture', draftInput),
+      ).resolves.toMatchObject({ recovered: true, verified: true })
+      expect(creates).toBe(1)
+      expect(
+        fetchMock.mock.calls.every(
+          (_, index) => !requestMethod(fetchMock, index)?.startsWith('EmailSubmission/'),
+        ),
+      ).toBe(true)
+    },
+  )
   it('reuses a matching draft after process-memory loss without creating another one', async () => {
     const fetchMock = vi
       .fn<typeof fetch>()

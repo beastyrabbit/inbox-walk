@@ -1,11 +1,13 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { DefaultResourceLoader, SettingsManager } from '@earendil-works/pi-coding-agent'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   bundleDecisionSystemPrompt,
   bundlePartitionPrompt,
   bundlePartitionSystemPrompt,
+  bundlePartitionToolSchema,
   CodexAuthenticationError,
   CodexContextLengthError,
   codexAuthStoragePath,
@@ -14,6 +16,7 @@ import {
   ensureCodexStorageReady,
   finalCodexToolResult,
   isCodexAuthenticationFailure,
+  isolatedResourceOptions,
   MAX_CODEX_BUNDLE_TIMEOUT_MS,
   requireSubmittedBundlePartition,
   runCodexReply,
@@ -41,6 +44,31 @@ afterEach(() => {
 })
 
 describe('Codex provider boundary', () => {
+  it('does not load ambient prompts, context, extensions or skills', async () => {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'inbox-loader-'))
+    temporaryDirectories.push(directory)
+    fs.writeFileSync(path.join(directory, 'APPEND_SYSTEM.md'), 'SYNTHETIC_APPEND_MARKER')
+    fs.writeFileSync(path.join(directory, 'AGENTS.md'), 'SYNTHETIC_CONTEXT_MARKER')
+    const loader = new DefaultResourceLoader({
+      cwd: directory,
+      agentDir: directory,
+      settingsManager: SettingsManager.inMemory(),
+      ...isolatedResourceOptions(),
+      systemPrompt: 'Explicit prompt only',
+    })
+    await loader.reload()
+    expect(loader.getAppendSystemPrompt()).toEqual([])
+    expect(loader.getAgentsFiles().agentsFiles).toEqual([])
+    expect(loader.getSkills().skills).toEqual([])
+    expect(loader.getExtensions().extensions).toEqual([])
+  })
+
+  it('sizes all partition tool collections from the frozen snapshot', () => {
+    const schema = bundlePartitionToolSchema(10_001)
+    expect(schema.properties.stories).toMatchObject({ maxItems: 10_001 })
+    expect(schema.properties.stories.items.properties.emailIds).toMatchObject({ maxItems: 10_001 })
+    expect(schema.properties.standaloneEmailIds).toMatchObject({ maxItems: 10_001 })
+  })
   it('terminates the agent loop after accepting a structured result', () => {
     expect(finalCodexToolResult('accepted')).toMatchObject({ terminate: true })
   })
