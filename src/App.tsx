@@ -1183,6 +1183,9 @@ function App() {
 
   async function saveDraft() {
     if (!snapshot || !summary || !editor) return
+    const epoch = roundEpochRef.current
+    const belongsToRound = () =>
+      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
     let to: MailAddress[]
     let cc: MailAddress[]
     try {
@@ -1221,13 +1224,14 @@ function App() {
         ...draftPayload,
         requestId,
       })
+      if (!belongsToRound()) return
       setDraftResults((current) => ({ ...current, [summary.id]: saved }))
       setKeptUnread((current) => new Set(current).add(summary.id))
       setStatus('Draft in Fastmail gespeichert; die Nachricht bleibt ungelesen.')
     } catch (cause) {
-      setError(errorMessage(cause))
+      if (belongsToRound()) setError(errorMessage(cause))
     } finally {
-      setSubmitting(false)
+      if (belongsToRound()) setSubmitting(false)
     }
   }
 

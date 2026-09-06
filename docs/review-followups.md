@@ -4,6 +4,8 @@ This change addresses the [5 September project review](https://schaffa.dev/p/4ne
 
 The [6 September re-review](https://schaffa.dev/p/yujkms5pwdn37rob) found four further races. Finalization now rejects a snapshot displaced during preflight, preserving the newer durable selection and confirmed progress. History reconciliation compares captured record versions, so concurrent additions, repeated keeps and delete/reinsert operations survive stale queries. Browser finalization callbacks check the originating round and epoch, including error recovery after browser Back.
 
+The final verification also reproduced two neighboring cases. Slow state uploads now reject a snapshot displaced by cache eviction before writing, so they cannot change a round finalized through a replacement snapshot. Draft-save callbacks also check their originating round and epoch; late success or failure cannot alter the next round's unread decisions, status or request state.
+
 Codex deadlines now start before authentication and session setup. A bounded refresh adapter passes cancellation through the refresh request and response body; aborting a refresh releases its file lock. A cancelled lock waiter does no refresh or persistence work if the SDK's bounded lock retry later succeeds. The adapter retains Pi's login and storage format and never includes token responses in errors. The history database adds a revision column on startup without removing existing decisions.
 
 | Finding | Result |

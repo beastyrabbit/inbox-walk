@@ -1206,6 +1206,63 @@ test('refreshes the durable lock after a post-lock finalization error', async ({
 })
 
 for (const responseKind of ['success', 'error'] as const) {
+  test(`ignores a late draft ${responseKind} after browser Back opens another round`, async ({
+    page,
+  }) => {
+    await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+    await page.getByLabel('Was soll die Antwort sagen?').fill('Synthetic reply')
+    await page.getByRole('button', { name: 'Entwurf erstellen' }).click()
+    await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toBeVisible()
+    const started = deferred()
+    const release = deferred()
+    await page.route('**/api/reviews/*/drafts', async (route) => {
+      const response = await route.fetch()
+      started.resolve()
+      await release.promise
+      if (responseKind === 'success') await route.fulfill({ response })
+      else
+        await route.fulfill({
+          status: 502,
+          json: {
+            error: {
+              code: 'SYNTHETIC_FAILURE',
+              message: 'Synthetic delayed draft error',
+              retryable: true,
+            },
+          },
+        })
+    })
+    await page.getByRole('button', { name: 'In Fastmail als Draft speichern' }).click()
+    await started.promise
+    await page.goBack()
+    await expect(page.getByRole('heading', { name: 'Runden', exact: true })).toBeVisible()
+    await startAndOpenRound(page)
+    await expect(page.getByRole('heading', { name: 'Deine Verbindung am Montag' })).toBeVisible()
+    await expect(page).toHaveURL(/\/rounds\/[^/]+$/)
+    const settled = page.waitForResponse('**/api/reviews/*/drafts')
+    const newRoundId = page.url().split('/').at(-1)
+    release.resolve()
+    await settled
+    await expect(
+      page.getByText(/Draft in Fastmail gespeichert|Synthetic delayed draft error/),
+    ).toHaveCount(0)
+    await expect(
+      page.getByRole('button', { name: 'Ungelesen behalten', exact: true }),
+    ).toHaveAttribute('aria-pressed', 'false')
+    await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+    await expect(page.getByLabel('Was soll die Antwort sagen?')).toHaveValue('')
+    await expect(page.getByText(/Draft gespeichert und verifiziert/)).toHaveCount(0)
+    await page.getByRole('button', { name: 'Antwort schließen' }).click()
+    await completeStory(page)
+    await expect(page.getByRole('heading', { name: 'Re: Essen nächste Woche?' })).toBeVisible()
+    await page.getByRole('button', { name: 'Runden', exact: true }).click()
+    const response = await page.request.get(`/api/reviews/${newRoundId}`)
+    expect(response.ok()).toBe(true)
+    const round = await response.json()
+    expect(round.userState.keptUnreadIds).toEqual([])
+    expect(round.userState.processedIds).toEqual(['demo-train'])
+  })
+
   test(`ignores a late finalization ${responseKind} after browser Back opens another round`, async ({
     page,
   }) => {

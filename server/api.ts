@@ -760,7 +760,20 @@ function requireCsrf(req: IncomingMessage, snapshot: StoredSnapshot) {
   }
 }
 
-function requireMutableRoundState(snapshot: StoredSnapshot) {
+function requireCurrentSnapshot(snapshotId: string, snapshot: StoredSnapshot) {
+  // Request-body/context awaits may outlive eviction, deletion or rehydration.
+  if (snapshots.get(snapshotId) !== snapshot) {
+    throw new ApiHttpError(
+      409,
+      'ROUND_RELOAD_REQUIRED',
+      'Der Rundenstand wurde neu geladen. Bitte die Runde erneut öffnen.',
+      true,
+    )
+  }
+}
+
+function requireMutableRoundState(snapshotId: string, snapshot: StoredSnapshot) {
+  requireCurrentSnapshot(snapshotId, snapshot)
   if (snapshot.finalizationState === 'active' && !snapshot.finalEmailIds) return
   throw new ApiHttpError(
     409,
@@ -2467,7 +2480,7 @@ async function updateRoundState(
 ) {
   const snapshot = getSnapshot(snapshotId)
   requireCsrf(req, snapshot)
-  requireMutableRoundState(snapshot)
+  requireMutableRoundState(snapshotId, snapshot)
   const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
   const parsed = z
     .object({
@@ -2538,7 +2551,7 @@ async function updateRoundState(
   }
   // The request body can arrive slowly while another tab finalizes the round.
   // Recheck immediately before the synchronous revision-guarded write.
-  requireMutableRoundState(snapshot)
+  requireMutableRoundState(snapshotId, snapshot)
   if (apiOptions.roundStore) {
     try {
       snapshot.userState = apiOptions.roundStore.updateUserState(
@@ -2601,16 +2614,7 @@ async function finalize(
     }
   }
   const requireFinalizeAvailable = () => {
-    // A pre-lock await may outlive cache eviction or deletion. Never lock using
-    // an object replaced by a subsequently hydrated, possibly finalized round.
-    if (snapshots.get(snapshotId) !== snapshot) {
-      throw new ApiHttpError(
-        409,
-        'ROUND_RELOAD_REQUIRED',
-        'Der Rundenstand wurde neu geladen. Bitte die Runde erneut öffnen.',
-        true,
-      )
-    }
+    requireCurrentSnapshot(snapshotId, snapshot)
     if (snapshot.finalizationState === 'finalizing') {
       throw new ApiHttpError(
         409,
