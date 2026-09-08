@@ -2,7 +2,7 @@
 
 ## Production contract
 
-- Release described by this source tree: `v0.9.2`
+- Release described by this source tree: `v0.9.3`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -60,6 +60,12 @@ explicit reanalysis. There is no application-level message cap. If the selected
 model exhausts its context or output length, the run remains stored and reports
 that condition separately; choose a narrower time range or another available
 model and reanalyze the same round.
+
+## Upgrade to v0.9.3
+
+This release changes the reader layout only. No migration or configuration
+change is required from v0.9.2. Keep the existing `/data` volume and one
+application replica.
 
 ## Upgrade to v0.9.2
 

@@ -21,6 +21,7 @@ Fastmail.
 - Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
 - Can omit messages deliberately kept unread in an earlier round using a small local SQLite history.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
+- Uses the available window for reading mail, with one compact story title and expandable message details.
 - Keeps selected messages unread and marks the rest read only after confirmation.
 - Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.
 - Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
@@ -131,7 +132,7 @@ publishes it to `ghcr.io/beastyrabbit/inbox-walk` on the repository's ARC runner
 
 ## Production
 
-This source tree describes release `v0.9.2`. Production releases are deployed at
+This source tree describes release `v0.9.3`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

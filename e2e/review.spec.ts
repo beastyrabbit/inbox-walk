@@ -1373,16 +1373,53 @@ test('bundles connected GitHub and Railway notifications without manual grouping
 }) => {
   await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
   await page.getByRole('button', { name: /Railway deployment successful/ }).click()
-  await expect(page.getByText('GitHub · Railway')).toBeVisible()
   await expect(
     page.getByRole('list', { name: 'Verlauf der Story' }).getByRole('button'),
   ).toHaveCount(4)
   await page
     .getByRole('button', { name: /GitHub · \[beasty\/inbox-walk\] Pull request #184 opened/ })
     .click()
+  await page.getByText('Details', { exact: true }).click()
   await expect(page.locator('.original-subject')).toHaveText(/Pull request #184 opened/)
-  await expect(page.getByText('4 Originale')).toBeVisible()
-  await expect(page.locator('.bundle-tools button')).toHaveCount(0)
+  await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+})
+
+test('fills the available window with mail and keeps walk controls in view', async ({ page }) => {
+  for (const viewport of [
+    { width: 1920, height: 1080 },
+    { width: 1280, height: 720 },
+    { width: 393, height: 851 },
+  ]) {
+    await page.setViewportSize(viewport)
+    const frame = page.locator('iframe.message-body')
+    await expect(frame).toBeVisible()
+    const box = await frame.boundingBox()
+    expect(box).not.toBeNull()
+    if (!box) throw new Error('Message frame is missing')
+    expect(box.width).toBe(viewport.width)
+    expect(box.height).toBeGreaterThan(viewport.height * 0.55)
+    const controls = await page.locator('.controls').boundingBox()
+    expect(controls).not.toBeNull()
+    if (!controls) throw new Error('Walk controls are missing')
+    expect(controls.y + controls.height).toBeLessThanOrEqual(viewport.height)
+    expect(box.y + box.height).toBeLessThanOrEqual(controls.y)
+    expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(viewport.width)
+    await expect(page.getByRole('heading', { level: 1 })).toHaveCount(1)
+    await expect(page.getByRole('list', { name: 'Verlauf der Story' })).toHaveCount(0)
+  }
+  await page.setViewportSize({ width: 1440, height: 900 })
+  await page.getByRole('button', { name: 'Antwort entwerfen' }).click()
+  await expect(page.getByRole('heading', { name: 'Antwortentwurf' })).toBeVisible()
+  await expect
+    .poll(async () => {
+      const frame = await page.locator('iframe.message-body').boundingBox()
+      return frame ? frame.x + frame.width : Infinity
+    })
+    .toBeLessThanOrEqual(980)
+  const next = await page.locator('.control-button.next').boundingBox()
+  expect(next).not.toBeNull()
+  if (!next) throw new Error('Next control is missing')
+  expect(next.x + next.width).toBeLessThanOrEqual(980)
 })
 
 test('completes every bundle member while protecting one selected original', async ({ page }) => {
