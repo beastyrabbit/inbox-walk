@@ -1796,72 +1796,53 @@ function App() {
       </header>
 
       <main className="reader">
-        <section className="bundle-story" aria-labelledby="bundle-title">
-          <header className="bundle-heading">
-            <div>
-              <p className="bundle-kicker">
-                {currentBundle.timeline
-                  .map((item) => item.source)
-                  .filter((source, sourceIndex, sources) => sources.indexOf(source) === sourceIndex)
-                  .join(' · ')}
-              </p>
-              <h1 id="bundle-title">{currentBundle.title}</h1>
-            </div>
-            <span className="bundle-state">{currentBundle.currentState}</span>
-          </header>
-          <p className="bundle-summary">{currentBundle.summary}</p>
-          <ol className="bundle-timeline" aria-label="Verlauf der Story">
-            {currentBundle.timeline.map((item) => {
-              const original = emails.find((emailItem) => emailItem.id === item.emailId)
-              return (
-                <li key={item.emailId}>
-                  <button
-                    type="button"
-                    className={summary.id === item.emailId ? 'selected' : ''}
-                    onClick={() => {
-                      setSelectedMemberId(item.emailId)
-                      setReplyOpen(false)
-                    }}
-                  >
-                    <time dateTime={item.occurredAt}>{formatDate(item.occurredAt)}</time>
-                    <strong>
-                      {item.source} · {item.event}
-                    </strong>
-                    <span>
-                      {keptUnread.has(item.emailId) ? 'Bleibt ungelesen' : original?.preview}
-                    </span>
-                  </button>
-                </li>
-              )
-            })}
-          </ol>
-          <div className="bundle-tools">
-            <span>
-              {currentBundle.emailIds.length}{' '}
-              {currentBundle.emailIds.length === 1 ? 'Original' : 'Originale'}
-            </span>
-          </div>
-        </section>
-        <article className="message-card">
+        <article className="message-card" aria-labelledby="bundle-title">
           <header className="message-header">
+            <h1 id="bundle-title">{currentBundle.title}</h1>
             <div className="message-heading">
-              <div>
-                <p className="sender" title={fullAddress(summary.from)}>
-                  {addressLine(summary.from)}
-                </p>
-                <p className="original-subject">{summary.subject || '(Kein Betreff)'}</p>
-              </div>
+              <p className="sender" title={fullAddress(summary.from)}>
+                {addressLine(summary.from)}
+              </p>
               <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
+              <details className="message-details" key={summary.id}>
+                <summary>Details</summary>
+                <div className="message-details-content">
+                  <p className="bundle-summary">{currentBundle.summary}</p>
+                  <p>{currentBundle.currentState}</p>
+                  <p className="original-subject">{summary.subject || '(Kein Betreff)'}</p>
+                  <p title={fullAddress(summary.to)}>An {addressLine(summary.to)}</p>
+                  <p>
+                    {summary.mailboxNames.join(' · ')}
+                    {summary.isNewsletter && ' · Newsletter'}
+                  </p>
+                </div>
+              </details>
             </div>
-            <div className="message-meta">
-              <span title={fullAddress(summary.to)}>An {addressLine(summary.to)}</span>
-              {summary.mailboxNames.map((mailbox) => (
-                <span className="mailbox" key={mailbox}>
-                  {mailbox}
-                </span>
-              ))}
-              {summary.isNewsletter && <span className="mailbox">Newsletter</span>}
-            </div>
+            {currentBundle.emailIds.length > 1 && (
+              <ol className="bundle-timeline" aria-label="Verlauf der Story">
+                {currentBundle.timeline.map((item) => {
+                  return (
+                    <li key={item.emailId}>
+                      <button
+                        type="button"
+                        className={summary.id === item.emailId ? 'selected' : ''}
+                        aria-pressed={summary.id === item.emailId}
+                        title={`${formatDate(item.occurredAt)} · ${item.source} · ${item.event}`}
+                        onClick={() => {
+                          setSelectedMemberId(item.emailId)
+                          setReplyOpen(false)
+                        }}
+                      >
+                        <strong>
+                          {item.source} · {item.event}
+                        </strong>
+                        {keptUnread.has(item.emailId) && <span>Bleibt ungelesen</span>}
+                      </button>
+                    </li>
+                  )
+                })}
+              </ol>
+            )}
             {email?.bodyTruncated && (
               <p className="warning-note">
                 Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
