@@ -1058,12 +1058,22 @@ test('flushes pending reply notes before leaving and reopening the round', async
   await expect(page.getByLabel('Was soll die Antwort sagen?')).toHaveValue(notes)
 })
 
-test('requires confirmation before finalizing the fixed snapshot', async ({ page }) => {
+test('automatically finalizes the fixed snapshot after every story is confirmed', async ({
+  page,
+}) => {
+  const roundId = new URL(page.url()).pathname.split('/').at(-1)
+  await page.keyboard.press('ArrowUp')
   for (let index = 0; index < 5; index += 1) await completeStory(page)
-  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
-  await expect(page.getByText('Bereits bearbeitet')).toBeVisible()
-  await expect(page.getByText('Neue Nachrichten seit dem Start')).toBeVisible()
-  await page.getByRole('button', { name: 'Änderungen speichern' }).click()
+  await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+  const round = await (await page.request.get(`/api/reviews/${roundId}`)).json()
+  expect(round.userState.processedIds).toHaveLength(9)
+  expect(round.finalization.result).toMatchObject({
+    finalized: true,
+    markedRead: 8,
+    keptUnread: 1,
+    untouched: 0,
+  })
+  await page.reload()
   await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
 
   await page.getByRole('button', { name: 'Runden' }).click()
@@ -1089,6 +1099,43 @@ test('requires confirmation before finalizing the fixed snapshot', async ({ page
   await expect(completedRow.getByRole('button', { name: 'Runde öffnen' })).toBeEnabled({
     timeout: 15_000,
   })
+})
+
+test('automatically finishes when the last unprocessed story is not at the end', async ({
+  page,
+}) => {
+  await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
+  await page.locator('.overview-list button').nth(1).click()
+  for (let index = 0; index < 4; index += 1) await completeStory(page)
+  await expect(page.getByRole('heading', { name: 'Review abschließen?' })).toBeVisible()
+  await page.getByRole('button', { name: 'Zurück', exact: true }).click()
+  await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
+  await page.locator('.overview-list button').first().click()
+  await completeStory(page)
+  await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+  await expect(page.getByText(/9 Nachrichten wurden als gelesen markiert/)).toBeVisible()
+})
+
+test('keeps an automatic finalization failure available for manual retry', async ({ page }) => {
+  let attempts = 0
+  await page.route('**/api/reviews/*/finalize', async (route) => {
+    attempts += 1
+    if (attempts > 1) return route.continue()
+    await route.fulfill({
+      status: 502,
+      json: {
+        error: { code: 'SYNTHETIC_FAILURE', message: 'Abschluss fehlgeschlagen.', retryable: true },
+      },
+    })
+  })
+  for (let index = 0; index < 5; index += 1) await completeStory(page)
+  await expect(page.getByRole('alert')).toContainText('Abschluss fehlgeschlagen.')
+  const retry = page.getByRole('button', { name: 'Änderungen speichern' })
+  await expect(retry).toBeEnabled()
+  expect(attempts).toBe(1)
+  await retry.click()
+  await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+  expect(attempts).toBe(2)
 })
 
 test('can finalize only messages already confirmed with Weiter', async ({ page }) => {
