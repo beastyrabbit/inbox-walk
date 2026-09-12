@@ -319,6 +319,7 @@ function App() {
   const stateSaveTimerRef = useRef<number | null>(null)
   const stateSaveFailedRef = useRef(false)
   const creatingRunRef = useRef(false)
+  const autoFinalizeRoundRef = useRef<string | null>(null)
   const legacyMigrationRef = useRef<LegacyReviewCheckpoint | null>(null)
 
   const emails = snapshot?.emails ?? []
@@ -358,6 +359,7 @@ function App() {
   )
 
   const applySnapshot = useCallback((nextSnapshot: ReviewSnapshot) => {
+    autoFinalizeRoundRef.current = null
     roundEpochRef.current += 1
     detailRequestsRef.current.clear()
     replyBodyEditsRef.current.clear()
@@ -1007,14 +1009,23 @@ function App() {
     if (view !== 'review' || !currentBundle) return
     if (summary && !details[summary.id] && !failedDetails.has(summary.id)) return
     setReplyOpen(false)
-    setProcessedIds((current) => {
-      const nextProcessed = new Set(current)
-      for (const id of currentBundle.emailIds) nextProcessed.add(id)
-      return nextProcessed
-    })
-    if (index >= bundles.length - 1) setView('confirm')
+    const nextProcessed = new Set(processedIds)
+    for (const id of currentBundle.emailIds) nextProcessed.add(id)
+    setProcessedIds(nextProcessed)
+    if (index >= bundles.length - 1 || emails.every((email) => nextProcessed.has(email.id)))
+      setView('confirm')
     else setIndex((current) => current + 1)
-  }, [bundles.length, currentBundle, index, view, summary, details, failedDetails])
+  }, [
+    bundles.length,
+    currentBundle,
+    index,
+    view,
+    summary,
+    details,
+    failedDetails,
+    processedIds,
+    emails,
+  ])
 
   const finishProcessed = useCallback(() => {
     if (view !== 'review' || processedIds.size === 0) return
@@ -1235,7 +1246,7 @@ function App() {
     }
   }
 
-  async function finalizeReview() {
+  const finalizeReview = useCallback(async () => {
     if (!snapshot || pendingDetails.size > 0) return
     const epoch = roundEpochRef.current
     const belongsToRound = () =>
@@ -1293,7 +1304,43 @@ function App() {
     } finally {
       if (belongsToRound()) setSubmitting(false)
     }
-  }
+  }, [
+    snapshot,
+    pendingDetails.size,
+    flushState,
+    finalizedEmailIds,
+    finalizedKeptUnreadIds,
+    finalizedSecondaryActionIds,
+    applySnapshot,
+  ])
+
+  useEffect(() => {
+    if (
+      !snapshot ||
+      view !== 'confirm' ||
+      pendingDetails.size > 0 ||
+      submitting ||
+      stateConflict ||
+      statePersistenceFailed ||
+      snapshot.finalization.selectionLocked ||
+      emails.length === 0 ||
+      finalizedEmailIds.length !== emails.length ||
+      autoFinalizeRoundRef.current === snapshot.snapshotId
+    )
+      return
+    autoFinalizeRoundRef.current = snapshot.snapshotId
+    void finalizeReview()
+  }, [
+    emails.length,
+    finalizedEmailIds.length,
+    finalizeReview,
+    pendingDetails.size,
+    snapshot,
+    stateConflict,
+    statePersistenceFailed,
+    submitting,
+    view,
+  ])
 
   async function startNewReview() {
     if (creatingRunRef.current) return
