@@ -23,6 +23,7 @@ Fastmail.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
 - Uses the available window for reading mail, with one compact story title and expandable message details.
 - Keeps selected messages unread and marks the rest read only after confirmation.
+- Closes a round automatically after every message in its frozen snapshot is processed.
 - Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.
 - Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
 - Loads up to 100 messages from the selected reply thread; this limit does not cap a review round.
