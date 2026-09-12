@@ -1721,8 +1721,8 @@ test('reviews Spam separately and makes Down mean Not Spam', async ({ page }) =>
     'true',
   )
   await completeStory(page)
-  await expect(page.getByText('Aus Spam in die Inbox')).toBeVisible()
-  await expect(page.locator('.review-summary div').filter({ hasText: 'Aus Spam' })).toContainText(
-    '1',
-  )
+  await expect(page.getByRole('heading', { name: 'Review abgeschlossen' })).toBeVisible()
+  await expect(
+    page.getByText(/1 Nachrichten wurden aus Spam in die Inbox verschoben/),
+  ).toBeVisible()
 })
