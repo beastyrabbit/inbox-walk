@@ -1,8 +1,14 @@
 # Inbox Walk
 
-Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one
-complete snapshot of unread incoming mail, groups related notifications into
-review stories, and applies read-state changes only after a final confirmation.
+
+Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one unread-mail snapshot, groups related messages into stories, and changes read state only after you confirm the result.
+
+## Highlights
+
+- Review a stable snapshot without messages moving underneath you.
+- Expand a story to inspect every original message.
+- Prepare a thread-aware Fastmail draft with Codex.
+- Keep sending in Fastmail. Inbox Walk has no send endpoint.
 
 For messages that need an answer, Inbox Walk can use Codex through a ChatGPT
 Plus/Pro subscription to prepare a thread-aware reply and save it as a verified
