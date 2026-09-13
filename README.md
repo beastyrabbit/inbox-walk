@@ -148,3 +148,9 @@ container image.
 
 See [product behavior](docs/PRODUCT.md), [delivery status](docs/BOARD.md), and
 [operations](docs/OPERATIONS.md).
+
+## Live preview
+
+The live interface shows completed analysis rounds, filters, time windows, and the one-click round workflow.
+
+![Inbox Walk interface](https://schaffa.dev/f/jnpAVwnym9BXhmjfRh6XJw.webp)
