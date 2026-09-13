@@ -10,11 +10,6 @@ Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one unre
 - Prepare a thread-aware Fastmail draft with Codex.
 - Keep sending in Fastmail. Inbox Walk has no send endpoint.
 
-For messages that need an answer, Inbox Walk can use Codex through a ChatGPT
-Plus/Pro subscription to prepare a thread-aware reply and save it as a verified
-Fastmail draft. It has no send-mail endpoint or send control; sending remains in
-Fastmail.
-
 ## What it does
 
 - Loads every matching unread incoming message into a stable, paginated JMAP snapshot.
