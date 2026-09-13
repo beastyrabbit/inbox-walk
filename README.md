@@ -153,4 +153,4 @@ See [product behavior](docs/PRODUCT.md), [delivery status](docs/BOARD.md), and
 
 The live interface shows completed analysis rounds, filters, time windows, and the one-click round workflow.
 
-![Inbox Walk interface](https://schaffa.dev/f/jnpAVwnym9BXhmjfRh6XJw.webp)
+![Inbox Walk interface](https://schaffa.dev/f/_6rNaj2njDv7k5R01ZmdPA.webp)
