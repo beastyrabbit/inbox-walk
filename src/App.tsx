@@ -23,9 +23,9 @@ import {
 } from './review-state.ts'
 import {
   type CodexLoginState,
-  type CodexModelId,
+  type CodexSpeed,
   type CodexThinkingLevel,
-  codexModels,
+  codexModelLabel,
   type DraftResult,
   defaultReviewFilters,
   type FinalizeResult,
@@ -145,7 +145,7 @@ function analysisStatus(analysis: ReviewSnapshot['analysis']) {
 }
 
 function analysisOrigin(analysis: ReviewSnapshot['analysis']) {
-  const label = codexModels.find((model) => model.id === analysis.model)?.label
+  const label = codexModelLabel(analysis.model)
   if (analysis.engine === 'fallback') {
     return analysis.callCount > 0 && label
       ? `Sichere Einzelansicht · Codex-Versuch ${label}`
@@ -287,7 +287,6 @@ function App() {
   const [deleteRun, setDeleteRun] = useState<ReviewRunSummary | null>(null)
   const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
   const [codexLoginBusy, setCodexLoginBusy] = useState(false)
-  const [codexSettingsBusy, setCodexSettingsBusy] = useState(false)
   const [runActionIds, setRunActionIds] = useState<Set<string>>(new Set())
   const [deletingRunIds, setDeletingRunIds] = useState<Set<string>>(new Set())
   const [migrationRoundId, setMigrationRoundId] = useState<string | null>(null)
@@ -1517,35 +1516,16 @@ function App() {
     }
   }
 
-  async function changeCodexSettings(model: CodexModelId, thinkingLevel: CodexThinkingLevel) {
-    setCodexSettingsBusy(true)
-    setSettingsError(null)
-    try {
-      const codex = await api.updateCodexSettings(model, thinkingLevel)
-      setCodexSettings(codex)
-      setOptions((current) => (current ? { ...current, codex } : current))
-      setStatus('Codex-Einstellungen gespeichert.')
-    } catch (cause) {
-      setSettingsError(errorMessage(cause))
-    } finally {
-      setCodexSettingsBusy(false)
-    }
-  }
-
   const settingsDialog =
     settingsOpen && codexSettings ? (
       <SettingsDialog
         authBusy={codexLoginBusy}
-        authConfigured={codexSettings.configured}
+        codex={codexSettings}
+        demo={options?.mode === 'demo'}
         error={settingsError}
         login={codexLogin}
-        model={codexSettings.model}
         onClose={() => setSettingsOpen(false)}
-        onSave={(model, thinkingLevel) => void changeCodexSettings(model, thinkingLevel)}
         onStartLogin={() => void startCodexLogin()}
-        saveBusy={codexSettingsBusy}
-        settingsEditable={options?.mode !== 'demo'}
-        thinkingLevel={codexSettings.thinkingLevel ?? 'high'}
       />
     ) : null
 
@@ -2712,52 +2692,51 @@ function HelpDialog({
   )
 }
 
-const thinkingLevelOptions: Array<{
-  label: string
-  value: CodexThinkingLevel
-}> = [
-  { label: 'Aus', value: 'off' },
-  { label: 'Minimal', value: 'minimal' },
-  { label: 'Niedrig', value: 'low' },
-  { label: 'Mittel', value: 'medium' },
-  { label: 'Hoch', value: 'high' },
-  { label: 'Sehr hoch', value: 'xhigh' },
-  { label: 'Maximum', value: 'max' },
-]
+const thinkingLevelLabels: Record<CodexThinkingLevel, string> = {
+  off: 'Aus',
+  minimal: 'Minimal',
+  low: 'Niedrig',
+  medium: 'Mittel',
+  high: 'Hoch',
+  xhigh: 'Sehr hoch',
+  max: 'Maximum',
+}
+
+const speedLabels: Record<CodexSpeed, string> = {
+  standard: 'Standard',
+  fast: 'Schnell',
+}
+
+function settingsSourceLabel(codex: CodexSettings) {
+  if (codex.settingsSource === 'codex') {
+    return codex.settingsPath
+      ? `Gelesen aus ${codex.settingsPath}.`
+      : 'Gelesen aus der Codex-Konfiguration.'
+  }
+  return 'Codex hat kein Modell konfiguriert; die Startwerte der App gelten.'
+}
 
 function SettingsDialog({
   authBusy,
-  authConfigured,
+  codex,
+  demo,
   error,
   login,
-  model,
   onClose,
-  onSave,
   onStartLogin,
-  saveBusy,
-  settingsEditable,
-  thinkingLevel,
 }: {
   authBusy: boolean
-  authConfigured: boolean
+  codex: CodexSettings
+  demo: boolean
   error: string | null
   login: CodexLoginState | null
-  model: CodexModelId
   onClose: () => void
-  onSave: (model: CodexModelId, thinkingLevel: CodexThinkingLevel) => void
   onStartLogin: () => void
-  saveBusy: boolean
-  settingsEditable: boolean
-  thinkingLevel: CodexThinkingLevel
 }) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
-  const [selectedModel, setSelectedModel] = useState<CodexModelId>(model)
-  const [selectedThinkingLevel, setSelectedThinkingLevel] =
-    useState<CodexThinkingLevel>(thinkingLevel)
   const waiting = login?.status === 'starting' || login?.status === 'waiting'
-  useEffect(() => setSelectedModel(model), [model])
-  useEffect(() => setSelectedThinkingLevel(thinkingLevel), [thinkingLevel])
-  const unchanged = selectedModel === model && selectedThinkingLevel === thinkingLevel
+  const codexLogin = codex.authSource === 'codex'
+  const modelLabel = codex.modelLabel ?? codexModelLabel(codex.model) ?? codex.model
   return (
     <div className="dialog-backdrop">
       <section
@@ -2783,51 +2762,39 @@ function SettingsDialog({
               <h3 id="settings-codex-title">Codex</h3>
               <p>
                 Codex analysiert alle gespeicherten Zusammenfassungen einer neuen Runde gemeinsam
-                und ordnet jede Nachricht einer Story oder der Einzelansicht zu. Modell und
-                Denkaufwand gelten für neue Analysen und Antwortentwürfe.
+                und ordnet jede Nachricht einer Story oder der Einzelansicht zu. Modell, Denkaufwand
+                und Geschwindigkeit folgen der Codex-Konfiguration und gelten für neue Analysen und
+                Antwortentwürfe.
               </p>
             </div>
-            <span className={`connection-state ${authConfigured ? 'connected' : ''}`}>
-              {authConfigured ? 'Verbunden' : 'Nicht verbunden'}
+            <span className={`connection-state ${codex.configured ? 'connected' : ''}`}>
+              {codex.configured ? 'Verbunden' : 'Nicht verbunden'}
             </span>
           </div>
-          <div className="settings-fields">
-            <label>
-              Modell
-              <select
-                value={selectedModel}
-                disabled={saveBusy || !settingsEditable}
-                onChange={(event) => setSelectedModel(event.target.value as CodexModelId)}
-              >
-                {codexModels.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <small>
-                {codexModels.find((option) => option.id === selectedModel)?.description}
-              </small>
-            </label>
-            <label>
-              Denkaufwand
-              <select
-                value={selectedThinkingLevel}
-                disabled={saveBusy || !settingsEditable}
-                onChange={(event) =>
-                  setSelectedThinkingLevel(event.target.value as CodexThinkingLevel)
-                }
-              >
-                {thinkingLevelOptions.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-              <small>Mehr Denkaufwand kann gründlicher sein, braucht aber länger.</small>
-            </label>
-          </div>
-          {!settingsEditable && (
+          <dl className="settings-values">
+            <div>
+              <dt>Modell</dt>
+              <dd>
+                {modelLabel}
+                {modelLabel !== codex.model && <small>{codex.model}</small>}
+              </dd>
+            </div>
+            <div>
+              <dt>Denkaufwand</dt>
+              <dd>{thinkingLevelLabels[codex.thinkingLevel ?? 'high']}</dd>
+            </div>
+            <div>
+              <dt>Geschwindigkeit</dt>
+              <dd>{speedLabels[codex.speed ?? 'standard']}</dd>
+            </div>
+          </dl>
+          {!demo && (
+            <p className="settings-source">
+              {settingsSourceLabel(codex)} Ändere die Werte in Codex; die App übernimmt sie bei der
+              nächsten Analyse.
+            </p>
+          )}
+          {demo && (
             <p className="settings-demo-note">Im Demo-Modus sind diese Werte fest eingestellt.</p>
           )}
           {error && (
@@ -2846,28 +2813,26 @@ function SettingsDialog({
               )}
             </div>
           )}
-          {settingsEditable && !waiting && (
+          {!demo && codexLogin && (
+            <p className="settings-source">
+              Angemeldet über die Codex-Anmeldung. Bei Anmeldeproblemen <code>codex login</code>{' '}
+              ausführen.
+            </p>
+          )}
+          {!demo && !codexLogin && !waiting && (
             <button
               type="button"
               className="text-button settings-login"
               disabled={authBusy}
               onClick={onStartLogin}
             >
-              {authConfigured ? 'Codex neu verbinden' : 'Mit ChatGPT verbinden'}
+              {codex.configured ? 'Codex neu verbinden' : 'Mit ChatGPT verbinden'}
             </button>
           )}
         </section>
         <div className="button-row">
           <button type="button" className="button secondary" onClick={onClose}>
             Schließen
-          </button>
-          <button
-            type="button"
-            className="button primary"
-            disabled={saveBusy || unchanged || !settingsEditable}
-            onClick={() => onSave(selectedModel, selectedThinkingLevel)}
-          >
-            {saveBusy ? 'Wird gespeichert …' : 'Speichern'}
           </button>
         </div>
       </section>

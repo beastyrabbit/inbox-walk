@@ -29,7 +29,7 @@ Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one unre
 - Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
 - Loads up to 100 messages from the selected reply thread; this limit does not cap a review round.
 - Sends every supported image to Codex and extracts every supported document through Apache Tika.
-- Selects Sol, Terra, or Luna for new Codex work without restarting the app.
+- Follows the model, reasoning effort, and speed configured in Codex without restarting the app.
 - Shows the running release version in the application shell.
 - Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
 - Creates and reads back a normal Fastmail draft with reply headers and identity signature.
@@ -58,19 +58,28 @@ Infisical project, environment `dev`, path
 but cannot mark messages read or create Fastmail drafts. Live mode never falls
 back to sample data.
 
-The app reuses an existing Pi `openai-codex` login from
+The app follows the Codex CLI. It reads the ChatGPT login from
+`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and takes `model`,
+`model_reasoning_effort`, and `service_tier` from `$CODEX_HOME/config.toml`,
+honouring the active `profile`. Refreshed tokens are written back in Codex's
+own format so the CLI and the app never hold diverging refresh tokens. Run
+`codex login` when that login can no longer refresh.
+
+Without a Codex login the app reuses an existing Pi `openai-codex` login from
 `~/.pi/agent/auth.json` during local development. Otherwise, open
 **Einstellungen**, choose **Mit ChatGPT verbinden**, and complete the OpenAI
-device-code flow. The rotating
-OAuth record stays server-side and is never returned by the API.
-Choosing **Neu anmelden** while using that local fallback also refreshes the
-workstation's shared Pi login; set `DATA_DIR` to an app-specific directory if
-you want isolated local credentials.
+device-code flow. The rotating OAuth record stays server-side and is never
+returned by the API. Choosing **Neu anmelden** while using that local fallback
+also refreshes the workstation's shared Pi login; set `DATA_DIR` to an
+app-specific directory if you want isolated local credentials.
 
-The settings menu selects the model and thinking level used for new bundle
-decisions and reply drafts. Sol is the deployment default; Sol, Terra, and Luna
-can be selected without restarting the app. The choices are stored together in
-`DATA_DIR/codex-settings.json`.
+The settings menu shows the model, thinking level, and speed in use for new
+bundle decisions and reply drafts; change them in Codex. `CODEX_MODEL`,
+`CODEX_THINKING_LEVEL`, and `CODEX_SPEED` (`standard` or `fast`) only apply when
+Codex has no model configured, and Sol at high effort is the final default.
+Models Pi does not know yet, such as `gpt-6-astra`, are described from
+`$CODEX_HOME/models_cache.json`. Codex `service_tier = "fast"` is sent as the
+`priority` service tier.
 
 Connect Codex in the settings menu before starting a round. The app stores the
 run first and freezes every matching summary. Codex receives the complete frozen

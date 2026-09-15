@@ -2,8 +2,6 @@ import type {
   ApiError,
   CodexAuthStatus,
   CodexLoginState,
-  CodexModelId,
-  CodexThinkingLevel,
   DraftResult,
   FinalizeResult,
   MailAddress,
@@ -152,14 +150,6 @@ async function post<T>(url: string, body: unknown, csrfToken?: string, persistOn
   })
 }
 
-async function put<T>(url: string, body: unknown) {
-  return request<T>(url, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
-}
-
 async function remove(url: string, csrfToken: string) {
   return request<void>(url, {
     method: 'DELETE',
@@ -176,9 +166,6 @@ export const api = {
   },
   async codexSettings() {
     return request<CodexSettings>('/api/settings/codex')
-  },
-  async updateCodexSettings(model: CodexModelId, thinkingLevel: CodexThinkingLevel) {
-    return put<CodexSettings>('/api/settings/codex', { model, thinkingLevel })
   },
   async codexLoginState(id: string) {
     return request<CodexLoginState>(`/api/auth/codex/${encodeURIComponent(id)}`)

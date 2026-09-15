@@ -66,6 +66,11 @@ export interface ReviewOptions {
 
 export const codexModels = [
   {
+    description: 'Neuestes und stärkstes Modell.',
+    id: 'gpt-6-astra',
+    label: 'Astra',
+  },
+  {
     description: 'Gründlich bei schwierigen Zusammenhängen.',
     id: 'gpt-5.6-sol',
     label: 'Sol',
@@ -82,7 +87,13 @@ export const codexModels = [
   },
 ] as const
 
-export type CodexModelId = (typeof codexModels)[number]['id']
+/** Any model slug Codex can be configured with; known slugs get a short label. */
+export type CodexModelId = string
+
+export function codexModelLabel(id: string | undefined) {
+  if (!id) return undefined
+  return codexModels.find((model) => model.id === id)?.label ?? id
+}
 
 export const codexThinkingLevels = [
   'off',
@@ -100,14 +111,30 @@ export function isCodexThinkingLevel(value: unknown): value is CodexThinkingLeve
   return codexThinkingLevels.some((level) => level === value)
 }
 
-export function isCodexModelId(value: unknown): value is CodexModelId {
-  return codexModels.some((model) => model.id === value)
+export const codexSpeeds = ['standard', 'fast'] as const
+
+export type CodexSpeed = (typeof codexSpeeds)[number]
+
+export function isCodexSpeed(value: unknown): value is CodexSpeed {
+  return codexSpeeds.some((speed) => speed === value)
 }
+
+export function isCodexModelId(value: unknown): value is CodexModelId {
+  return typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,79}$/i.test(value)
+}
+
+export type CodexSettingsSource = 'codex' | 'environment' | 'default'
+export type CodexAuthSource = 'codex' | 'pi'
 
 export interface CodexAuthStatus {
   configured: boolean
   model: CodexModelId
+  modelLabel?: string
   thinkingLevel?: CodexThinkingLevel
+  speed?: CodexSpeed
+  authSource?: CodexAuthSource
+  settingsSource?: CodexSettingsSource
+  settingsPath?: string
   source?:
     | 'stored'
     | 'runtime'

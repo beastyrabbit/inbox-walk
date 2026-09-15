@@ -113,6 +113,7 @@ describe('Codex preflight cancellation', () => {
         { emails: [demoEmails[0]], examples: [] },
         'gpt-5.6-sol',
         'high',
+        'standard',
         controller.signal,
       )
       const rejected = expect(result).rejects.toThrow()

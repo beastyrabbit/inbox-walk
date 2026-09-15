@@ -1534,22 +1534,22 @@ test('does not apply review shortcuts behind open surfaces', async ({ page }) =>
   await expect(currentSubject).toBeVisible()
 })
 
-test('selects the Codex model and thinking level in settings', async ({ page }) => {
+test('shows the model, thinking level and speed configured in Codex', async ({ page }) => {
+  const codex = {
+    authSource: 'codex',
+    configured: true,
+    model: 'gpt-6-astra',
+    modelLabel: 'GPT 6.0 Astra',
+    settingsPath: '/home/test/.codex/config.toml',
+    settingsSource: 'codex',
+    source: 'stored',
+    speed: 'fast',
+    thinkingLevel: 'xhigh',
+  }
   await page.route('**/api/review/options', async (route) => {
     const response = await route.fetch()
     const body = await response.json()
-    await route.fulfill({
-      json: {
-        ...body,
-        codex: {
-          configured: true,
-          model: 'gpt-5.6-sol',
-          source: 'stored',
-          thinkingLevel: 'high',
-        },
-        mode: 'live',
-      },
-    })
+    await route.fulfill({ json: { ...body, codex, mode: 'live' } })
   })
   await page.route('**/api/reviews', async (route) => {
     const response = await route.fetch()
@@ -1562,52 +1562,24 @@ test('selects the Codex model and thinking level in settings', async ({ page }) 
     await route.fulfill({ json: { ...body, mode: 'live' } })
   })
   await page.route('**/api/settings/codex', async (route) => {
-    if (route.request().method() === 'GET') {
-      await route.fulfill({
-        json: {
-          configured: true,
-          model: 'gpt-5.6-sol',
-          source: 'stored',
-          thinkingLevel: 'high',
-        },
-      })
-      return
-    }
-    const request = route.request().postDataJSON() as { model: string; thinkingLevel: string }
-    await route.fulfill({
-      json: {
-        configured: true,
-        model: request.model,
-        source: 'stored',
-        thinkingLevel: request.thinkingLevel,
-      },
-    })
+    await route.fulfill({ json: codex })
   })
 
   await page.evaluate(() => localStorage.clear())
   await page.goto('/')
   await page.getByRole('button', { name: 'Einstellungen' }).click()
 
-  await expect(page.getByRole('heading', { name: 'Einstellungen' })).toBeVisible()
-  expect(
-    await page
-      .getByLabel('Modell')
-      .locator('option')
-      .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)),
-  ).toEqual(['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'])
-  expect(
-    await page
-      .getByLabel('Denkaufwand')
-      .locator('option')
-      .evaluateAll((options) => options.map((option) => (option as HTMLOptionElement).value)),
-  ).toEqual(['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'])
-  await expect(page.getByLabel('Modell')).toHaveValue('gpt-5.6-sol')
-  await page.getByLabel('Modell').selectOption('gpt-5.6-terra')
-  await page.getByLabel('Denkaufwand').selectOption('xhigh')
-  await page.getByRole('button', { name: 'Speichern' }).click()
-  await expect(page.getByLabel('Modell')).toHaveValue('gpt-5.6-terra')
-  await expect(page.getByLabel('Denkaufwand')).toHaveValue('xhigh')
-  await expect(page.getByRole('button', { name: 'Speichern' })).toBeDisabled()
+  const dialog = page.getByRole('dialog', { name: 'Einstellungen' })
+  await expect(dialog).toBeVisible()
+  await expect(dialog.getByText('GPT 6.0 Astra')).toBeVisible()
+  await expect(dialog.getByText('gpt-6-astra')).toBeVisible()
+  await expect(dialog.getByText('Sehr hoch')).toBeVisible()
+  await expect(dialog.getByText('Schnell')).toBeVisible()
+  await expect(dialog.getByText('Gelesen aus /home/test/.codex/config.toml.')).toBeVisible()
+  await expect(dialog.getByText('codex login')).toBeVisible()
+  await expect(dialog.getByRole('combobox')).toHaveCount(0)
+  await expect(dialog.getByRole('button', { name: 'Speichern' })).toHaveCount(0)
+  await expect(dialog.getByRole('button', { name: /verbinden/ })).toHaveCount(0)
 })
 
 test('keeps Codex settings available during a Fastmail options outage', async ({ page }) => {
@@ -1626,9 +1598,12 @@ test('keeps Codex settings available during a Fastmail options outage', async ({
   await page.route('**/api/settings/codex', async (route) => {
     await route.fulfill({
       json: {
+        authSource: 'pi',
         configured: true,
         model: 'gpt-5.6-sol',
+        settingsSource: 'environment',
         source: 'stored',
+        speed: 'standard',
         thinkingLevel: 'high',
       },
     })
@@ -1641,53 +1616,13 @@ test('keeps Codex settings available during a Fastmail options outage', async ({
 
   const dialog = page.getByRole('dialog', { name: 'Einstellungen' })
   await expect(dialog).toBeVisible()
-  await expect(dialog.getByLabel('Modell')).toBeEnabled()
-  await expect(dialog.getByLabel('Modell')).toHaveValue('gpt-5.6-sol')
-  await expect(dialog.getByLabel('Denkaufwand')).toHaveValue('high')
-})
-
-test('shows Codex settings failures inside the open settings dialog', async ({ page }) => {
-  await page.route('**/api/review/options', async (route) => {
-    const response = await route.fetch()
-    const body = await response.json()
-    await route.fulfill({
-      response,
-      json: {
-        ...body,
-        codex: {
-          configured: true,
-          model: 'gpt-5.6-sol',
-          source: 'stored',
-          thinkingLevel: 'high',
-        },
-        mode: 'live',
-      },
-    })
-  })
-  await page.route('**/api/settings/codex', async (route) => {
-    await route.fulfill({
-      status: 503,
-      json: {
-        error: {
-          code: 'SETTINGS_WRITE_FAILED',
-          message: 'Die Codex-Einstellungen konnten nicht gespeichert werden.',
-          retryable: true,
-        },
-      },
-    })
-  })
-
-  await page.evaluate(() => localStorage.clear())
-  await page.goto('/')
-  await page.getByRole('button', { name: 'Einstellungen' }).click()
-  await page.getByLabel('Modell').selectOption('gpt-5.6-terra')
-  await page.getByRole('button', { name: 'Speichern' }).click()
-
-  const dialog = page.getByRole('dialog', { name: 'Einstellungen' })
-  await expect(dialog).toBeVisible()
-  await expect(dialog.getByRole('alert')).toHaveText(
-    'Die Codex-Einstellungen konnten nicht gespeichert werden.',
-  )
+  await expect(dialog.locator('.settings-values dd')).toHaveText([
+    'Solgpt-5.6-sol',
+    'Hoch',
+    'Standard',
+  ])
+  await expect(dialog.getByText('Codex hat kein Modell konfiguriert')).toBeVisible()
+  await expect(dialog.getByRole('button', { name: 'Codex neu verbinden' })).toBeVisible()
 })
 
 test('uses a script-disabled same-origin mail sandbox', async ({ page }) => {

@@ -232,32 +232,4 @@ describe('round lifecycle API', () => {
       }),
     )
   })
-
-  it('saves model and thinking level together', async () => {
-    const settings = {
-      configured: true,
-      model: 'gpt-5.6-terra' as const,
-      source: 'stored' as const,
-      thinkingLevel: 'xhigh' as const,
-    }
-    const fetchMock = vi.fn(async () =>
-      Promise.resolve(
-        new Response(JSON.stringify(settings), {
-          headers: { 'Content-Type': 'application/json' },
-        }),
-      ),
-    )
-    vi.stubGlobal('fetch', fetchMock)
-
-    await expect(api.updateCodexSettings(settings.model, settings.thinkingLevel)).resolves.toEqual(
-      settings,
-    )
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/settings/codex',
-      expect.objectContaining({
-        body: JSON.stringify({ model: settings.model, thinkingLevel: settings.thinkingLevel }),
-        method: 'PUT',
-      }),
-    )
-  })
 })

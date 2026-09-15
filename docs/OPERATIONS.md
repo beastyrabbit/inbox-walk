@@ -14,8 +14,9 @@
 - Liveness: `GET /healthz`
 - Readiness: `GET /readyz`
 - Required live secret: `FASTMAIL_JMAP_TOKEN`
-- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `codex-settings.json`, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
-- Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `CODEX_THINKING_LEVEL=high`, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
+- Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record, `inbox-walk.sqlite`, and `bundle-learning.sqlite`
+- Codex home: `CODEX_HOME` (default `~/.codex`) with `auth.json`, `config.toml`, and `models_cache.json` takes precedence for login, model, reasoning effort, and speed
+- Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `CODEX_THINKING_LEVEL=high`, `CODEX_SPEED=standard` as fallbacks, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
 - Global grouping timeout: `CODEX_BUNDLE_TIMEOUT_MS=1800000` by default, maximum `3600000`
 - Inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
@@ -125,11 +126,12 @@ curl -fsS http://127.0.0.1:3000/api/review/options \
   | jq '{mode, reviewedCount, mailboxCount: (.mailboxes | length)}'
 ```
 
-Check `/api/auth/codex/status` for the non-secret configured flag and model. Do
-not inspect or print `/data/pi/auth.json`; reconnect from the app when OAuth can
-no longer refresh. The settings dialog stores the Codex model and thinking
-level in `/data/codex-settings.json`; `CODEX_MODEL` and
-`CODEX_THINKING_LEVEL` remain startup defaults. For the
+Check `/api/auth/codex/status` for the non-secret configured flag, model,
+thinking level, speed, and their sources. Do not inspect or print
+`$CODEX_HOME/auth.json` or `/data/pi/auth.json`; run `codex login` or reconnect
+from the app when OAuth can no longer refresh. Model, thinking level, and speed
+come from `$CODEX_HOME/config.toml`; `CODEX_MODEL`, `CODEX_THINKING_LEVEL`, and
+`CODEX_SPEED` only fill values Codex leaves unset. For the
 review persistence, inspect schema and aggregate counts only rather than
 printing message IDs, subjects, previews, addresses, or editor text.
 
