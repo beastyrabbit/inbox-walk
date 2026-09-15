@@ -7,6 +7,7 @@ import {
   createAgentSession,
   DefaultResourceLoader,
   defineTool,
+  type ExtensionAPI,
   ModelRegistry,
   SessionManager,
   SettingsManager,
@@ -14,8 +15,11 @@ import {
 import { Type } from 'typebox'
 import {
   type CodexModelId,
+  type CodexSpeed,
   type CodexThinkingLevel,
+  codexModelLabel,
   isCodexModelId,
+  isCodexSpeed,
   isCodexThinkingLevel,
 } from '../src/shared.ts'
 import type {
@@ -27,12 +31,25 @@ import type {
   BundlePartitionInput,
 } from './bundles.ts'
 import { normalizeBundleDecisionPartition } from './bundles.ts'
+import {
+  codexAuthFilePath,
+  codexConfigPath,
+  createCodexHomeAuthBackend,
+  hasCodexChatgptAuth,
+  readCodexConfigSettings,
+  readCodexModelCatalog,
+} from './codex-home.ts'
 import { codexRequestSignal, createCodexAuthStorage, withCodexRequest } from './codex-request.ts'
 import { abortable } from './io.ts'
 
 const CODEX_PROVIDER = 'openai-codex'
 const DEFAULT_CODEX_MODEL: CodexModelId = 'gpt-5.6-sol'
 const DEFAULT_CODEX_THINKING_LEVEL: CodexThinkingLevel = 'high'
+const DEFAULT_CODEX_SPEED: CodexSpeed = 'standard'
+/** Unknown-to-Pi Codex models inherit this model's transport settings. */
+const CODEX_MODEL_TEMPLATE: CodexModelId = 'gpt-5.6-sol'
+/** Codex sends its `fast` service tier as this request value. */
+const CODEX_FAST_SERVICE_TIER = 'priority'
 export const BUNDLE_PARTITION_PROMPT_VERSION = 2
 export const DEFAULT_CODEX_BUNDLE_TIMEOUT_MS = 30 * 60_000
 export const MAX_CODEX_BUNDLE_TIMEOUT_MS = 60 * 60_000
@@ -129,72 +146,92 @@ async function requireCodexRequestAuth(
   }
 }
 
-function codexSettingsPath() {
-  const dataDir = process.env.DATA_DIR ?? path.resolve('data')
-  return path.join(dataDir, 'codex-settings.json')
-}
-
-interface CodexSettings {
+export interface CodexSettings {
   model: CodexModelId
   thinkingLevel: CodexThinkingLevel
+  speed: CodexSpeed
 }
 
-function storedCodexSettings(): Partial<CodexSettings> {
-  try {
-    const value = JSON.parse(fs.readFileSync(codexSettingsPath(), 'utf8')) as {
-      model?: unknown
-      thinkingLevel?: unknown
-    }
-    return {
-      ...(isCodexModelId(value.model) ? { model: value.model } : {}),
-      ...(isCodexThinkingLevel(value.thinkingLevel) ? { thinkingLevel: value.thinkingLevel } : {}),
-    }
-  } catch {
-    return {}
-  }
-}
+export type CodexSettingsSource = 'codex' | 'environment' | 'default'
 
 export function selectedCodexModel(): CodexModelId {
   return selectedCodexSettings().model
 }
 
+/**
+ * Model, reasoning effort and speed follow the Codex configuration in
+ * CODEX_HOME/config.toml. Environment variables only fill keys Codex leaves
+ * unset, and the deployment defaults cover the rest.
+ */
 export function selectedCodexSettings(): CodexSettings {
-  const stored = storedCodexSettings()
-  const configured = process.env.CODEX_MODEL?.trim()
-  const configuredThinking = process.env.CODEX_THINKING_LEVEL?.trim()
-  return {
-    model: stored.model ?? (isCodexModelId(configured) ? configured : DEFAULT_CODEX_MODEL),
+  return resolvedCodexSettings().settings
+}
+
+export function resolvedCodexSettings(): {
+  settings: CodexSettings
+  source: CodexSettingsSource
+  path: string
+} {
+  const configPath = codexConfigPath()
+  const configured = readCodexConfigSettings(configPath)
+  const environmentModel = process.env.CODEX_MODEL?.trim()
+  const environmentThinking = process.env.CODEX_THINKING_LEVEL?.trim()
+  const environmentSpeed = process.env.CODEX_SPEED?.trim()
+  const settings: CodexSettings = {
+    model:
+      configured.model ??
+      (isCodexModelId(environmentModel) ? environmentModel : DEFAULT_CODEX_MODEL),
     thinkingLevel:
-      stored.thinkingLevel ??
-      (isCodexThinkingLevel(configuredThinking)
-        ? configuredThinking
+      configured.thinkingLevel ??
+      (isCodexThinkingLevel(environmentThinking)
+        ? environmentThinking
         : DEFAULT_CODEX_THINKING_LEVEL),
+    speed:
+      configured.speed ?? (isCodexSpeed(environmentSpeed) ? environmentSpeed : DEFAULT_CODEX_SPEED),
+  }
+  const source: CodexSettingsSource = configured.model
+    ? 'codex'
+    : isCodexModelId(environmentModel)
+      ? 'environment'
+      : 'default'
+  return { settings, source, path: configPath }
+}
+
+type CodexModel = NonNullable<ReturnType<ModelRegistry['find']>>
+
+/**
+ * Finds the configured model in Pi's catalog, or derives it from the Codex
+ * model cache when Pi does not know the slug yet.
+ */
+export function resolveCodexModel(registry: ModelRegistry, modelId: CodexModelId): CodexModel {
+  const known = registry.find(CODEX_PROVIDER, modelId)
+  if (known) return known
+  const template = registry.find(CODEX_PROVIDER, CODEX_MODEL_TEMPLATE)
+  const catalogEntry = readCodexModelCatalog().find((entry) => entry.id === modelId)
+  if (!template || !catalogEntry) throw new Error(`Codex model ${modelId} is unavailable.`)
+  return {
+    ...template,
+    id: catalogEntry.id,
+    name: catalogEntry.label,
+    input: catalogEntry.supportsImages ? ['text', 'image'] : ['text'],
+    ...(catalogEntry.contextWindow ? { contextWindow: catalogEntry.contextWindow } : {}),
   }
 }
 
-export function selectCodexModel(model: CodexModelId) {
-  return selectCodexSettings({ ...selectedCodexSettings(), model })
-}
-
-export function selectCodexSettings(settings: CodexSettings) {
-  const { model, thinkingLevel } = settings
-  if (!isCodexModelId(model)) throw new Error(`Unsupported Codex model: ${String(model)}`)
-  if (!isCodexThinkingLevel(thinkingLevel)) {
-    throw new Error(`Unsupported Codex thinking level: ${String(thinkingLevel)}`)
-  }
-  const settingsPath = codexSettingsPath()
-  const directory = path.dirname(settingsPath)
-  const temporaryPath = `${settingsPath}.${process.pid}.tmp`
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 })
-  try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify({ model, thinkingLevel })}\n`, {
-      mode: 0o600,
-    })
-    fs.renameSync(temporaryPath, settingsPath)
-  } finally {
-    fs.rmSync(temporaryPath, { force: true })
-  }
-  return codexAuthStatus()
+/** Inline Pi extension that asks the Codex backend for the fast service tier. */
+export function codexSpeedExtensions(speed: CodexSpeed) {
+  if (speed !== 'fast') return []
+  return [
+    (pi: ExtensionAPI) => {
+      pi.on('before_provider_request', (event) => {
+        if (!event.payload || typeof event.payload !== 'object') return undefined
+        return {
+          ...(event.payload as Record<string, unknown>),
+          service_tier: CODEX_FAST_SERVICE_TIER,
+        }
+      })
+    },
+  ]
 }
 
 export interface CodexReplyInput {
@@ -230,13 +267,20 @@ export function isolatedResourceOptions() {
   }
 }
 
+/** The Codex CLI login wins; otherwise Pi's own record below DATA_DIR or the workstation. */
 export function codexAuthStoragePath() {
+  const codexPath = codexAuthFilePath()
+  if (hasCodexChatgptAuth(codexPath)) return codexPath
   const dataDir = process.env.DATA_DIR ?? path.resolve('data')
   const persistentPath = path.join(dataDir, 'pi', 'auth.json')
   const workstationPath = path.join(os.homedir(), '.pi', 'agent', 'auth.json')
   return !process.env.DATA_DIR && !hasStoredAuth(persistentPath) && hasStoredAuth(workstationPath)
     ? workstationPath
     : persistentPath
+}
+
+export function codexAuthSource(authPath = codexAuthStoragePath()): 'codex' | 'pi' {
+  return authPath === codexAuthFilePath() ? 'codex' : 'pi'
 }
 
 export function ensureCodexStorageReady() {
@@ -254,20 +298,36 @@ export function getCodexAuthStorage() {
   let storage = authStores.get(authPath)
   if (!storage) {
     fs.mkdirSync(path.dirname(authPath), { recursive: true })
-    storage = createCodexAuthStorage(authPath)
+    storage =
+      codexAuthSource(authPath) === 'codex'
+        ? createCodexAuthStorage(authPath, createCodexHomeAuthBackend(authPath))
+        : createCodexAuthStorage(authPath)
     authStores.set(authPath, storage)
   }
   return storage
 }
 
 export function codexAuthStatus() {
-  const settings = selectedCodexSettings()
+  const { settings, source, path: settingsPath } = resolvedCodexSettings()
+  const details = {
+    ...settings,
+    modelLabel:
+      readCodexModelCatalog().find((entry) => entry.id === settings.model)?.label ??
+      codexModelLabel(settings.model),
+    settingsSource: source,
+    settingsPath,
+  }
   try {
+    const authPath = codexAuthStoragePath()
     const storage = getCodexAuthStorage()
     storage.reload()
-    return { ...storage.getAuthStatus(CODEX_PROVIDER), ...settings }
+    return {
+      ...storage.getAuthStatus(CODEX_PROVIDER),
+      ...details,
+      authSource: codexAuthSource(authPath),
+    }
   } catch {
-    return { configured: false, ...settings }
+    return { configured: false, ...details }
   }
 }
 
@@ -311,9 +371,8 @@ async function codexReply(input: CodexReplyInput): Promise<CodexReplyOutput> {
   const authStorage = getCodexAuthStorage()
   authStorage.reload()
   const registry = ModelRegistry.inMemory(authStorage)
-  const { model: modelId, thinkingLevel } = selectedCodexSettings()
-  const model = registry.find(CODEX_PROVIDER, modelId)
-  if (!model) throw new Error(`Codex model ${modelId} is unavailable.`)
+  const { model: modelId, thinkingLevel, speed: frozenSpeed } = selectedCodexSettings()
+  const model = resolveCodexModel(registry, modelId)
   await requireCodexRequestAuth(registry, model)
 
   const submitted: CodexReplyOutput[] = []
@@ -341,6 +400,7 @@ async function codexReply(input: CodexReplyInput): Promise<CodexReplyOutput> {
     agentDir,
     settingsManager,
     ...isolatedResourceOptions(),
+    extensionFactories: codexSpeedExtensions(frozenSpeed),
     systemPrompt: input.systemPrompt,
   })
   await abortable(resourceLoader.reload(), codexRequestSignal())
@@ -626,10 +686,11 @@ export async function runCodexBundleDecision(
   input: BundleDecisionInput,
   frozenModelId = selectedCodexModel(),
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
+  frozenSpeed = selectedCodexSettings().speed,
   signal?: AbortSignal,
 ): Promise<BundleDecision> {
   return withCodexRequest(
-    () => codexBundleDecision(input, frozenModelId, frozenThinkingLevel, signal),
+    () => codexBundleDecision(input, frozenModelId, frozenThinkingLevel, frozenSpeed, signal),
     codexInferenceTimeoutMs(),
     signal,
   )
@@ -639,6 +700,7 @@ async function codexBundleDecision(
   input: BundleDecisionInput,
   frozenModelId: CodexModelId,
   frozenThinkingLevel: CodexThinkingLevel,
+  frozenSpeed: CodexSpeed,
   signal?: AbortSignal,
 ): Promise<BundleDecision> {
   if (process.env.VITEST) {
@@ -650,8 +712,7 @@ async function codexBundleDecision(
   const authStorage = getCodexAuthStorage()
   authStorage.reload()
   const registry = ModelRegistry.inMemory(authStorage)
-  const model = registry.find(CODEX_PROVIDER, frozenModelId)
-  if (!model) throw new Error(`Codex model ${frozenModelId} is unavailable.`)
+  const model = resolveCodexModel(registry, frozenModelId)
   await requireCodexRequestAuth(registry, model)
   signal?.throwIfAborted()
   const submitted: BundleDecision[] = []
@@ -677,6 +738,7 @@ async function codexBundleDecision(
     agentDir,
     settingsManager,
     ...isolatedResourceOptions(),
+    extensionFactories: codexSpeedExtensions(frozenSpeed),
     systemPrompt: bundleDecisionSystemPrompt(false),
   })
   await abortable(resourceLoader.reload(), codexRequestSignal())
@@ -747,10 +809,12 @@ export async function runCodexBundleDecisionBatch(
   cohorts: readonly BundleDecisionCohort[],
   frozenModelId = selectedCodexModel(),
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
+  frozenSpeed = selectedCodexSettings().speed,
   signal?: AbortSignal,
 ): Promise<BundleDecisionResult[]> {
   return withCodexRequest(
-    () => codexBundleDecisionBatch(cohorts, frozenModelId, frozenThinkingLevel, signal),
+    () =>
+      codexBundleDecisionBatch(cohorts, frozenModelId, frozenThinkingLevel, frozenSpeed, signal),
     codexInferenceTimeoutMs(),
     signal,
   )
@@ -760,6 +824,7 @@ async function codexBundleDecisionBatch(
   cohorts: readonly BundleDecisionCohort[],
   frozenModelId: CodexModelId,
   frozenThinkingLevel: CodexThinkingLevel,
+  frozenSpeed: CodexSpeed,
   signal?: AbortSignal,
 ): Promise<BundleDecisionResult[]> {
   if (process.env.VITEST) {
@@ -778,8 +843,7 @@ async function codexBundleDecisionBatch(
   const authStorage = getCodexAuthStorage()
   authStorage.reload()
   const registry = ModelRegistry.inMemory(authStorage)
-  const model = registry.find(CODEX_PROVIDER, frozenModelId)
-  if (!model) throw new Error(`Codex model ${frozenModelId} is unavailable.`)
+  const model = resolveCodexModel(registry, frozenModelId)
   await requireCodexRequestAuth(registry, model)
   signal?.throwIfAborted()
 
@@ -807,6 +871,7 @@ async function codexBundleDecisionBatch(
     agentDir,
     settingsManager,
     ...isolatedResourceOptions(),
+    extensionFactories: codexSpeedExtensions(frozenSpeed),
     systemPrompt: bundleDecisionSystemPrompt(true),
   })
   await abortable(resourceLoader.reload(), codexRequestSignal())
@@ -889,10 +954,11 @@ export async function runCodexBundlePartition(
   input: BundlePartitionInput,
   frozenModelId = selectedCodexModel(),
   frozenThinkingLevel = selectedCodexSettings().thinkingLevel,
+  frozenSpeed = selectedCodexSettings().speed,
   signal?: AbortSignal,
 ): Promise<BundlePartitionDecision> {
   return withCodexRequest(
-    () => codexBundlePartition(input, frozenModelId, frozenThinkingLevel, signal),
+    () => codexBundlePartition(input, frozenModelId, frozenThinkingLevel, frozenSpeed, signal),
     codexBundleTimeoutMs(process.env.CODEX_BUNDLE_TIMEOUT_MS),
     signal,
   )
@@ -902,6 +968,7 @@ async function codexBundlePartition(
   input: BundlePartitionInput,
   frozenModelId: CodexModelId,
   frozenThinkingLevel: CodexThinkingLevel,
+  frozenSpeed: CodexSpeed,
   signal?: AbortSignal,
 ): Promise<BundlePartitionDecision> {
   if (process.env.VITEST) {
@@ -918,8 +985,7 @@ async function codexBundlePartition(
   const authStorage = getCodexAuthStorage()
   authStorage.reload()
   const registry = ModelRegistry.inMemory(authStorage)
-  const model = registry.find(CODEX_PROVIDER, frozenModelId)
-  if (!model) throw new Error(`Codex model ${frozenModelId} is unavailable.`)
+  const model = resolveCodexModel(registry, frozenModelId)
   await requireCodexRequestAuth(registry, model)
   signal?.throwIfAborted()
 
@@ -947,6 +1013,7 @@ async function codexBundlePartition(
     agentDir,
     settingsManager,
     ...isolatedResourceOptions(),
+    extensionFactories: codexSpeedExtensions(frozenSpeed),
     systemPrompt: bundlePartitionSystemPrompt(),
   })
   await abortable(resourceLoader.reload(), codexRequestSignal())

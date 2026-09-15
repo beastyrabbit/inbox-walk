@@ -4,7 +4,11 @@ import {
   openaiCodexOAuthProvider,
   registerOAuthProvider,
 } from '@earendil-works/pi-ai/oauth'
-import { AuthStorage, FileAuthStorageBackend } from '@earendil-works/pi-coding-agent'
+import {
+  AuthStorage,
+  type AuthStorageBackend,
+  FileAuthStorageBackend,
+} from '@earendil-works/pi-coding-agent'
 import { abortable, ioSignal, readBoundedBody } from './io.ts'
 
 const requestSignal = new AsyncLocalStorage<AbortSignal>()
@@ -66,21 +70,26 @@ export async function refreshCodexCredentials(
     const accountId = claims['https://api.openai.com/auth']?.chatgpt_account_id
     if (typeof accountId !== 'string' || !accountId) throw new Error()
     signal.throwIfAborted()
-    return {
+    const credentials: OAuthCredentials & { idToken?: string } = {
       access: value.access_token,
       refresh: value.refresh_token,
       expires: Date.now() + value.expires_in * 1000,
       accountId,
     }
+    // Codex's auth.json also carries the ID token; keep it current when present.
+    if (typeof value.id_token === 'string' && value.id_token) credentials.idToken = value.id_token
+    return credentials
   } catch {
     signal.throwIfAborted()
     throw new Error('Codex OAuth refresh returned invalid credentials.')
   }
 }
 
-export function createCodexAuthStorage(authPath: string) {
+export function createCodexAuthStorage(
+  authPath: string,
+  backend: AuthStorageBackend = new FileAuthStorageBackend(authPath),
+) {
   registerOAuthProvider({ ...openaiCodexOAuthProvider, refreshToken: refreshCodexCredentials })
-  const backend = new FileAuthStorageBackend(authPath)
   return AuthStorage.fromStorage({
     withLock: (work) => backend.withLock(work),
     withLockAsync: (work) => {

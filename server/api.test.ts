@@ -233,13 +233,13 @@ describe('demo API contract', () => {
     expect(state.body).not.toHaveProperty('refresh')
   })
 
-  it('does not allow model changes in demo mode', async () => {
+  it('rejects settings writes because Codex owns model, reasoning and speed', async () => {
     const result = await json<{ error: { code: string } }>(
-      '/api/auth/codex/model',
-      post({ model: 'gpt-5.6-terra' }),
+      '/api/settings/codex',
+      post({ model: 'gpt-5.6-terra', thinkingLevel: 'xhigh' }),
     )
-    expect(result.response.status).toBe(403)
-    expect(result.body.error.code).toBe('DEMO_MODE')
+    expect(result.response.status).toBe(405)
+    expect(result.body.error.code).toBe('CODEX_SETTINGS_READ_ONLY')
   })
 
   it('creates one durable background run idempotently, lists it, reanalyzes its frozen snapshot, and deletes it', async () => {
@@ -1426,14 +1426,18 @@ describe('demo API contract', () => {
     }
   })
 
-  it('reads and atomically updates model plus thinking level through settings', async () => {
-    let settings = { model: 'gpt-5.6-sol' as const, thinkingLevel: 'high' as const }
+  it('serves the Codex model, thinking level and speed read-only', async () => {
+    const settings = {
+      model: 'gpt-6-astra',
+      modelLabel: 'GPT 6.0 Astra',
+      thinkingLevel: 'xhigh' as const,
+      speed: 'fast' as const,
+      settingsSource: 'codex' as const,
+      settingsPath: '/srv/codex/config.toml',
+      authSource: 'codex' as const,
+    }
     const localMiddleware = createApiMiddleware({
       codexAuthStatus: () => ({ configured: true, ...settings }),
-      codexSettingsSelect: (next) => {
-        settings = next as typeof settings
-        return { configured: true, ...settings }
-      },
       fastmailToken: 'test-token',
     })
     const localServer = createServer((request, response) => {
@@ -1452,11 +1456,8 @@ describe('demo API contract', () => {
         `${localBase}/api/settings/codex`,
         post({ model: 'gpt-5.6-terra', thinkingLevel: 'xhigh' }),
       )
-      expect(updated.status).toBe(200)
-      expect(await updated.json()).toMatchObject({
-        model: 'gpt-5.6-terra',
-        thinkingLevel: 'xhigh',
-      })
+      expect(updated.status).toBe(405)
+      expect(await (await fetch(`${localBase}/api/settings/codex`)).json()).toMatchObject(settings)
     } finally {
       await new Promise<void>((resolve, reject) =>
         localServer.close((error) => (error ? reject(error) : resolve())),

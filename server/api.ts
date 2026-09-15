@@ -7,8 +7,6 @@ import type {
   ApiError,
   CodexAuthStatus,
   CodexLoginState,
-  CodexModelId,
-  CodexThinkingLevel,
   DraftResult,
   FinalizeResult,
   MailboxOption,
@@ -26,7 +24,12 @@ import type {
   ReviewSnapshot,
   ThreadMessage,
 } from '../src/shared.ts'
-import { defaultReviewFilters, isCodexModelId, isCodexThinkingLevel } from '../src/shared.ts'
+import {
+  defaultReviewFilters,
+  isCodexModelId,
+  isCodexSpeed,
+  isCodexThinkingLevel,
+} from '../src/shared.ts'
 import {
   createCheckpointedBundleDecider,
   createCheckpointedBundlePartitionDecider,
@@ -52,8 +55,6 @@ import {
   runCodexBundleDecision,
   runCodexBundleDecisionBatch,
   runCodexBundlePartition,
-  selectCodexModel,
-  selectCodexSettings,
   selectedCodexSettings,
 } from './codex.ts'
 import { demoEmails } from './demo.ts'
@@ -111,12 +112,6 @@ const filtersSchema = z.object({
   newsletter: z.enum(['all', 'exclude', 'only']),
   spam: z.enum(['exclude', 'only']).default('exclude'),
   timeRange: z.enum(['all', '24h', '7d', '30d']),
-})
-
-const codexModelSchema = z.object({ model: z.custom<CodexModelId>(isCodexModelId) })
-const codexSettingsSchema = z.object({
-  model: z.custom<CodexModelId>(isCodexModelId),
-  thinkingLevel: z.custom<CodexThinkingLevel>(isCodexThinkingLevel),
 })
 
 const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
@@ -188,11 +183,6 @@ export interface ApiOptions {
   bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
-  codexModelSelect?: (model: CodexModelId) => CodexAuthStatus
-  codexSettingsSelect?: (settings: {
-    model: CodexModelId
-    thinkingLevel: CodexThinkingLevel
-  }) => CodexAuthStatus
   demoMessages?: ReviewEmail[]
   fastmailToken?: string
   fetchMailSnapshot?: typeof fetchUnreadSnapshot
@@ -1857,7 +1847,7 @@ async function threadContext(
 function publicBundleFailure(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
   if (error instanceof CodexContextLengthError) {
-    return 'Die Runde ist für das Kontextfenster des gewählten Codex-Modells zu groß. Wähle einen kleineren Zeitraum oder ein anderes Modell und analysiere dieselbe Runde erneut.'
+    return 'Die Runde ist für das Kontextfenster des in Codex konfigurierten Modells zu groß. Wähle einen kleineren Zeitraum oder stelle in Codex ein anderes Modell ein und analysiere dieselbe Runde erneut.'
   }
   if (/timeout|timed out|abort/i.test(message)) {
     return 'Codex hat nicht rechtzeitig geantwortet. Die Nachrichten werden einzeln angezeigt.'
@@ -2021,6 +2011,8 @@ function startBundleJob(
   const frozenThinkingLevel = isCodexThinkingLevel(snapshot.analysis.thinkingLevel)
     ? snapshot.analysis.thinkingLevel
     : configuredThinkingLevel
+  const frozenSpeed =
+    'speed' in auth && isCodexSpeed(auth.speed) ? auth.speed : selectedCodexSettings().speed
   const providerDecidePartition =
     apiOptions.bundlePartitionDecider ??
     (!apiOptions.bundleDecider &&
@@ -2033,6 +2025,7 @@ function startBundleJob(
             input,
             frozenModel ?? auth.model,
             frozenThinkingLevel,
+            frozenSpeed,
             signal ?? jobContext.signal,
           )
       : undefined)
@@ -2047,6 +2040,7 @@ function startBundleJob(
             input,
             frozenModel ?? auth.model,
             frozenThinkingLevel,
+            frozenSpeed,
             signal ?? jobContext.signal,
           )
       : undefined)
@@ -2062,6 +2056,7 @@ function startBundleJob(
             cohorts,
             frozenModel ?? auth.model,
             frozenThinkingLevel,
+            frozenSpeed,
             signal ?? jobContext.signal,
           )
       : undefined)
@@ -3202,35 +3197,15 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
           url.pathname === '/api/settings/codex'
         ) {
           validateOrigin(req)
-          if (apiOptions.forceDemo) {
-            throw new ApiHttpError(403, 'DEMO_MODE', 'Codex-Einstellungen sind im Demo-Modus fest.')
-          }
-          const parsed = codexSettingsSchema.safeParse(await readJson(req))
-          if (!parsed.success) {
-            throw new ApiHttpError(400, 'INVALID_CODEX_SETTINGS', 'Ungültige Codex-Einstellungen.')
-          }
-          return json(
-            res,
-            200,
-            (apiOptions.codexSettingsSelect ?? selectCodexSettings)(parsed.data),
+          throw new ApiHttpError(
+            405,
+            'CODEX_SETTINGS_READ_ONLY',
+            'Modell, Denkaufwand und Geschwindigkeit werden aus der Codex-Konfiguration gelesen.',
           )
         }
         if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
           validateOrigin(req)
           return await startCodexLogin(res, apiOptions)
-        }
-        if (req.method === 'POST' && url.pathname === '/api/auth/codex/model') {
-          validateOrigin(req)
-          if (apiOptions.forceDemo)
-            throw new ApiHttpError(403, 'DEMO_MODE', 'Das Codex-Modell ist im Demo-Modus fest.')
-          const parsed = codexModelSchema.safeParse(await readJson(req))
-          if (!parsed.success)
-            throw new ApiHttpError(400, 'INVALID_CODEX_MODEL', 'Unbekanntes Codex-Modell.')
-          return json(
-            res,
-            200,
-            (apiOptions.codexModelSelect ?? selectCodexModel)(parsed.data.model),
-          )
         }
         if (
           req.method === 'GET' &&

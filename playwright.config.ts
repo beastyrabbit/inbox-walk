@@ -21,6 +21,7 @@ export default defineConfig({
   webServer: {
     command: 'pnpm build && pnpm start',
     env: {
+      CODEX_HOME: 'test-results/codex-home',
       DATA_DIR: 'test-results/runtime-data',
       HOST: '127.0.0.1',
       MAIL_REVIEW_DEMO: '1',
