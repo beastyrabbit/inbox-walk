@@ -2,7 +2,7 @@
 
 ## Production contract
 
-- Release described by this source tree: `v0.9.3`
+- Release described by this source tree: `v0.9.5`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Namespace: `tools`
@@ -61,6 +61,25 @@ explicit reanalysis. There is no application-level message cap. If the selected
 model exhausts its context or output length, the run remains stored and reports
 that condition separately; choose a narrower time range or another available
 model and reanalyze the same round.
+
+## Upgrade to v0.9.5
+
+No database migration is required from v0.9.4. Keep the existing `/data`
+volume and one application replica.
+
+This release reads the Codex login, model, reasoning effort, and speed from the
+Codex home (`CODEX_HOME`, default `~/.codex`). A container without a Codex home
+keeps the Pi login below `/data/pi/auth.json` and takes the model from
+`CODEX_MODEL`, `CODEX_THINKING_LEVEL`, and `CODEX_SPEED`. The settings dialog
+no longer changes these values; change the HelmRelease environment to switch
+the deployed model. A `/data/codex-settings.json` written by earlier releases is
+ignored and can be deleted.
+
+## Upgrade to v0.9.4
+
+No migration or configuration change is required from v0.9.3. Completed review
+rounds close automatically once every message in the frozen snapshot has been
+processed.
 
 ## Upgrade to v0.9.3
 
