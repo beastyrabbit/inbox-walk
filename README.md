@@ -6,7 +6,7 @@ Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one unre
 ## Highlights
 
 - Review a stable snapshot without messages moving underneath you.
-- Expand a story to inspect every original message.
+- See every message of a story side by side, in a grid that adapts to the number of messages.
 - Prepare a thread-aware Fastmail draft with Codex.
 - Keep sending in Fastmail. Inbox Walk has no send endpoint.
 
@@ -22,7 +22,8 @@ Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one unre
 - Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
 - Can omit messages deliberately kept unread in an earlier round using a small local SQLite history.
 - Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
-- Uses the available window for reading mail, with one compact story title and expandable message details.
+- Renders each HTML message in its original design, adapted to the dark interface by default; **Original** shows the sender's colours, and the choice is remembered in the browser.
+- Uses the available window for reading mail: a single message fills it, a story splits it into one pane per message, and message details stay one click away.
 - Keeps selected messages unread and marks the rest read only after confirmation.
 - Closes a round automatically after every message in its frozen snapshot is processed.
 - Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.

@@ -1037,7 +1037,8 @@ test('loads a proxied image without any direct sender request', async ({ page })
   )
   await page.getByRole('button', { name: 'Nachrichtenübersicht öffnen' }).click()
   await page.getByRole('button', { name: /03 DHL Sendungsnummer/ }).click()
-  const image = page.frameLocator('iframe.message-body').locator('img').first()
+  // A story shows every member side by side; the shop mail with the image is the first pane.
+  const image = page.frameLocator('iframe.message-body').first().locator('img').first()
   await expect
     .poll(() =>
       image.evaluate((element: HTMLImageElement) => element.complete && element.naturalWidth > 0),
