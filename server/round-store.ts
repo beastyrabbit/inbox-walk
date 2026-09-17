@@ -16,7 +16,6 @@ import type {
   ReviewFilters,
 } from '../src/shared.ts'
 import {
-  type BundleDecision,
   type BundleExample,
   type BundlePartitionDecision,
   hashLearningSignal,
@@ -165,11 +164,6 @@ export interface RoundStore {
   close(): void
   create(input: CreateReviewRoundInput): StoredReviewRound
   delete(roundId: string): boolean
-  getBundleDecision(
-    roundId: string,
-    decisionKey: string,
-    expectedGeneration?: number,
-  ): BundleDecision | null
   getBundlePartition(
     roundId: string,
     decisionKey: string,
@@ -189,12 +183,6 @@ export interface RoundStore {
     analysis?: RoundAnalysisUpdate,
     expectedGeneration?: number,
   ): StoredReviewRound | null
-  saveBundleDecision(
-    roundId: string,
-    decisionKey: string,
-    decision: BundleDecision,
-    expectedGeneration?: number,
-  ): BundleDecision | null
   saveBundlePartition(
     roundId: string,
     decisionKey: string,
@@ -508,18 +496,6 @@ function cleanBundleRun(run: ReviewBundleRun): ReviewBundleRun {
     })),
     fallback: run.fallback,
     snapshotId: run.snapshotId,
-  }
-}
-
-function cleanBundleDecision(decision: BundleDecision): BundleDecision {
-  return {
-    currentState: decision.currentState,
-    includedEmailIds: [...decision.includedEmailIds],
-    kind: decision.kind,
-    linkEvidence: [...decision.linkEvidence],
-    membershipConfidence: decision.membershipConfidence,
-    summary: decision.summary,
-    title: decision.title,
   }
 }
 
@@ -1397,17 +1373,6 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
       if (deleted) checkpointDeletedPages()
       return deleted
     },
-    getBundleDecision(roundId, decisionKey, expectedGeneration) {
-      assertNonEmpty(decisionKey, 'Bundle decision key')
-      if (expectedGeneration !== undefined) {
-        const row = selectRound.get(roundId) as RoundRow | undefined
-        if (!row || Number(row.generation) !== expectedGeneration) return null
-      }
-      const row = selectBundleDecision.get(roundId, decisionKey) as
-        | { decision_json: string }
-        | undefined
-      return row ? cleanBundleDecision(jsonParse<BundleDecision>(row.decision_json)) : null
-    },
     getBundlePartition(roundId, decisionKey, expectedGeneration) {
       assertNonEmpty(decisionKey, 'Bundle partition key')
       if (expectedGeneration !== undefined) {
@@ -1595,28 +1560,6 @@ export function createRoundStore(databasePath = roundStorePath()): RoundStore {
         return true
       })
       return started ? get(roundId) : null
-    },
-    saveBundleDecision(roundId, decisionKey, decision, expectedGeneration) {
-      assertNonEmpty(decisionKey, 'Bundle decision key')
-      const clean = cleanBundleDecision(decision)
-      const now = new Date().toISOString()
-      const saved = transaction(() => {
-        const row = selectRound.get(roundId) as RoundRow | undefined
-        if (!row) return false
-        if (expectedGeneration !== undefined && Number(row.generation) !== expectedGeneration) {
-          return false
-        }
-        insertBundleDecision.run(roundId, decisionKey, JSON.stringify(clean), now)
-        touchRound.run(now, roundId)
-        return true
-      })
-      if (!saved) return null
-      const persisted = selectBundleDecision.get(roundId, decisionKey) as
-        | { decision_json: string }
-        | undefined
-      return persisted
-        ? cleanBundleDecision(jsonParse<BundleDecision>(persisted.decision_json))
-        : null
     },
     saveBundlePartition(roundId, decisionKey, decision, expectedGeneration) {
       assertNonEmpty(decisionKey, 'Bundle partition key')

@@ -10,7 +10,6 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
-  bundleDecisionSystemPrompt,
   bundlePartitionPrompt,
   bundlePartitionSystemPrompt,
   bundlePartitionToolSchema,
@@ -146,42 +145,6 @@ describe('Codex provider boundary', () => {
       emails: unknown[]
     }
     expect(parsed.emails).toEqual([email])
-  })
-
-  it('defines entity-level lifecycle, recurring-series, evidence, and title rules', () => {
-    const single = bundleDecisionSystemPrompt(false)
-    const batch = bundleDecisionSystemPrompt(true)
-
-    for (const prompt of [single, batch]) {
-      expect(prompt).toContain('same underlying story')
-      expect(prompt).toContain('same narrow real-world entity and activity')
-      expect(prompt).toContain(
-        'notification template, broad category, wording, or time window alone',
-      )
-      expect(prompt).toContain('require a discriminating combination')
-      expect(prompt).toContain('one or more carrier parcels')
-      expect(prompt).toContain('candidate need not match the seed directly')
-      expect(prompt).toContain('Different provider roles are not a conflict')
-      expect(prompt).toContain('Prefer a concrete lifecycle over a recurring series')
-      expect(prompt).toContain('Never group generic card notifications with each other')
-      expect(prompt).toContain('unique compatible charge event within minutes')
-      expect(prompt).toContain('several items or parcels')
-      expect(prompt).toContain('continuous unresolved incident across successive SHAs or providers')
-      expect(prompt).toContain('commission start to completion to review')
-      expect(prompt).toContain("one repository's same change or bounded failure episode")
-      expect(prompt).toContain('return each included ID at most once')
-      expect(prompt).toContain('latest state or activity')
-      expect(prompt).toContain(
-        'Write title, currentState, summary, and linkEvidence in concise German',
-      )
-      expect(prompt).toContain('Avoid generic titles')
-      expect(prompt).toContain('Never invent a missing fact')
-    }
-    expect(single).toContain('Never return seed IDs')
-    expect(single).toContain('submit_bundle_decision exactly once')
-    expect(batch).toContain('Evaluate every supplied cohort independently')
-    expect(batch).toContain('Candidate IDs may only be returned within their own cohort')
-    expect(batch).toContain('submit_bundle_decision_batch exactly once')
   })
 
   it('keeps the OAuth record below DATA_DIR and verifies writable storage', () => {

@@ -30,20 +30,14 @@ import {
   isCodexSpeed,
   isCodexThinkingLevel,
 } from '../src/shared.ts'
-import {
-  createCheckpointedBundleDecider,
-  createCheckpointedBundlePartitionDecider,
-} from './bundle-checkpoint.ts'
+import { createCheckpointedBundlePartitionDecider } from './bundle-checkpoint.ts'
 import type { BundleStore } from './bundle-store.ts'
 import {
   type BundleBuildProgress,
   type BundleExample,
-  buildReviewBundles,
   buildReviewBundlesFromPartition,
-  type DecideBundle,
-  type DecideBundleBatch,
   type DecideBundlePartition,
-  singletonBundleRun,
+  heuristicBundlePartition,
   validateBundlePartition,
 } from './bundles.ts'
 import {
@@ -52,8 +46,6 @@ import {
   CodexContextLengthError,
   codexAuthStatus,
   getCodexAuthStorage,
-  runCodexBundleDecision,
-  runCodexBundleDecisionBatch,
   runCodexBundlePartition,
   selectedCodexSettings,
 } from './codex.ts'
@@ -176,10 +168,7 @@ interface StoredSnapshot {
 
 export interface ApiOptions {
   autoStartBundles?: boolean
-  bundleBatchDecider?: DecideBundleBatch
-  bundleDecider?: DecideBundle
   bundlePartitionDecider?: DecideBundlePartition
-  bundleFallback?: typeof singletonBundleRun
   bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
@@ -383,11 +372,7 @@ function initialAnalysis(
 ): ReviewAnalysisState {
   const auth =
     mode === 'live' ? (options.codexAuthStatus ?? codexAuthStatus)() : { configured: false }
-  const usesCodex =
-    Boolean(
-      options.bundleDecider || options.bundleBatchDecider || options.bundlePartitionDecider,
-    ) ||
-    (mode === 'live' && auth.configured)
+  const usesCodex = Boolean(options.bundlePartitionDecider) || (mode === 'live' && auth.configured)
   return {
     callCount: 0,
     engine: usesCodex ? 'codex' : 'heuristic',
@@ -1850,12 +1835,12 @@ function publicBundleFailure(error: unknown) {
     return 'Die Runde ist für das Kontextfenster des in Codex konfigurierten Modells zu groß. Wähle einen kleineren Zeitraum oder stelle in Codex ein anderes Modell ein und analysiere dieselbe Runde erneut.'
   }
   if (/timeout|timed out|abort/i.test(message)) {
-    return 'Codex hat nicht rechtzeitig geantwortet. Die Nachrichten werden einzeln angezeigt.'
+    return 'Codex hat nicht rechtzeitig geantwortet. Analysiere dieselbe Runde erneut.'
   }
   if (/network|fetch|connect|econn|dns/i.test(message)) {
-    return 'Codex war nicht erreichbar. Die Nachrichten werden einzeln angezeigt.'
+    return 'Codex war nicht erreichbar. Analysiere dieselbe Runde erneut.'
   }
-  return 'Die Zusammenhänge konnten nicht sicher bestimmt werden. Die Nachrichten werden einzeln angezeigt.'
+  return 'Die Zusammenhänge konnten nicht sicher bestimmt werden. Analysiere dieselbe Runde erneut.'
 }
 
 function persistAnalysisUpdate(event: string, action: () => unknown) {
@@ -1960,7 +1945,6 @@ function startBundleJob(
   if (snapshot.bundleRun) return Promise.resolve()
   const existingJob = bundleJobs.get(snapshotId)
   if (existingJob) return existingJob
-  const fallback = apiOptions.bundleFallback ?? singletonBundleRun
   const emails = snapshot.emailIds
     .map((id) => snapshot.summaries.get(id))
     .filter((email): email is ReviewEmailSummary => Boolean(email))
@@ -1971,8 +1955,6 @@ function startBundleJob(
   const mustResumeWithCodex =
     snapshot.mode === 'live' &&
     snapshot.analysis.engine === 'codex' &&
-    !apiOptions.bundleDecider &&
-    !apiOptions.bundleBatchDecider &&
     !apiOptions.bundlePartitionDecider
   if (mustResumeWithCodex && !auth.configured) {
     snapshot.analysis = {
@@ -2015,45 +1997,10 @@ function startBundleJob(
     'speed' in auth && isCodexSpeed(auth.speed) ? auth.speed : selectedCodexSettings().speed
   const providerDecidePartition =
     apiOptions.bundlePartitionDecider ??
-    (!apiOptions.bundleDecider &&
-    !apiOptions.bundleBatchDecider &&
-    snapshot.mode === 'live' &&
-    snapshot.analysis.engine === 'codex' &&
-    auth.configured
+    (snapshot.mode === 'live' && snapshot.analysis.engine === 'codex' && auth.configured
       ? (input: Parameters<typeof runCodexBundlePartition>[0], signal?: AbortSignal) =>
           runCodexBundlePartition(
             input,
-            frozenModel ?? auth.model,
-            frozenThinkingLevel,
-            frozenSpeed,
-            signal ?? jobContext.signal,
-          )
-      : undefined)
-  const providerDecide =
-    apiOptions.bundleDecider ??
-    (!providerDecidePartition &&
-    snapshot.mode === 'live' &&
-    snapshot.analysis.engine === 'codex' &&
-    auth.configured
-      ? (input: Parameters<typeof runCodexBundleDecision>[0], signal?: AbortSignal) =>
-          runCodexBundleDecision(
-            input,
-            frozenModel ?? auth.model,
-            frozenThinkingLevel,
-            frozenSpeed,
-            signal ?? jobContext.signal,
-          )
-      : undefined)
-  const providerDecideBatch =
-    apiOptions.bundleBatchDecider ??
-    (!apiOptions.bundleDecider &&
-    !providerDecidePartition &&
-    snapshot.mode === 'live' &&
-    snapshot.analysis.engine === 'codex' &&
-    auth.configured
-      ? (cohorts: Parameters<typeof runCodexBundleDecisionBatch>[0], signal?: AbortSignal) =>
-          runCodexBundleDecisionBatch(
-            cohorts,
             frozenModel ?? auth.model,
             frozenThinkingLevel,
             frozenSpeed,
@@ -2094,31 +2041,12 @@ function startBundleJob(
           store: apiOptions.roundStore,
         })
       : undefined
-  const checkpointed =
-    providerDecide && apiOptions.roundStore
-      ? createCheckpointedBundleDecider({
-          decide: providerDecide,
-          ...(providerDecideBatch ? { decideBatch: providerDecideBatch } : {}),
-          initialCallCount: snapshot.analysis.callCount,
-          ...(jobContext.expectedGeneration === undefined
-            ? {}
-            : { generation: jobContext.expectedGeneration }),
-          ...(frozenModel ? { model: frozenModel } : {}),
-          onCallStarted,
-          onCallRolledBack,
-          roundId: snapshotId,
-          shouldRollbackCall: (error) => error instanceof CodexAuthenticationError,
-          store: apiOptions.roundStore,
-        })
-      : undefined
-  const decidePartition = checkpointedPartition?.decide ?? providerDecidePartition
-  const decide = checkpointed?.decide ?? providerDecide
-  const codexCallCount = () =>
-    checkpointedPartition?.callCount() ?? checkpointed?.callCount() ?? snapshot.analysis.callCount
-  const engine =
-    providerDecidePartition || providerDecide || providerDecideBatch
-      ? ('codex' as const)
-      : ('heuristic' as const)
+  const decidePartition: DecideBundlePartition =
+    checkpointedPartition?.decide ??
+    providerDecidePartition ??
+    (async (input) => heuristicBundlePartition(input.emails))
+  const codexCallCount = () => checkpointedPartition?.callCount() ?? snapshot.analysis.callCount
+  const engine = providerDecidePartition ? ('codex' as const) : ('heuristic' as const)
   const model = frozenModel
   const { error: _previousAnalysisError, ...previousAnalysis } = snapshot.analysis
   snapshot.analysis = {
@@ -2164,11 +2092,7 @@ function startBundleJob(
       const buildOptions = {
         codexCallCount: codexCallCount(),
         engine,
-        ...(checkpointedPartition
-          ? { getCodexCallCount: checkpointedPartition.callCount }
-          : checkpointed
-            ? { getCodexCallCount: checkpointed.callCount }
-            : {}),
+        ...(checkpointedPartition ? { getCodexCallCount: checkpointedPartition.callCount } : {}),
         ...(model ? { model } : {}),
         signal: jobContext.signal,
         onProgress: (progress: BundleBuildProgress) =>
@@ -2180,22 +2104,13 @@ function startBundleJob(
             jobContext.expectedGeneration,
           ),
       }
-      const run = decidePartition
-        ? await buildReviewBundlesFromPartition(
-            snapshotId,
-            emails,
-            decidePartition,
-            snapshot.bundleExamples,
-            buildOptions,
-          )
-        : await buildReviewBundles(snapshotId, emails, decide, snapshot.bundleExamples, {
-            ...buildOptions,
-            ...(checkpointed
-              ? { decideBatch: checkpointed.decideBatch }
-              : providerDecideBatch
-                ? { decideBatch: providerDecideBatch }
-                : {}),
-          })
+      const run = await buildReviewBundlesFromPartition(
+        snapshotId,
+        emails,
+        decidePartition,
+        snapshot.bundleExamples,
+        buildOptions,
+      )
       jobContext.signal?.throwIfAborted()
       snapshot.bundleRun = run
       snapshot.analysis = {
@@ -2265,9 +2180,7 @@ function startBundleJob(
           error:
             error instanceof CodexAuthenticationError
               ? 'Codex muss erneut verbunden werden. Danach kannst du dieselbe Runde neu analysieren.'
-              : publicBundleFailure(error)
-                  .replace(' Die Nachrichten werden sicher einzeln angezeigt.', '')
-                  .replace(' Die Nachrichten werden einzeln angezeigt.', ''),
+              : publicBundleFailure(error),
           phase: 'failed',
           status: 'pending',
         }
@@ -2309,34 +2222,24 @@ function startBundleJob(
       }
       process.stderr.write(
         `${JSON.stringify({
-          event: 'bundle_fallback',
+          event: 'bundle_analysis_failed',
+          generation: jobContext.expectedGeneration ?? snapshot.generation,
           message: error instanceof Error ? error.message : 'unknown',
+          roundId: snapshotId,
         })}\n`,
       )
-      snapshot.analysis = { ...snapshot.analysis, error: publicBundleFailure(error) }
-      snapshot.bundleRun = fallback(snapshotId, emails, {
-        codexCallCount: snapshot.analysis.callCount,
-        ...(model ? { model } : {}),
-        onProgress: (progress) =>
-          applyBundleProgress(
-            snapshotId,
-            snapshot,
-            progress,
-            apiOptions.roundStore,
-            jobContext.expectedGeneration,
-          ),
-      })
+      snapshot.bundleRun = undefined
       snapshot.analysis = {
         ...snapshot.analysis,
-        phase: 'complete',
-        progress: 1,
-        status: 'complete',
+        callCount: codexCallCount(),
+        error: publicBundleFailure(error),
+        phase: 'failed',
+        status: 'pending',
       }
       if (apiOptions.roundStore) {
-        const persisted = persistAnalysisUpdate('bundle_fallback_persist_failed', () =>
-          apiOptions.roundStore?.saveBundleRun(
+        const persisted = persistAnalysisUpdate('bundle_failure_persist_failed', () =>
+          apiOptions.roundStore?.updateAnalysis(
             snapshotId,
-            snapshot.bundleRun as ReviewBundleRun,
             snapshot.analysis,
             jobContext.expectedGeneration,
           ),
@@ -2356,9 +2259,7 @@ function startBundleJob(
         snapshot.bundleRun = undefined
         snapshot.analysis = {
           ...snapshot.analysis,
-          error: publicBundleFailure(error)
-            .replace(' Die Nachrichten werden sicher einzeln angezeigt.', '')
-            .replace(' Die Nachrichten werden einzeln angezeigt.', ''),
+          error: publicBundleFailure(error),
           phase: 'failed',
           status: 'pending',
         }
@@ -2378,53 +2279,22 @@ function startBundleJob(
           message: error instanceof Error ? error.message : 'unknown',
         })}\n`,
       )
-      try {
-        snapshot.analysis = {
-          ...snapshot.analysis,
-          engine: 'fallback',
-          error: publicBundleFailure(error),
-          phase: 'complete',
-          progress: 1,
-          status: 'complete',
-        }
-        snapshot.bundleRun = fallback(snapshotId, emails)
-        if (apiOptions.roundStore) {
-          const persisted = persistAnalysisUpdate('bundle_emergency_fallback_persist_failed', () =>
-            apiOptions.roundStore?.saveBundleRun(
-              snapshotId,
-              snapshot.bundleRun as ReviewBundleRun,
-              snapshot.analysis,
-              jobContext.expectedGeneration,
-            ),
-          )
-          if (!persisted) markAnalysisPersistenceFailure(snapshot)
-        }
-      } catch (fallbackError) {
-        process.stderr.write(
-          `${JSON.stringify({
-            event: 'bundle_emergency_fallback_failed',
-            message: fallbackError instanceof Error ? fallbackError.message : 'unknown',
-          })}\n`,
+      snapshot.bundleRun = undefined
+      snapshot.analysis = {
+        ...snapshot.analysis,
+        error: publicBundleFailure(error),
+        phase: 'failed',
+        status: 'pending',
+      }
+      if (apiOptions.roundStore) {
+        const persisted = persistAnalysisUpdate('bundle_failure_persist_failed', () =>
+          apiOptions.roundStore?.updateAnalysis(
+            snapshotId,
+            snapshot.analysis,
+            jobContext.expectedGeneration,
+          ),
         )
-        snapshot.bundleRun = undefined
-        snapshot.analysis = {
-          ...snapshot.analysis,
-          engine: 'fallback',
-          error:
-            'Die Analyse ist fehlgeschlagen. Die gespeicherte Runde kann nach einem Neustart erneut geladen werden.',
-          phase: 'waiting',
-          progress: 0,
-          status: 'pending',
-        }
-        if (apiOptions.roundStore) {
-          persistAnalysisUpdate('bundle_terminal_error_persist_failed', () =>
-            apiOptions.roundStore?.updateAnalysis(
-              snapshotId,
-              snapshot.analysis,
-              jobContext.expectedGeneration,
-            ),
-          )
-        }
+        if (!persisted) markAnalysisPersistenceFailure(snapshot)
       }
     })
     .finally(() => {

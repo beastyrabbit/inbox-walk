@@ -17,7 +17,12 @@ import {
   safeCodexLoginUrl,
   waitForApiJobs,
 } from './api.ts'
-import { type BundleExample, hashLearningSignal } from './bundles.ts'
+import {
+  type BundleExample,
+  type BundlePartitionDecision,
+  type BundlePartitionInput,
+  hashLearningSignal,
+} from './bundles.ts'
 import { CodexAuthenticationError, CodexContextLengthError } from './codex.ts'
 import { demoEmails } from './demo.ts'
 import { createRoundStore } from './round-store.ts'
@@ -46,6 +51,10 @@ const partialFinalizeResult: FinalizeResult = {
   untouched: demoEmails.length - 1,
 }
 
+function standalonePartition(input: BundlePartitionInput): BundlePartitionDecision {
+  return { standaloneEmailIds: input.emails.map((email) => email.id), stories: [] }
+}
+
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
   const body = (await response.json()) as T
@@ -67,22 +76,6 @@ async function json<T>(path: string, init?: RequestInit) {
     return { response, body: (await opened.json()) as T }
   }
   return { response, body }
-}
-
-async function waitForBundles(review: ReviewSnapshot) {
-  const started = await json<ReviewSnapshot>(
-    `/api/reviews/${review.snapshotId}/bundles`,
-    post({}, review.csrfToken),
-  )
-  expect([200, 202]).toContain(started.response.status)
-  let current = started.body
-  for (let attempt = 0; attempt < 50 && current.analysis.status !== 'complete'; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 5))
-    current = (await json<ReviewSnapshot>(`/api/reviews/${review.snapshotId}`)).body
-  }
-  expect(current.analysis.status).toBe('complete')
-  expect(current.bundleRun).toBeDefined()
-  return current
 }
 
 function post(body: unknown, csrfToken?: string): RequestInit {
@@ -157,19 +150,13 @@ beforeAll(async () => {
         })
       },
     }),
-    bundleDecider: async () => {
+    bundlePartitionDecider: async (input) => {
       bundleDecisionCalls += 1
       if (bundleDecisionGate) await bundleDecisionGate
       if (bundleDecisionFailure) throw bundleDecisionFailure
-      return {
-        includedEmailIds: injectUnknownBundleId ? ['outside-frozen-snapshot'] : [],
-        kind: 'standalone',
-        title: 'Demo bundle',
-        currentState: 'Demo',
-        summary: 'Deterministic test decision.',
-        linkEvidence: [],
-        membershipConfidence: 1,
-      }
+      return injectUnknownBundleId
+        ? { standaloneEmailIds: ['outside-frozen-snapshot'], stories: [] }
+        : standalonePartition(input)
     },
   })
   server = createServer((request, response) => {
@@ -614,7 +601,7 @@ describe('demo API contract', () => {
     if (!source) return
     let providerCalls = 0
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async () => {
+      bundlePartitionDecider: async () => {
         providerCalls += 1
         throw new Error('Provider must not be called for an incomplete snapshot')
       },
@@ -722,9 +709,9 @@ describe('demo API contract', () => {
     let savedRuns = 0
     const observedStore = {
       ...localStore,
-      saveBundleDecision: (...args: Parameters<(typeof localStore)['saveBundleDecision']>) => {
+      saveBundlePartition: (...args: Parameters<(typeof localStore)['saveBundlePartition']>) => {
         savedDecisions += 1
-        return localStore.saveBundleDecision(...args)
+        return localStore.saveBundlePartition(...args)
       },
       saveBundleRun: (...args: Parameters<(typeof localStore)['saveBundleRun']>) => {
         savedRuns += 1
@@ -732,7 +719,7 @@ describe('demo API contract', () => {
       },
     }
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async (_input, signal) => {
+      bundlePartitionDecider: async (_input, signal) => {
         analysisStartedResolve?.()
         await new Promise<never>((_resolve, reject) => {
           const abort = () => {
@@ -1100,18 +1087,10 @@ describe('demo API contract', () => {
     })
     let providerSignal: AbortSignal | undefined
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async (input, signal) => {
+      bundlePartitionDecider: async (input, signal) => {
         providerSignal = signal
         await decisionGate
-        return {
-          currentState: 'Geprüft',
-          includedEmailIds: [],
-          kind: 'standalone',
-          linkEvidence: [],
-          membershipConfidence: 1,
-          summary: 'Eigenständige Nachricht.',
-          title: input.seed[0]?.subject ?? 'Nachricht',
-        }
+        return standalonePartition(input)
       },
       forceDemo: true,
       roundStore: localStore,
@@ -1166,17 +1145,9 @@ describe('demo API contract', () => {
       saveBundleRun: () => null,
     }
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async (input) => {
+      bundlePartitionDecider: async (input) => {
         providerCalls += 1
-        return {
-          currentState: 'Geprüft',
-          includedEmailIds: [],
-          kind: 'standalone',
-          linkEvidence: [],
-          membershipConfidence: 1,
-          summary: 'Eigenständige Nachricht.',
-          title: input.seed[0]?.subject ?? 'Nachricht',
-        }
+        return standalonePartition(input)
       },
       forceDemo: true,
       roundStore: failingStore,
@@ -1272,15 +1243,7 @@ describe('demo API contract', () => {
       },
     }
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async (input) => ({
-        currentState: 'Geprüft',
-        includedEmailIds: [],
-        kind: 'standalone',
-        linkEvidence: [],
-        membershipConfidence: 1,
-        summary: 'Eigenständige Nachricht.',
-        title: input.seed[0]?.subject ?? 'Nachricht',
-      }),
+      bundlePartitionDecider: async (input) => standalonePartition(input),
       forceDemo: true,
       roundStore: throwingStore,
     })
@@ -1332,7 +1295,7 @@ describe('demo API contract', () => {
       updateAnalysis: () => null,
     }
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async () => {
+      bundlePartitionDecider: async () => {
         providerCalls += 1
         throw new Error('Provider must not be called')
       },
@@ -1681,17 +1644,9 @@ describe('demo API contract', () => {
       releaseSnapshot = resolve
     })
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async (input) => {
+      bundlePartitionDecider: async (input) => {
         providerCalls += 1
-        return {
-          currentState: 'Geprüft',
-          includedEmailIds: [],
-          kind: 'standalone',
-          linkEvidence: [],
-          membershipConfidence: 1,
-          summary: 'Eigenständige Nachricht.',
-          title: input.seed[0]?.subject ?? 'Nachricht',
-        }
+        return standalonePartition(input)
       },
       fastmailToken: 'test-token',
       resumeMailSnapshot: async (_token, _ids, filters) => {
@@ -1808,7 +1763,7 @@ describe('demo API contract', () => {
     if (!source) return
     let providerCalls = 0
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async () => {
+      bundlePartitionDecider: async () => {
         providerCalls += 1
         throw new Error('Provider must not be called for an incomplete snapshot')
       },
@@ -1906,7 +1861,7 @@ describe('demo API contract', () => {
     })
     let providerCalls = 0
     const localMiddleware = createApiMiddleware({
-      bundleDecider: async () => {
+      bundlePartitionDecider: async () => {
         providerCalls += 1
         throw new Error('Incomplete historical rounds must never run analysis')
       },
@@ -2077,7 +2032,7 @@ describe('demo API contract', () => {
     const localStore = createRoundStore(':memory:')
     const localMiddleware = createApiMiddleware({
       autoStartBundles: true,
-      bundleDecider: async () => {
+      bundlePartitionDecider: async () => {
         throw new Error('Primary bundle analysis failed')
       },
       demoMessages: [
@@ -2169,18 +2124,10 @@ describe('demo API contract', () => {
     let decisionCalls = 0
     const localMiddleware = createApiMiddleware({
       autoStartBundles: true,
-      bundleDecider: async () => {
+      bundlePartitionDecider: async (input) => {
         decisionCalls += 1
         await decisionGate
-        return {
-          currentState: 'Geprüft',
-          includedEmailIds: [],
-          kind: 'standalone',
-          linkEvidence: [],
-          membershipConfidence: 1,
-          summary: 'Persistierte Recovery-Entscheidung.',
-          title: 'Recovery',
-        }
+        return standalonePartition(input)
       },
       demoMessages: demoEmails,
       forceDemo: true,
@@ -2645,19 +2592,11 @@ describe('demo API contract', () => {
     const observedExamples: BundleExample[][] = []
     const localMiddleware = createApiMiddleware({
       autoStartBundles: false,
-      bundleDecider: async (input) => {
+      bundlePartitionDecider: async (input) => {
         providerCalls += 1
         observedExamples.push(input.examples)
-        if (failAuthentication && providerCalls === 2) throw new CodexAuthenticationError()
-        return {
-          currentState: 'Geprüft',
-          includedEmailIds: [],
-          kind: 'standalone',
-          linkEvidence: [],
-          membershipConfidence: 1,
-          summary: 'Getrennte Story.',
-          title: 'Getrennt',
-        }
+        if (failAuthentication && providerCalls === 1) throw new CodexAuthenticationError()
+        return standalonePartition(input)
       },
       bundleStore: {
         examples: () => {
@@ -2692,7 +2631,7 @@ describe('demo API contract', () => {
       ).json()) as ReviewSnapshot
       expect(waiting).toMatchObject({
         analysis: {
-          callCount: 1,
+          callCount: 0,
           engine: 'codex',
           model: 'gpt-5.6-sol',
           phase: 'waiting_for_codex',
@@ -2704,7 +2643,7 @@ describe('demo API contract', () => {
 
       const frozenExamples = localStore.get('auth-resume-round')?.bundleExamples ?? []
       expect(frozenExamples).toHaveLength(1)
-      expect(observedExamples).toEqual([frozenExamples, frozenExamples])
+      expect(observedExamples).toEqual([frozenExamples])
       globalExamples = [
         {
           anchorSignals: ['provider:changed-anchor'],
@@ -2721,9 +2660,9 @@ describe('demo API contract', () => {
       )
       expect(resumed.status).toBe(202)
       await waitForApiJobs()
-      expect(providerCalls).toBe(3)
+      expect(providerCalls).toBe(2)
       expect(globalExampleReads).toBe(0)
-      expect(observedExamples).toEqual([frozenExamples, frozenExamples, frozenExamples])
+      expect(observedExamples).toEqual([frozenExamples, frozenExamples])
       expect(observedExamples.flat()).not.toEqual(expect.arrayContaining(globalExamples))
 
       clearApiStateForTests()
@@ -2731,7 +2670,7 @@ describe('demo API contract', () => {
         await fetch(`${localBase}/api/reviews/auth-resume-round`)
       ).json()) as ReviewSnapshot
       expect(completed.analysis).toMatchObject({
-        callCount: 2,
+        callCount: 1,
         engine: 'codex',
         model: 'gpt-5.6-sol',
         phase: 'complete',
@@ -3094,27 +3033,62 @@ describe('demo API contract', () => {
     expect(rejected.body.error.code).toBe('INVALID_CSRF')
   })
 
-  it('builds an exact bundle partition', async () => {
-    const review = await json<ReviewSnapshot>(
-      '/api/reviews',
-      post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
-    )
-    const completed = await waitForBundles(review.body)
-    const run = completed.bundleRun
-    if (!run) return
-    const bundledIds = run.bundles.flatMap((bundle) => bundle.emailIds)
-    expect(new Set(bundledIds)).toEqual(new Set(review.body.emails.map((email) => email.id)))
-    expect(bundledIds).toHaveLength(review.body.emails.length)
-    expect(
-      run.bundles.find((bundle) => bundle.emailIds.includes('demo-github-merged'))?.emailIds,
-    ).toEqual(
-      expect.arrayContaining([
-        'demo-github-opened',
-        'demo-github-merged',
-        'demo-railway-failed',
-        'demo-railway-success',
-      ]),
-    )
+  it('builds an exact bundle partition with the local heuristic in demo mode', async () => {
+    const localStore = createRoundStore(':memory:')
+    const localMiddleware = createApiMiddleware({
+      autoStartBundles: true,
+      forceDemo: true,
+      roundStore: localStore,
+    })
+    const localServer = createServer((request, response) => {
+      void localMiddleware(request, response, () => {
+        response.statusCode = 404
+        response.end()
+      })
+    })
+    await new Promise<void>((resolve) => localServer.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = localServer.address()
+      if (!address || typeof address === 'string') throw new Error('Local server did not bind')
+      const localBase = `http://127.0.0.1:${address.port}`
+      const created = (await (
+        await fetch(
+          `${localBase}/api/reviews`,
+          post({ filters: { mailboxId: null, newsletter: 'all', timeRange: 'all' } }),
+        )
+      ).json()) as ReviewRunSummary
+      await waitForApiJobs()
+      const completed = (await (
+        await fetch(`${localBase}/api/reviews/${created.id}`)
+      ).json()) as ReviewSnapshot
+      expect(completed.analysis).toMatchObject({
+        callCount: 0,
+        engine: 'heuristic',
+        status: 'complete',
+      })
+      const run = completed.bundleRun
+      expect(run).toBeDefined()
+      if (!run) return
+      const bundledIds = run.bundles.flatMap((bundle) => bundle.emailIds)
+      expect(new Set(bundledIds)).toEqual(new Set(completed.emails.map((email) => email.id)))
+      expect(bundledIds).toHaveLength(completed.emails.length)
+      expect(
+        run.bundles.find((bundle) => bundle.emailIds.includes('demo-github-merged'))?.emailIds,
+      ).toEqual(
+        expect.arrayContaining([
+          'demo-github-opened',
+          'demo-github-merged',
+          'demo-railway-failed',
+          'demo-railway-success',
+        ]),
+      )
+    } finally {
+      await new Promise<void>((resolve, reject) =>
+        localServer.close((error) => (error ? reject(error) : resolve())),
+      )
+      localStore.close()
+      clearApiStateForTests()
+    }
   })
 
   it('fails the background run closed when a bundle decision injects an unknown ID', async () => {

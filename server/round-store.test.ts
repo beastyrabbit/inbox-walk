@@ -361,17 +361,22 @@ describe('SQLite review round store', () => {
     legacy.close()
 
     const migrated = createRoundStore(databasePath)
-    const decision = {
-      currentState: 'Ready',
-      includedEmailIds: ['mail-2'],
-      kind: 'conversation' as const,
-      linkEvidence: ['same conversation'],
-      membershipConfidence: 0.9,
-      summary: 'Related messages.',
-      title: 'Conversation',
+    const decision: BundlePartitionDecision = {
+      standaloneEmailIds: [],
+      stories: [
+        {
+          currentState: 'Ready',
+          emailIds: ['mail-1', 'mail-2'],
+          kind: 'conversation',
+          linkEvidence: ['same conversation'],
+          membershipConfidence: 0.9,
+          summary: 'Related messages.',
+          title: 'Conversation',
+        },
+      ],
     }
-    expect(migrated.saveBundleDecision('round-1', 'decision-key', decision)).toEqual(decision)
-    expect(migrated.getBundleDecision('round-1', 'decision-key')).toEqual(decision)
+    expect(migrated.saveBundlePartition('round-1', 'decision-key', decision)).toEqual(decision)
+    expect(migrated.getBundlePartition('round-1', 'decision-key')).toEqual(decision)
     expect(migrated.get('round-1')?.bundleExamples).toEqual([])
     migrated.close()
 
@@ -467,14 +472,19 @@ describe('SQLite review round store', () => {
     const databasePath = createDatabasePath()
     const { store } = createRound(databasePath)
     store.saveBundleRun('round-1', bundleRun())
-    store.saveBundleDecision('round-1', 'stale-decision', {
-      currentState: 'Ready',
-      includedEmailIds: ['mail-2'],
-      kind: 'conversation',
-      linkEvidence: ['same conversation'],
-      membershipConfidence: 0.9,
-      summary: 'Related messages.',
-      title: 'Conversation',
+    store.saveBundlePartition('round-1', 'stale-decision', {
+      standaloneEmailIds: [],
+      stories: [
+        {
+          currentState: 'Ready',
+          emailIds: ['mail-1', 'mail-2'],
+          kind: 'conversation',
+          linkEvidence: ['same conversation'],
+          membershipConfidence: 0.9,
+          summary: 'Related messages.',
+          title: 'Conversation',
+        },
+      ],
     })
     store.close()
 
@@ -505,7 +515,7 @@ describe('SQLite review round store', () => {
     expect(migrated.list()).toEqual([
       expect.objectContaining({ id: 'round-1', reanalyzable: false, runStatus: 'failed' }),
     ])
-    expect(migrated.getBundleDecision('round-1', 'stale-decision')).toBeNull()
+    expect(migrated.getBundlePartition('round-1', 'stale-decision')).toBeNull()
     migrated.close()
   })
 
