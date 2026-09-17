@@ -8,7 +8,7 @@ import {
   saveCheckpoint,
   stageCheckpointMigration,
 } from './checkpoint.ts'
-import { emailDocument } from './email-document.ts'
+import { emailDocument, type MailColorMode } from './email-document.ts'
 import {
   addressesToText,
   applyReplyProposal,
@@ -83,6 +83,38 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatShortDate(value: string) {
+  return new Intl.DateTimeFormat('de-DE', {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value))
+}
+
+function initials(addresses: MailAddress[]) {
+  const source = addresses[0]?.name || addresses[0]?.email || '?'
+  const words = source
+    .replace(/[<>"]/g, '')
+    .trim()
+    .split(/[\s._@-]+/)
+    .filter(Boolean)
+  return words
+    .slice(0, 2)
+    .map((word) => word[0]?.toLocaleUpperCase('de-DE') ?? '')
+    .join('')
+}
+
+const MAIL_COLOR_STORAGE_KEY = 'inbox-walk.mail-colors'
+
+function storedMailColorMode(): MailColorMode {
+  try {
+    return window.localStorage.getItem(MAIL_COLOR_STORAGE_KEY) === 'original' ? 'original' : 'dark'
+  } catch {
+    return 'dark'
+  }
 }
 
 function errorMessage(error: unknown) {
@@ -292,7 +324,6 @@ function App() {
   const [migrationRoundId, setMigrationRoundId] = useState<string | null>(null)
   const [creatingRun, setCreatingRun] = useState(false)
   const [loading, setLoading] = useState(true)
-  const [detailLoading, setDetailLoading] = useState(false)
   const [failedDetails, setFailedDetails] = useState<Set<string>>(new Set())
   const [pendingDetails, setPendingDetails] = useState<Set<string>>(new Set())
   const roundEpochRef = useRef(0)
@@ -306,6 +337,15 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [runStatusError, setRunStatusError] = useState<string | null>(null)
   const [result, setResult] = useState<FinalizeResult | null>(null)
+  const [mailColorMode, setMailColorModeState] = useState<MailColorMode>(storedMailColorMode)
+  const setMailColorMode = useCallback((mode: MailColorMode) => {
+    setMailColorModeState(mode)
+    try {
+      window.localStorage.setItem(MAIL_COLOR_STORAGE_KEY, mode)
+    } catch {
+      // The preference simply resets on the next visit.
+    }
+  }, [])
   const restoredRef = useRef(false)
   const activeRoundIdRef = useRef<string | null>(null)
   const activeSnapshotRef = useRef<ReviewSnapshot | null>(null)
@@ -331,6 +371,8 @@ function App() {
       ) ?? emails.find((item) => item.id === currentBundle.emailIds[0]))
     : undefined
   const email = summary ? details[summary.id] : undefined
+  const isStory = (currentBundle?.emailIds.length ?? 0) > 1
+  const detailLoading = summary ? pendingDetails.has(summary.id) : false
   const editor = summary ? replyDrafts[summary.id] : undefined
   const thread = summary ? threadContexts[summary.id] : undefined
   const proposal = summary ? replyProposals[summary.id] : undefined
@@ -953,46 +995,49 @@ function App() {
   }, [clearStateSaveTimer, triggerStateSave])
 
   useEffect(() => {
-    if (!snapshot || !summary || details[summary.id]) return
-    let active = true
+    if (!snapshot || !currentBundle) return
     const epoch = roundEpochRef.current
     const belongsToRound = () =>
       activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
-    setPendingDetails((current) => new Set(current).add(summary.id))
-    setDetailLoading(true)
+    // Every message of the current story is shown at once, so load all of them. Failed
+    // bodies are retried whenever the story is revisited.
+    const missing = currentBundle.emailIds.filter(
+      (id) => !details[id] && !detailRequestsRef.current.has(`${epoch}/${id}`),
+    )
+    if (missing.length === 0) return
+    setPendingDetails((current) => {
+      const next = new Set(current)
+      for (const id of missing) next.add(id)
+      return next
+    })
     setError(null)
-    const requestKey = `${epoch}/${summary.id}`
-    let request = detailRequestsRef.current.get(requestKey)
-    if (!request) {
-      request = api.email(snapshot.snapshotId, summary.id)
+    for (const id of missing) {
+      const requestKey = `${epoch}/${id}`
+      const request = api.email(snapshot.snapshotId, id)
       detailRequestsRef.current.set(requestKey, request)
+      void request
+        .then((loaded) => {
+          if (belongsToRound()) setDetails((current) => ({ ...current, [loaded.id]: loaded }))
+        })
+        .catch((cause) => {
+          if (!belongsToRound()) return
+          if (detailRequestsRef.current.get(requestKey) === request)
+            detailRequestsRef.current.delete(requestKey)
+          setFailedDetails((current) => new Set(current).add(id))
+          setKeptUnread((current) => new Set(current).add(id))
+          setError(`${errorMessage(cause)} Die Nachricht bleibt vorsichtshalber ungelesen.`)
+          setStatus('Nachrichteninhalt nicht verfügbar; ungelesen geschützt.')
+        })
+        .finally(() => {
+          if (belongsToRound())
+            setPendingDetails((current) => {
+              const next = new Set(current)
+              next.delete(id)
+              return next
+            })
+        })
     }
-    void request
-      .then((loaded) => {
-        if (belongsToRound()) setDetails((current) => ({ ...current, [loaded.id]: loaded }))
-      })
-      .catch((cause) => {
-        if (!belongsToRound()) return
-        if (detailRequestsRef.current.get(requestKey) === request)
-          detailRequestsRef.current.delete(requestKey)
-        setFailedDetails((current) => new Set(current).add(summary.id))
-        setKeptUnread((current) => new Set(current).add(summary.id))
-        setError(`${errorMessage(cause)} Die Nachricht bleibt vorsichtshalber ungelesen.`)
-        setStatus('Nachrichteninhalt nicht verfügbar; ungelesen geschützt.')
-      })
-      .finally(() => {
-        if (belongsToRound())
-          setPendingDetails((current) => {
-            const next = new Set(current)
-            next.delete(summary.id)
-            return next
-          })
-        if (active) setDetailLoading(false)
-      })
-    return () => {
-      active = false
-    }
-  }, [details, snapshot, summary])
+  }, [currentBundle, details, snapshot])
 
   const previous = useCallback(() => {
     if (view !== 'review') {
@@ -1781,8 +1826,14 @@ function App() {
             <span>Inbox Walk</span>
             <span className="app-version">v{__APP_VERSION__}</span>
           </span>
-          <span className="counter">
-            Story {index + 1} / {bundles.length} · {emails.length} Nachrichten
+          <span className="story-position">
+            <span className="counter">
+              Story {index + 1} / {bundles.length} · {emails.length} Nachrichten
+            </span>
+            <span className="counter-compact">
+              {index + 1}/{bundles.length}
+            </span>
+            <ChevronIcon />
           </span>
         </button>
         <div className="top-actions">
@@ -1826,50 +1877,106 @@ function App() {
         <article className="message-card" aria-labelledby="bundle-title">
           <header className="message-header">
             <h1 id="bundle-title">{currentBundle.title}</h1>
-            <div className="message-heading">
-              <p className="sender" title={fullAddress(summary.from)}>
-                {addressLine(summary.from)}
-              </p>
-              <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
+            {isStory ? (
+              <p className="message-subject">{currentBundle.summary}</p>
+            ) : (
+              summary.subject &&
+              summary.subject !== currentBundle.title && (
+                <p className="message-subject">{summary.subject}</p>
+              )
+            )}
+            {isStory ? (
+              <div className="message-meta">
+                <span className="tag">{currentBundle.emailIds.length} Nachrichten</span>
+                {Array.from(new Set(currentBundle.timeline.map((item) => item.source))).map(
+                  (source) => (
+                    <span className="tag" key={source}>
+                      {source}
+                    </span>
+                  ),
+                )}
+                <span className="meta-hint">
+                  Klick auf eine Kopfzeile wählt die Nachricht für ↑ und R
+                </span>
+              </div>
+            ) : (
+              <div className="message-meta">
+                <span className="avatar" aria-hidden="true">
+                  {initials(summary.from)}
+                </span>
+                <span className="sender" title={fullAddress(summary.from)}>
+                  {addressLine(summary.from)}
+                </span>
+                {summary.from[0]?.name && summary.from[0]?.email && (
+                  <span className="sender-email">{summary.from[0].email}</span>
+                )}
+                <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
+                <span className="meta-tags">
+                  {summary.mailboxNames.map((name) => (
+                    <span className="tag" key={name}>
+                      {name}
+                    </span>
+                  ))}
+                  {summary.isNewsletter && <span className="tag newsletter">Newsletter</span>}
+                  {summary.hasAttachment && <span className="tag">Anhang</span>}
+                </span>
+              </div>
+            )}
+            <div className="message-tools">
+              {email?.html && (
+                <fieldset className="segmented">
+                  <legend className="sr-only">Farben der Nachricht</legend>
+                  <button
+                    type="button"
+                    aria-pressed={mailColorMode === 'dark'}
+                    onClick={() => setMailColorMode('dark')}
+                    title="Farben an die dunkle Oberfläche anpassen"
+                  >
+                    Dunkel
+                  </button>
+                  <button
+                    type="button"
+                    aria-pressed={mailColorMode === 'original'}
+                    onClick={() => setMailColorMode('original')}
+                    title="Nachricht in ihren Originalfarben zeigen"
+                  >
+                    Original
+                  </button>
+                </fieldset>
+              )}
               <details className="message-details" key={summary.id}>
                 <summary>Details</summary>
-                <div className="message-details-content">
-                  <p className="bundle-summary">{currentBundle.summary}</p>
-                  <p>{currentBundle.currentState}</p>
-                  <p className="original-subject">{summary.subject || '(Kein Betreff)'}</p>
-                  <p title={fullAddress(summary.to)}>An {addressLine(summary.to)}</p>
-                  <p>
-                    {summary.mailboxNames.join(' · ')}
-                    {summary.isNewsletter && ' · Newsletter'}
-                  </p>
-                </div>
+                <dl className="message-details-content">
+                  <div>
+                    <dt>Story</dt>
+                    <dd className="bundle-summary">{currentBundle.summary}</dd>
+                  </div>
+                  <div>
+                    <dt>Stand</dt>
+                    <dd>{currentBundle.currentState}</dd>
+                  </div>
+                  <div>
+                    <dt>Betreff</dt>
+                    <dd className="original-subject">{summary.subject || '(Kein Betreff)'}</dd>
+                  </div>
+                  <div>
+                    <dt>Von</dt>
+                    <dd>{fullAddress(summary.from) || 'Unbekannter Absender'}</dd>
+                  </div>
+                  <div>
+                    <dt>An</dt>
+                    <dd>{fullAddress(summary.to) || '–'}</dd>
+                  </div>
+                  <div>
+                    <dt>Postfach</dt>
+                    <dd>
+                      {summary.mailboxNames.join(', ') || '–'}
+                      {summary.isNewsletter && ' · Newsletter'}
+                    </dd>
+                  </div>
+                </dl>
               </details>
             </div>
-            {currentBundle.emailIds.length > 1 && (
-              <ol className="bundle-timeline" aria-label="Verlauf der Story">
-                {currentBundle.timeline.map((item) => {
-                  return (
-                    <li key={item.emailId}>
-                      <button
-                        type="button"
-                        className={summary.id === item.emailId ? 'selected' : ''}
-                        aria-pressed={summary.id === item.emailId}
-                        title={`${formatDate(item.occurredAt)} · ${item.source} · ${item.event}`}
-                        onClick={() => {
-                          setSelectedMemberId(item.emailId)
-                          setReplyOpen(false)
-                        }}
-                      >
-                        <strong>
-                          {item.source} · {item.event}
-                        </strong>
-                        {keptUnread.has(item.emailId) && <span>Bleibt ungelesen</span>}
-                      </button>
-                    </li>
-                  )
-                })}
-              </ol>
-            )}
             {email?.bodyTruncated && (
               <p className="warning-note">
                 Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
@@ -1877,48 +1984,124 @@ function App() {
             )}
           </header>
 
-          <div className="message-content" aria-busy={detailLoading}>
-            {detailLoading && !email ? (
-              <div className="body-loading">
-                <div className="spinner" />
-                <span>Nachricht wird geladen …</span>
-              </div>
-            ) : email ? (
-              <iframe
-                className="message-body"
-                title={`Inhalt von ${summary.subject}`}
-                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                srcDoc={emailDocument(email, snapshot.snapshotId, true, snapshot.imageToken)}
-              />
-            ) : (
-              <div className="body-loading error-copy">
-                Der Nachrichteninhalt ist nicht verfügbar.
-              </div>
-            )}
-          </div>
-
-          {email && email.attachments.length > 0 && (
-            <section className="attachments" aria-label="Anhänge">
-              <h2>Anhänge</h2>
-              <div className="attachment-list">
-                {email.attachments.map((attachment) =>
-                  snapshot.mode === 'live' ? (
-                    <a
-                      key={attachment.blobId}
-                      href={blobUrl(snapshot.snapshotId, attachment.blobId)}
+          {isStory ? (
+            <ol
+              className="story-grid"
+              aria-label="Verlauf der Story"
+              data-count={Math.min(currentBundle.timeline.length, 6)}
+            >
+              {currentBundle.timeline.map((item, position) => {
+                const member = emails.find((candidate) => candidate.id === item.emailId)
+                const body = details[item.emailId]
+                const selected = summary.id === item.emailId
+                const pending = pendingDetails.has(item.emailId)
+                return (
+                  <li
+                    key={item.emailId}
+                    className={`story-pane ${selected ? 'selected' : ''}`}
+                    aria-current={selected ? 'true' : undefined}
+                  >
+                    <button
+                      type="button"
+                      className="pane-head"
+                      aria-pressed={selected}
+                      aria-label={`${item.source} · ${item.event} · ${formatDate(item.occurredAt)}`}
+                      title="Diese Nachricht auswählen"
+                      onClick={() => {
+                        setSelectedMemberId(item.emailId)
+                        setReplyOpen(false)
+                      }}
                     >
-                      <span>{attachment.name}</span>
-                      <small>{formatBytes(attachment.size)}</small>
-                    </a>
-                  ) : (
-                    <button type="button" key={attachment.blobId} disabled>
-                      <span>{attachment.name}</span>
-                      <small>{formatBytes(attachment.size)} · Demo</small>
+                      <span className="timeline-step">{position + 1}</span>
+                      <span className="timeline-copy">
+                        <span className="timeline-source">
+                          {item.source}
+                          <time dateTime={item.occurredAt}>{formatShortDate(item.occurredAt)}</time>
+                        </span>
+                        <strong>{item.event}</strong>
+                        {member &&
+                          (() => {
+                            const parts = [addressLine(member.from), member.subject].filter(
+                              (part) => part && part !== item.source && part !== item.event,
+                            )
+                            return parts.length > 0 ? (
+                              <small className="pane-sender">{parts.join(' · ')}</small>
+                            ) : null
+                          })()}
+                      </span>
+                      {keptUnread.has(item.emailId) && (
+                        <span className="timeline-flag">Bleibt ungelesen</span>
+                      )}
                     </button>
-                  ),
+                    <div className="pane-body" aria-busy={pending}>
+                      {body ? (
+                        <iframe
+                          className="message-body"
+                          title={`Inhalt von ${body.subject}`}
+                          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                          srcDoc={emailDocument(
+                            body,
+                            snapshot.snapshotId,
+                            true,
+                            snapshot.imageToken,
+                            mailColorMode,
+                          )}
+                        />
+                      ) : pending ? (
+                        <div className="body-loading">
+                          <div className="spinner" />
+                          <span>Nachricht wird geladen …</span>
+                        </div>
+                      ) : (
+                        <div className="body-loading error-copy">
+                          Der Nachrichteninhalt ist nicht verfügbar.
+                        </div>
+                      )}
+                    </div>
+                    {body && body.attachments.length > 0 && (
+                      <div className="attachments pane-attachments">
+                        <AttachmentChips email={body} snapshot={snapshot} />
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
+            </ol>
+          ) : (
+            <>
+              <div className="message-content" aria-busy={detailLoading}>
+                {detailLoading && !email ? (
+                  <div className="body-loading">
+                    <div className="spinner" />
+                    <span>Nachricht wird geladen …</span>
+                  </div>
+                ) : email ? (
+                  <iframe
+                    className="message-body"
+                    title={`Inhalt von ${summary.subject}`}
+                    sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+                    srcDoc={emailDocument(
+                      email,
+                      snapshot.snapshotId,
+                      true,
+                      snapshot.imageToken,
+                      mailColorMode,
+                    )}
+                  />
+                ) : (
+                  <div className="body-loading error-copy">
+                    Der Nachrichteninhalt ist nicht verfügbar.
+                  </div>
                 )}
               </div>
-            </section>
+
+              {email && email.attachments.length > 0 && (
+                <section className="attachments" aria-label="Anhänge">
+                  <h2>Anhänge</h2>
+                  <AttachmentChips email={email} snapshot={snapshot} />
+                </section>
+              )}
+            </>
           )}
         </article>
       </main>
@@ -2104,6 +2287,77 @@ function runScope(run: ReviewRunSummary, options: ReviewOptions | null) {
           ? '7 Tage'
           : '30 Tage'
   return `${scope} · ${range}`
+}
+
+function AttachmentChips({ email, snapshot }: { email: ReviewEmail; snapshot: ReviewSnapshot }) {
+  return (
+    <div className="attachment-list">
+      {email.attachments.map((attachment) =>
+        snapshot.mode === 'live' ? (
+          <a key={attachment.blobId} href={blobUrl(snapshot.snapshotId, attachment.blobId)}>
+            <AttachmentIcon />
+            <span className="attachment-copy">
+              <span>{attachment.name}</span>
+              <small>{formatBytes(attachment.size)}</small>
+            </span>
+          </a>
+        ) : (
+          <button type="button" key={attachment.blobId} disabled>
+            <AttachmentIcon />
+            <span className="attachment-copy">
+              <span>{attachment.name}</span>
+              <small>{formatBytes(attachment.size)} · Demo</small>
+            </span>
+          </button>
+        ),
+      )}
+    </div>
+  )
+}
+
+function ChevronIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14">
+      <path
+        d="m4 6 4 4 4-4"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  )
+}
+
+function AttachmentIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 20 20" width="16" height="16">
+      <path
+        d="m13.5 6.5-6 6a1.8 1.8 0 0 0 2.5 2.5l6.5-6.5a3.5 3.5 0 0 0-5-5L5 10a5.2 5.2 0 0 0 7.4 7.4l4.6-4.6"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.6"
+      />
+    </svg>
+  )
+}
+
+function RefreshIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
+      <path
+        d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+    </svg>
+  )
 }
 
 function TrashIcon() {
@@ -2319,11 +2573,13 @@ function ReviewSetup({
                           </button>
                           <button
                             type="button"
-                            className="text-button"
+                            className="icon-button run-reanalyze"
                             disabled={!run.csrfToken || !run.reanalyzable || busy}
                             onClick={() => onReanalyze(run)}
+                            aria-label="Mit Codex neu analysieren"
+                            title="Mit Codex neu analysieren"
                           >
-                            Mit Codex neu analysieren
+                            <RefreshIcon />
                           </button>
                           <button
                             type="button"

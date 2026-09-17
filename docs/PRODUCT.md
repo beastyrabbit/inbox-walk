@@ -52,7 +52,7 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 
 - The Fastmail credential is a backend-only runtime secret; rotating Codex OAuth data stays on the private app volume.
 - Round persistence stores mail summaries and review state, but never received bodies or attachment content. Retained-unread history remains ID-only.
-- Mail HTML is sanitized and isolated in a sandboxed iframe.
+- Mail HTML is sanitized and isolated in a sandboxed iframe. Head stylesheets and body colours of the mail are preserved; dark-scheme media rules are removed so the reader applies its own dark adaptation, which the user can switch to the original colours per browser.
 - External images are fetched through a bounded, type-checked backend proxy; the mail document never contacts remote senders directly.
 - Blob downloads are allowlisted from server-owned snapshot metadata and returned with `Cache-Control: no-store`.
 - POST mutations require same-origin checks and a snapshot CSRF token.
