@@ -763,7 +763,7 @@ export function createTriageStore(databasePath = triageStorePath()): TriageStore
       transaction(() => {
         for (const emailId of new Set(emailIds)) {
           const row = selectMessage.get(emailId) as MessageRow | undefined
-          if (!row || row.status !== 'parked') continue
+          if (row?.status !== 'parked') continue
           const bucket = row.bucket_id
             ? (selectBucket.get(row.bucket_id) as BucketRow | undefined)
             : undefined
