@@ -1,39 +1,29 @@
 # Inbox Walk
 
-
-Inbox Walk is a private, keyboard-first Fastmail review app. It freezes one unread-mail snapshot, groups related messages into stories, and changes read state only after you confirm the result.
+Inbox Walk is a private, keyboard-first Fastmail todo list. It watches your unread mail, lets Codex sort every new message into a bucket that stands for one real-world story, and changes read state only when you mark a bucket done.
 
 ## Highlights
 
-- Review a stable snapshot without messages moving underneath you.
-- See every message of a story side by side, in a grid that adapts to the number of messages.
+- Nothing to start. New mail is picked up within a minute and sorted in the background.
+- Every bucket shows all its messages at once, with the original mail design.
 - Prepare a thread-aware Fastmail draft with Codex.
 - Keep sending in Fastmail. Inbox Walk has no send endpoint.
 
 ## What it does
 
-- Loads every matching unread incoming message into a stable, paginated JMAP snapshot.
-- Bundles related threads, repository activity, deployments, orders, and carrier updates while keeping every original inspectable.
-- Can reuse a bounded set of hashed relationship examples retained from older releases without exposing message content.
-- Creates a stored run as soon as **Runde starten** is clicked and shows fetch and analysis progress in the rounds table.
-- Enables **Runde öffnen** only after the complete Codex result is stored.
-- Gives every round a stable URL and restores its snapshot, analysis, decisions, and finalization after a browser refresh or app restart.
-- Deletes rounds from the table, cancels abortable fetch or analysis work, and can reanalyze the same frozen snapshot. An active round keeps its review decisions and drafts. Reanalyzing a completed round clears its old decisions and completion result but keeps reply drafts. Reply generation and draft storage block deletion immediately. Finalization blocks it after taking the durable selection lock; if deletion wins the earlier mailbox-context race, finalization stops before changing the mailbox.
-- Reviews either Spam only or all incoming mail except Spam, with direct mailbox, time, and newsletter choices.
-- Can omit messages deliberately kept unread in an earlier round using a small local SQLite history.
-- Sanitizes mail HTML in a script-free sandboxed iframe and proxies remote images through the backend.
-- Renders each HTML message in its original design, adapted to the dark interface by default; **Original** shows the sender's colours, and the choice is remembered in the browser.
-- Uses the available window for reading mail: a single message fills it, a story splits it into one pane per message, and message details stay one click away.
-- Keeps selected messages unread and marks the rest read only after confirmation.
-- Closes a round automatically after every message in its frozen snapshot is processed.
-- Moves messages marked “Not Spam” back to Inbox when a Spam review is confirmed.
+- Polls Fastmail over JMAP for unread incoming mail outside Spam and queues every new message.
+- Sends each batch of new messages to Codex together with the open buckets and your notes. Codex may search the whole mailbox, read a thread or a message body, then creates a bucket, adds to one, merges two, or updates a title and state.
+- Shows the todo as buckets ordered by newest activity. Messages that are not sorted yet appear on top and can be opened right away.
+- Marks a bucket done with one key, which marks exactly its shown messages read in Fastmail and moves on to the next bucket.
+- Parks a message: it stays unread in Fastmail, leaves the todo, and comes back when you fetch it.
 - Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
-- Loads up to 100 messages from the selected reply thread; this limit does not cap a review round.
-- Sends every supported image to Codex and extracts every supported document through Apache Tika.
-- Follows the model, reasoning effort, and speed configured in Codex without restarting the app.
-- Shows the running release version in the application shell.
-- Blocks reply generation if any attachment is unsupported or the 45 MiB budget is exceeded.
+- Drops messages you read or delete in Fastmail from the todo on the next poll.
+- Retries a failed sort three times, then keeps the message visible as unsorted until you ask for another attempt.
+- Keeps a memory note that you write in the settings. Codex reads it on every sort and may propose additions, which apply only after you accept them.
+- Sanitizes mail HTML in a script-free sandboxed iframe, adapts it to the dark interface with an original-colours switch, and proxies remote images through the backend.
+- Sends every supported image to Codex and extracts every supported document through Apache Tika for reply drafts, and blocks the draft if any attachment is unsupported or the 45 MiB budget is exceeded.
 - Creates and reads back a normal Fastmail draft with reply headers and identity signature.
+- Follows the model, reasoning effort, and speed configured in Codex without restarting the app.
 - Exposes `/healthz` and `/readyz` for Kubernetes probes.
 
 ## Local development
@@ -55,9 +45,10 @@ Open <http://localhost:5173>.
 
 `pnpm dev` injects the read-only `FASTMAIL_JMAP_TOKEN` from the `Kub-Homelab`
 Infisical project, environment `dev`, path
-`/kubernetes/tools/inbox-walk-secret`. Local development can review real mail
+`/kubernetes/tools/inbox-walk-secret`. Local development can read real mail
 but cannot mark messages read or create Fastmail drafts. Live mode never falls
-back to sample data.
+back to sample data. `MAIL_REVIEW_DEMO=1` serves a fixed sample inbox and sorts
+it locally by exact identifiers; automated tests use that mode only.
 
 The app follows the Codex CLI. It reads the ChatGPT login from
 `$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and takes `model`,
@@ -70,63 +61,58 @@ Without a Codex login the app reuses an existing Pi `openai-codex` login from
 `~/.pi/agent/auth.json` during local development. Otherwise, open
 **Einstellungen**, choose **Mit ChatGPT verbinden**, and complete the OpenAI
 device-code flow. The rotating OAuth record stays server-side and is never
-returned by the API. Choosing **Neu anmelden** while using that local fallback
-also refreshes the workstation's shared Pi login; set `DATA_DIR` to an
-app-specific directory if you want isolated local credentials.
+returned by the API.
 
-The settings menu shows the model, thinking level, and speed in use for new
-bundle decisions and reply drafts; change them in Codex. `CODEX_MODEL`,
-`CODEX_THINKING_LEVEL`, and `CODEX_SPEED` (`standard` or `fast`) only apply when
-Codex has no model configured, and Sol at high effort is the final default.
-Models Pi does not know yet, such as `gpt-6-astra`, are described from
-`$CODEX_HOME/models_cache.json`. Codex `service_tier = "fast"` is sent as the
-`priority` service tier.
+The settings menu shows the model, thinking level, and speed in use; change
+them in Codex. `CODEX_MODEL`, `CODEX_THINKING_LEVEL`, and `CODEX_SPEED`
+(`standard` or `fast`) only apply when Codex has no model configured, and Sol
+at high effort is the final default. Models Pi does not know yet, such as
+`gpt-6-astra`, are described from `$CODEX_HOME/models_cache.json`.
 
-Connect Codex in the settings menu before starting a round. The app stores the
-run first and freezes every matching summary. Codex receives the complete frozen
-set in one request and partitions every message into a concrete multi-message
-story or a standalone item. The app does not preselect candidates or join
-stories before Codex sees them. Opening a message never starts analysis. Later
-mail is not added to the frozen round.
+## How sorting works
 
-The complete Codex partition is checkpointed in SQLite before the final run is
-stored. A browser reload keeps the current job running. After a process crash,
-the app reuses a complete saved partition; only an unfinished provider request
-may be repeated. Reloading or opening a finished round does not run Codex again.
-Only **Neu analysieren** starts a new analysis generation on the same snapshot.
-The backend turns overlapping model suggestions into one deterministic
-partition: higher-confidence stories win duplicate assignments, undersized
-stories dissolve, and every otherwise unassigned snapshot message becomes a
-standalone item. Unknown IDs and malformed story metadata still fail closed.
-If a started Codex run later needs a new login, it fails visibly instead of
-silently changing engines. Reconnect Codex and rerun the analysis on the same
-frozen snapshot.
+Every poll lists unread mail, queues new IDs with their summaries, and drops
+IDs that are no longer unread. Queued messages go to Codex in batches of up to
+eight. Each Codex session runs isolated: no built-in tools, skills, extensions,
+or project context. It receives the new summaries, the buckets active in the
+last 45 days, and your memory note. Its tools are:
 
-`CODEX_BUNDLE_TIMEOUT_MS` limits the one global grouping request. It defaults to
-30 minutes and can be raised to at most 60 minutes. `CODEX_INFERENCE_TIMEOUT_MS`
-keeps the five-minute default for other Codex work. A timeout marks the run
-**Fehlgeschlagen** and leaves it available for a fresh analysis.
+| Tool | Effect |
+| --- | --- |
+| `search_mail`, `get_thread`, `get_email_text` | Read-only lookups in the whole mailbox, bounded to 30 calls per session |
+| `create_bucket`, `add_to_bucket`, `update_bucket`, `merge_buckets` | Change buckets in this app only |
+| `propose_memory` | Suggest a note for you to accept or reject |
+| `finish_triage` | End the session once every new message has a bucket |
 
-`DATA_DIR/inbox-walk.sqlite` stores review rounds with their fixed IDs, filters,
-mail summaries, frozen hashed learning examples, bundle-analysis status, Codex
-checkpoints, decisions, reply editor state, and finalization results. It never
+Mail content is untrusted data. No tool can mark mail read, move it, label it,
+or create a draft. A sort that fails for a transient reason counts one attempt;
+after three attempts the message stays visible as unsorted with a retry
+button. An expired Codex login pauses sorting without counting attempts. Every
+tool action is appended to an event log in SQLite; message bodies fetched for
+sorting live only in the session.
+
+`TRIAGE_POLL_INTERVAL_MS` sets the poll interval and defaults to one minute.
+`TRIAGE_TIMEOUT_MS` bounds one sorting session, defaulting to 15 minutes with a
+60-minute ceiling. `CODEX_INFERENCE_TIMEOUT_MS` keeps the five-minute default
+for reply drafts.
+
+`DATA_DIR/inbox-walk.sqlite` stores buckets, message summaries with their todo
+state, the event log, reply editor state, memory notes and proposals. It never
 stores received message bodies or attachment content; the persisted summary
-includes Fastmail's short preview excerpt.
-Finished rounds are retained for seven days and active rounds for 30 days, with
-a 200-round cap. The same database keeps a separate history of IDs deliberately
-left unread, so a future round can optionally hide them. IDs marked read are
-removed from that history. Leave **Zurückgestellte Nachrichten ausblenden**
-unchecked to include every matching unread message as before.
+includes Fastmail's short preview excerpt. Handled messages are deleted after
+60 days. Databases from releases before 0.10 lose their review rounds on first
+start; the Codex login is kept.
 
 ## Keyboard controls
 
-- `ArrowRight`: complete the current story and continue
-- `ArrowLeft`: previous story
-- `ArrowUp`: toggle “keep unread” for the selected original
-- `ArrowDown`: mark “Not Spam” in Spam reviews, otherwise tag a newsletter for later unsubscribe work
+In the list, click a bucket or use `?` for help. In a bucket:
+
+- `E` or `ArrowRight`: bucket done, mark its shown messages read and open the next bucket
+- `ArrowLeft` or `Escape`: back to the list
+- `ArrowUp`: park the selected message
+- `ArrowDown`: tag the selected newsletter for later unsubscribe work
 - `R`: open the reply-draft panel
 - `?`: keyboard help
-- `Escape`: close the active panel or dialog
 
 ## Quality gates
 
@@ -144,13 +130,12 @@ publishes it to `ghcr.io/beastyrabbit/inbox-walk` on the repository's ARC runner
 
 ## Production
 
-This source tree describes release `v0.9.5`. Production releases are deployed at
+This source tree describes release `v0.10.0`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
-The Codex OAuth record, review rounds, retained-unread history, and bundle
-learning data are stored under `DATA_DIR`; `TIKA_URL` points to the
-document-extraction sidecar.
+The Codex OAuth record and the todo database are stored under `DATA_DIR`;
+`TIKA_URL` points to the document-extraction sidecar.
 
 Deployment is managed from `beastyrabbit/kub-homelab` on GitHub. Runtime secrets are synced by
 the Infisical Operator; no secret values belong in this repository or in the
@@ -158,9 +143,3 @@ container image.
 
 See [product behavior](docs/PRODUCT.md), [delivery status](docs/BOARD.md), and
 [operations](docs/OPERATIONS.md).
-
-## Live preview
-
-The live interface shows completed analysis rounds, filters, time windows, and the one-click round workflow.
-
-![Inbox Walk interface](https://schaffa.dev/f/_6rNaj2njDv7k5R01ZmdPA.webp)

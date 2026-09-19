@@ -2,10 +2,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createAndVerifyDraft,
   fetchEmailDetail,
+  fetchEmailSummaries,
+  fetchMailAccount,
   fetchUnreadEmailIds,
-  fetchUnreadSnapshot,
   markEmailsRead,
   moveEmailsOutOfSpam,
+  queryUnreadEmailIds,
   tagEmailsForLaterUnsubscribe,
   unreadFilter,
 } from './jmap.ts'
@@ -181,11 +183,12 @@ describe('Fastmail JMAP adapter', () => {
           ])
         }),
       )
+      const account = await fetchMailAccount('fixture')
       if (mode === 'retry') {
-        expect((await fetchUnreadSnapshot('fixture')).emails.map((email) => email.id)).toEqual(ids)
+        expect(await queryUnreadEmailIds(account, 'fixture')).toEqual(ids)
         expect(attempts).toBe(2)
       } else {
-        await expect(fetchUnreadSnapshot('fixture')).rejects.toThrow()
+        await expect(queryUnreadEmailIds(account, 'fixture')).rejects.toThrow()
         expect(attempts).toBe(3)
       }
     },
@@ -373,19 +376,8 @@ describe('Fastmail JMAP adapter', () => {
     })
   })
 
-  it('switches explicitly between non-spam and spam queries', () => {
-    expect(
-      unreadFilter(
-        {
-          hideReviewed: false,
-          mailboxId: null,
-          newsletter: 'all',
-          spam: 'exclude',
-          timeRange: 'all',
-        },
-        'junk',
-      ),
-    ).toEqual({
+  it('excludes the Spam mailbox when the account has one', () => {
+    expect(unreadFilter('junk')).toEqual({
       operator: 'AND',
       conditions: [
         { notKeyword: '$seen' },
@@ -393,24 +385,9 @@ describe('Fastmail JMAP adapter', () => {
         { operator: 'NOT', conditions: [{ inMailbox: 'junk' }] },
       ],
     })
-    expect(
-      unreadFilter(
-        {
-          hideReviewed: false,
-          mailboxId: null,
-          newsletter: 'all',
-          spam: 'only',
-          timeRange: 'all',
-        },
-        'junk',
-      ),
-    ).toEqual({
-      operator: 'AND',
-      conditions: [{ notKeyword: '$seen' }, { notKeyword: '$draft' }, { inMailbox: 'junk' }],
-    })
   })
 
-  it('loads and maps an unread snapshot while excluding sent-only mail', async () => {
+  it('loads and maps summaries while excluding sent-only mail', async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -437,9 +414,6 @@ describe('Fastmail JMAP adapter', () => {
             'mailboxes',
           ],
         ]),
-      )
-      .mockResolvedValueOnce(
-        jmapResponse([['Email/query', { ids: ['incoming', 'outgoing'], total: 2 }, 'query']]),
       )
       .mockResolvedValueOnce(
         jmapResponse([
@@ -480,24 +454,22 @@ describe('Fastmail JMAP adapter', () => {
           ],
         ]),
       )
-      .mockResolvedValueOnce(
-        jmapResponse([['Email/query', { ids: ['incoming', 'outgoing'], total: 2 }, 'query-check']]),
-      )
     vi.stubGlobal('fetch', fetchMock)
 
-    const snapshot = await fetchUnreadSnapshot('secret-token')
-    expect(snapshot.emails).toHaveLength(1)
-    expect(snapshot.emails[0]).toMatchObject({
+    const account = await fetchMailAccount('secret-token')
+    const result = await fetchEmailSummaries(account, 'secret-token', ['incoming', 'outgoing'])
+    expect(result.emails).toHaveLength(1)
+    expect(result.emails[0]).toMatchObject({
       id: 'incoming',
       subject: 'Hallo',
       hasAttachment: true,
     })
-    expect(snapshot.totalBeforeLimit).toBe(1)
-    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(result.excludedIds).toEqual(['outgoing'])
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual({ Authorization: 'Bearer secret-token' })
   })
 
-  it('freezes every matching message when the server caps query pages below the requested size', async () => {
+  it('lists every unread ID when the server caps query pages below the requested size', async () => {
     const ids = Array.from({ length: 501 }, (_, index) => `mail-${index}`)
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       if (String(input).includes('/jmap/session')) {
@@ -563,11 +535,8 @@ describe('Fastmail JMAP adapter', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const snapshot = await fetchUnreadSnapshot('secret-token')
-    expect(snapshot.emails).toHaveLength(501)
-    expect(snapshot.emails.map((email) => email.id)).toEqual(ids)
-    expect(snapshot.truncated).toBe(false)
-    expect(snapshot.totalBeforeLimit).toBe(501)
+    const account = await fetchMailAccount('secret-token')
+    expect(await queryUnreadEmailIds(account, 'secret-token')).toEqual(ids)
   })
 
   it('does not classify message body blobs as attachments', async () => {

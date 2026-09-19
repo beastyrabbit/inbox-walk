@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { api, ClientApiError } from './api.ts'
-import { defaultReviewFilters, type ReviewRunSummary } from './shared.ts'
 
 afterEach(() => {
   vi.unstubAllGlobals()
@@ -31,21 +30,21 @@ describe('API response handling', () => {
     respond(
       JSON.stringify({
         error: {
-          code: 'ROUND_NOT_FOUND',
-          message: 'Diese Runde wurde nicht gefunden.',
+          code: 'EMAIL_NOT_FOUND',
+          message: 'Nachricht nicht gefunden.',
           retryable: false,
-          details: { roundId: 'round-1' },
+          details: { emailId: 'mail-1' },
         },
       }),
       404,
     )
 
-    await expect(api.review('round-1')).rejects.toMatchObject({
+    await expect(api.email('mail-1')).rejects.toMatchObject({
       name: 'Error',
-      message: 'Diese Runde wurde nicht gefunden.',
-      code: 'ROUND_NOT_FOUND',
+      message: 'Nachricht nicht gefunden.',
+      code: 'EMAIL_NOT_FOUND',
       retryable: false,
-      details: { roundId: 'round-1' },
+      details: { emailId: 'mail-1' },
       status: 404,
     })
   })
@@ -109,127 +108,56 @@ describe('API response handling', () => {
   })
 })
 
-describe('round lifecycle API', () => {
-  const run: ReviewRunSummary = {
-    analysis: {
-      callCount: 0,
-      engine: 'codex',
-      model: 'gpt-5.6-sol',
-      phase: 'queued',
-      processedEmailCount: 0,
-      progress: 0,
-      status: 'pending',
-      thinkingLevel: 'high',
-      totalEmailCount: 0,
-    },
-    createdAt: '2026-08-31T10:00:00.000Z',
-    csrfToken: 'csrf-round-1',
-    emailCount: 0,
-    filters: defaultReviewFilters,
-    generation: 1,
-    id: 'round-1',
-    mode: 'live',
-    reanalyzable: false,
-    reviewStatus: 'active',
-    status: 'queued',
-    updatedAt: '2026-08-31T10:00:00.000Z',
-  }
-
-  it('creates an idempotent run with the client-generated ID', async () => {
+describe('todo API', () => {
+  it('sends message actions with the CSRF token and keeps them alive on unload', async () => {
+    const result = { failed: [], snapshot: { buckets: [] } }
     const fetchMock = vi.fn(async () =>
       Promise.resolve(
-        new Response(JSON.stringify(run), {
-          status: 202,
+        new Response(JSON.stringify(result), {
+          status: 200,
           headers: { 'Content-Type': 'application/json' },
         }),
       ),
     )
     vi.stubGlobal('fetch', fetchMock)
 
-    await expect(api.createReview(run.id, defaultReviewFilters)).resolves.toEqual(run)
+    await expect(api.messageAction('done', ['mail-1'], 'csrf-1')).resolves.toEqual(result)
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/reviews',
+      '/api/todo/messages/done',
       expect.objectContaining({
-        body: JSON.stringify({ id: run.id, filters: defaultReviewFilters }),
+        body: JSON.stringify({ emailIds: ['mail-1'] }),
+        headers: expect.objectContaining({ 'X-Inbox-Walk-CSRF': 'csrf-1' }),
         keepalive: true,
         method: 'POST',
       }),
     )
   })
 
-  it('resumes a legacy stable snapshot by its exact message IDs', async () => {
-    const id = '550e8400-e29b-41d4-a716-446655440000'
-    const resumed = {
-      csrfToken: 'csrf-migrated',
-      id,
-    }
+  it('accepts a multi-status action result with failures', async () => {
+    const result = { failed: [{ id: 'mail-2', reason: 'Fastmail-Fehler' }], snapshot: {} }
+    respond(JSON.stringify(result), 207)
+
+    await expect(api.messageAction('done', ['mail-1', 'mail-2'], 'csrf-1')).resolves.toEqual(result)
+  })
+
+  it('saves memory notes with PUT', async () => {
     const fetchMock = vi.fn(async () =>
       Promise.resolve(
-        new Response(JSON.stringify(resumed), {
-          status: 202,
+        new Response(JSON.stringify({ notes: 'Notiz', proposals: [] }), {
+          status: 200,
           headers: { 'Content-Type': 'application/json' },
         }),
       ),
     )
     vi.stubGlobal('fetch', fetchMock)
 
-    await expect(api.resumeReview(id, ['mail-1', 'mail-2'], defaultReviewFilters)).resolves.toEqual(
-      resumed,
-    )
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/reviews/resume',
-      expect.objectContaining({
-        body: JSON.stringify({
-          id,
-          emailIds: ['mail-1', 'mail-2'],
-          filters: defaultReviewFilters,
-        }),
-        method: 'POST',
-      }),
-    )
-  })
-
-  it('lists compact runs without loading review snapshots', async () => {
-    respond(JSON.stringify({ runs: [run] }))
-
-    await expect(api.reviewRuns()).resolves.toEqual({ runs: [run] })
-  })
-
-  it('deletes a run with its CSRF token and accepts an empty 204 response', async () => {
-    const fetchMock = vi.fn(async () => Promise.resolve(new Response(null, { status: 204 })))
-    vi.stubGlobal('fetch', fetchMock)
-
-    await expect(api.deleteReview(run)).resolves.toBeUndefined()
-    expect(fetchMock).toHaveBeenCalledWith(`/api/reviews/${run.id}`, {
-      method: 'DELETE',
-      headers: { 'X-Inbox-Walk-CSRF': run.csrfToken },
+    await expect(api.saveMemory('Notiz', 'csrf-1')).resolves.toEqual({
+      notes: 'Notiz',
+      proposals: [],
     })
-  })
-
-  it('starts a fresh Codex analysis for the persisted run', async () => {
-    const next = {
-      ...run,
-      analysis: { ...run.analysis, phase: 'indexing', status: 'running' as const },
-      generation: 2,
-      status: 'analyzing' as const,
-    }
-    const fetchMock = vi.fn(async () =>
-      Promise.resolve(
-        new Response(JSON.stringify(next), {
-          status: 202,
-          headers: { 'Content-Type': 'application/json' },
-        }),
-      ),
-    )
-    vi.stubGlobal('fetch', fetchMock)
-
-    await expect(api.reanalyzeReview(run)).resolves.toEqual(next)
     expect(fetchMock).toHaveBeenCalledWith(
-      `/api/reviews/${run.id}/reanalyze`,
-      expect.objectContaining({
-        method: 'POST',
-        headers: expect.objectContaining({ 'X-Inbox-Walk-CSRF': run.csrfToken }),
-      }),
+      '/api/todo/memory',
+      expect.objectContaining({ body: JSON.stringify({ notes: 'Notiz' }), method: 'PUT' }),
     )
   })
 })

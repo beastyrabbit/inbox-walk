@@ -2519,3 +2519,247 @@
     transition: none;
   }
 }
+
+/* Todo list */
+
+.todo-page {
+  width: min(960px, 100%);
+  min-height: 100vh;
+  margin: 0 auto;
+  padding: 36px 28px 80px;
+}
+
+.todo-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.todo-header .setup-brand {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.todo-header h1 {
+  margin: 0;
+  font-size: clamp(26px, 4vw, 34px);
+  font-weight: 560;
+  letter-spacing: -0.025em;
+}
+
+.todo-header .text-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.todo-status {
+  margin: 14px 0 20px;
+  color: var(--ink-soft);
+  font-size: 13px;
+}
+
+.text-button.inline {
+  padding: 0;
+  font-size: inherit;
+}
+
+.todo-page .inline-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  margin: 0 0 18px;
+}
+
+.todo-section {
+  padding: 8px 0 28px;
+}
+
+.parked-section {
+  border-top: 1px solid var(--line-strong);
+  padding-top: 22px;
+}
+
+.todo-empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: 48px 20px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius);
+  color: var(--ink-soft);
+  text-align: center;
+}
+
+.todo-empty h3 {
+  margin: 4px 0 0;
+  color: var(--ink);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.todo-empty p {
+  margin: 0;
+  font-size: 13px;
+}
+
+.todo-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.todo-list li {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.todo-list li > .text-button {
+  flex: 0 0 auto;
+  align-self: center;
+}
+
+.todo-row {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  width: 100%;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: inherit;
+  text-align: left;
+  font: inherit;
+  cursor: pointer;
+  transition:
+    border-color 120ms ease,
+    background-color 120ms ease;
+}
+
+.todo-row:hover,
+.todo-row:focus-visible {
+  border-color: var(--accent);
+  background: var(--surface-raised, var(--surface));
+}
+
+.todo-list li.unsorted .todo-row {
+  border-style: dashed;
+}
+
+.todo-row-main {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.todo-row-main strong {
+  overflow: hidden;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-row-main small {
+  overflow: hidden;
+  color: var(--ink-soft);
+  font-size: 12.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.todo-row-meta {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+  color: var(--ink-soft);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.todo-sources {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 640px) {
+  .todo-page {
+    padding: 22px 16px 60px;
+  }
+
+  .todo-row {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+
+  .todo-row-meta {
+    flex-wrap: wrap;
+    white-space: normal;
+  }
+
+  .todo-sources {
+    max-width: none;
+  }
+}
+
+/* Memory settings */
+
+.memory-field textarea {
+  width: 100%;
+  min-height: 120px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-size: 13.5px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.memory-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.memory-proposals {
+  display: grid;
+  gap: 8px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.memory-proposals li {
+  padding: 10px 12px;
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+}
+
+.memory-proposals p {
+  margin: 0 0 6px;
+  font-size: 13px;
+}
+
+.memory-proposal-actions {
+  display: flex;
+  gap: 14px;
+}

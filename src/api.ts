@@ -3,16 +3,14 @@ import type {
   CodexAuthStatus,
   CodexLoginState,
   DraftResult,
-  FinalizeResult,
   MailAddress,
+  ReplyEditorState,
   ReplyProposal,
   ReviewEmail,
-  ReviewFilters,
-  ReviewOptions,
-  ReviewRoundUserState,
-  ReviewRunSummary,
-  ReviewSnapshot,
   ThreadContext,
+  TriageActionResult,
+  TriageMemory,
+  TriageSnapshot,
 } from './shared.ts'
 
 export type CodexSettings = CodexAuthStatus
@@ -78,7 +76,6 @@ async function payload<T>(response: Response): Promise<T> {
       response.status,
     )
   }
-
   const trimmedBody = rawBody.trim()
   const contentType = response.headers.get('content-type')?.toLowerCase() ?? ''
   const shouldParseJson =
@@ -86,7 +83,6 @@ async function payload<T>(response: Response): Promise<T> {
     contentType.includes('+json') ||
     trimmedBody.startsWith('{') ||
     trimmedBody.startsWith('[')
-
   if (!shouldParseJson) {
     if (gatewayStatuses.has(response.status)) throw gatewayError(response.status)
     if (!response.ok && response.status !== 207) {
@@ -100,7 +96,6 @@ async function payload<T>(response: Response): Promise<T> {
     }
     throw invalidResponseError(response.status)
   }
-
   let body: unknown
   try {
     body = JSON.parse(trimmedBody)
@@ -108,7 +103,6 @@ async function payload<T>(response: Response): Promise<T> {
     if (gatewayStatuses.has(response.status)) throw gatewayError(response.status)
     throw invalidResponseError(response.status)
   }
-
   if (!response.ok && response.status !== 207) {
     const error = apiErrorFrom(body)
     throw new ClientApiError(
@@ -136,11 +130,17 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   return payload<T>(response)
 }
 
-async function post<T>(url: string, body: unknown, csrfToken?: string, persistOnUnload = false) {
+async function send<T>(
+  method: 'POST' | 'PUT',
+  url: string,
+  body: unknown,
+  csrfToken?: string,
+  persistOnUnload = false,
+) {
   const serialized = JSON.stringify(body)
   const keepalive = persistOnUnload && new TextEncoder().encode(serialized).byteLength <= 60 * 1024
   return request<T>(url, {
-    method: 'POST',
+    method,
     headers: {
       'Content-Type': 'application/json',
       ...(csrfToken ? { 'X-Inbox-Walk-CSRF': csrfToken } : {}),
@@ -150,134 +150,105 @@ async function post<T>(url: string, body: unknown, csrfToken?: string, persistOn
   })
 }
 
-async function remove(url: string, csrfToken: string) {
-  return request<void>(url, {
-    method: 'DELETE',
-    headers: { 'X-Inbox-Walk-CSRF': csrfToken },
-  })
-}
+type MessageAction = 'done' | 'park' | 'unpark' | 'newsletter' | 'retry'
+
+const encoded = encodeURIComponent
 
 export const api = {
   async codexStatus() {
     return request<CodexAuthStatus>('/api/auth/codex/status')
   },
   async startCodexLogin() {
-    return post<{ id: string }>('/api/auth/codex/start', {})
-  },
-  async codexSettings() {
-    return request<CodexSettings>('/api/settings/codex')
+    return send<{ id: string }>('POST', '/api/auth/codex/start', {})
   },
   async codexLoginState(id: string) {
-    return request<CodexLoginState>(`/api/auth/codex/${encodeURIComponent(id)}`)
+    return request<CodexLoginState>(`/api/auth/codex/${encoded(id)}`)
   },
-  async options() {
-    return request<ReviewOptions>('/api/review/options')
+  async todo() {
+    return request<TriageSnapshot>('/api/todo')
   },
-  async reviewRuns() {
-    return request<{ runs: ReviewRunSummary[] }>('/api/reviews')
+  async refresh(csrfToken: string) {
+    return send<TriageSnapshot>('POST', '/api/todo/refresh', {}, csrfToken)
   },
-  async createReview(id: string, filters: ReviewFilters) {
-    return post<ReviewRunSummary>('/api/reviews', { id, filters }, undefined, true)
-  },
-  async resumeReview(id: string, emailIds: string[], filters: ReviewFilters) {
-    return post<ReviewRunSummary>('/api/reviews/resume', { id, emailIds, filters })
-  },
-  async review(roundId: string) {
-    return request<ReviewSnapshot>(`/api/reviews/${encodeURIComponent(roundId)}`)
-  },
-  async deleteReview(run: Pick<ReviewRunSummary, 'csrfToken' | 'id'>) {
-    return remove(`/api/reviews/${encodeURIComponent(run.id)}`, run.csrfToken)
-  },
-  async reanalyzeReview(run: Pick<ReviewRunSummary, 'csrfToken' | 'id'>) {
-    return post<ReviewRunSummary>(
-      `/api/reviews/${encodeURIComponent(run.id)}/reanalyze`,
-      {},
-      run.csrfToken,
-    )
-  },
-  async email(snapshotId: string, emailId: string) {
-    return request<ReviewEmail>(
-      `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}`,
-    )
-  },
-  async updateReviewState(
-    snapshot: ReviewSnapshot,
-    revision: number,
-    state: Omit<ReviewRoundUserState, 'revision'>,
-  ) {
-    return post<ReviewRoundUserState>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/state`,
-      { revision, state },
-      snapshot.csrfToken,
+  async messageAction(action: MessageAction, emailIds: string[], csrfToken: string) {
+    return send<TriageActionResult>(
+      'POST',
+      `/api/todo/messages/${action}`,
+      { emailIds },
+      csrfToken,
       true,
     )
   },
-  async thread(snapshotId: string, threadId: string, emailId: string) {
+  async email(emailId: string) {
+    return request<ReviewEmail>(`/api/todo/emails/${encoded(emailId)}`)
+  },
+  async thread(threadId: string, emailId: string) {
     const params = new URLSearchParams({ emailId })
-    return request<ThreadContext>(
-      `/api/reviews/${encodeURIComponent(snapshotId)}/threads/${encodeURIComponent(threadId)}?${params}`,
+    return request<ThreadContext>(`/api/todo/threads/${encoded(threadId)}?${params}`)
+  },
+  async replyEditor(emailId: string) {
+    return request<{ editor: ReplyEditorState | null }>(
+      `/api/todo/emails/${encoded(emailId)}/editor`,
     )
   },
-  async finalize(
-    snapshot: ReviewSnapshot,
-    revision: number,
-    finalizeIds: string[],
-    keepUnreadIds: string[],
-    secondaryActionIds: string[],
-  ) {
-    return post<FinalizeResult>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/finalize`,
-      { finalizeIds, keepUnreadIds, revision, secondaryActionIds },
-      snapshot.csrfToken,
+  async saveReplyEditor(emailId: string, editor: ReplyEditorState, csrfToken: string) {
+    return send<{ editor: ReplyEditorState }>(
+      'PUT',
+      `/api/todo/emails/${encoded(emailId)}/editor`,
+      { editor },
+      csrfToken,
+      true,
     )
   },
   async reply(
-    snapshot: ReviewSnapshot,
+    emailId: string,
     body: {
       currentDraft?: string
-      emailId: string
       requestId: string
       revisionInstruction?: string
       roughNotes: string
     },
+    csrfToken: string,
   ) {
-    return post<ReplyProposal>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/replies`,
+    return send<ReplyProposal>(
+      'POST',
+      `/api/todo/emails/${encoded(emailId)}/replies`,
       body,
-      snapshot.csrfToken,
+      csrfToken,
     )
   },
   async draft(
-    snapshot: ReviewSnapshot,
+    emailId: string,
     body: {
       bodyText: string
       cc: MailAddress[]
-      emailId: string
       identityId: string
       requestId: string
       subject: string
       to: MailAddress[]
     },
+    csrfToken: string,
   ) {
-    return post<DraftResult>(
-      `/api/reviews/${encodeURIComponent(snapshot.snapshotId)}/drafts`,
-      body,
-      snapshot.csrfToken,
+    return send<DraftResult>('POST', `/api/todo/emails/${encoded(emailId)}/drafts`, body, csrfToken)
+  },
+  async saveMemory(notes: string, csrfToken: string) {
+    return send<TriageMemory>('PUT', '/api/todo/memory', { notes }, csrfToken)
+  },
+  async decideProposal(id: string, accept: boolean, csrfToken: string) {
+    return send<TriageMemory>(
+      'POST',
+      `/api/todo/memory/proposals/${encoded(id)}/${accept ? 'accept' : 'reject'}`,
+      {},
+      csrfToken,
     )
   },
 }
 
-export function blobUrl(snapshotId: string, blobId: string, inline = false) {
-  const suffix = inline ? '?inline=1' : ''
-  return `/api/reviews/${encodeURIComponent(snapshotId)}/blobs/${encodeURIComponent(blobId)}${suffix}`
+export function blobUrl(blobId: string, inline = false) {
+  return `/api/todo/blobs/${encoded(blobId)}${inline ? '?inline=1' : ''}`
 }
 
-export function remoteImageUrl(
-  snapshotId: string,
-  emailId: string,
-  imageId: string,
-  imageToken: string,
-) {
+export function remoteImageUrl(emailId: string, imageId: string, imageToken: string) {
   const params = new URLSearchParams({ token: imageToken })
-  return `/api/reviews/${encodeURIComponent(snapshotId)}/emails/${encodeURIComponent(emailId)}/images/${encodeURIComponent(imageId)}?${params}`
+  return `/api/todo/emails/${encoded(emailId)}/images/${encoded(imageId)}?${params}`
 }

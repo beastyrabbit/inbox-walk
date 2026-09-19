@@ -18,7 +18,7 @@ try {
   const result = await new Promise<{ code: number | null; output: string }>((resolve, reject) => {
     const child = spawn(
       'pnpm',
-      ['exec', 'playwright', 'test', '--project=chromium', '--grep=shows the package version'],
+      ['exec', 'playwright', 'test', '--project=chromium', '--grep=lists every unread message'],
       {
         env: {
           PATH: process.env.PATH,

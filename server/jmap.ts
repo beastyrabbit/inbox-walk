@@ -5,7 +5,6 @@ import type {
   MailResource,
   ReviewEmail,
   ReviewEmailSummary,
-  ReviewFilters,
   ThreadMessage,
 } from '../src/shared.ts'
 import { abortable, ioSignal, readBoundedBody } from './io.ts'
@@ -100,16 +99,6 @@ export interface MailAccountContext {
   maxObjectsInGet: number
   maxObjectsInSet: number
   username: string
-}
-
-export interface LiveSnapshotData {
-  context: MailAccountContext
-  emails: ReviewEmailSummary[]
-  filters: ReviewFilters
-  mailboxes: MailboxOption[]
-  missingIds: string[]
-  totalBeforeLimit: number
-  truncated: boolean
 }
 
 export interface MarkReadResult {
@@ -234,32 +223,15 @@ function responseFor<T>(responses: ResponseTuple<T>[], callId: string): MethodRe
   return found[1]
 }
 
-export function unreadFilter(
-  filters: ReviewFilters = {
-    hideReviewed: false,
-    mailboxId: null,
-    newsletter: 'all',
-    spam: 'exclude',
-    timeRange: 'all',
-  },
-  junkMailboxId?: string,
-) {
+/** Unread, non-draft mail outside Spam. */
+export function unreadFilter(junkMailboxId?: string) {
   const conditions: Array<Record<string, unknown>> = [
     { notKeyword: '$seen' },
     { notKeyword: '$draft' },
   ]
-  if (filters.mailboxId) conditions.push({ inMailbox: filters.mailboxId })
   if (junkMailboxId) {
-    conditions.push(
-      filters.spam === 'only'
-        ? { inMailbox: junkMailboxId }
-        : { operator: 'NOT', conditions: [{ inMailbox: junkMailboxId }] },
-    )
+    conditions.push({ operator: 'NOT', conditions: [{ inMailbox: junkMailboxId }] })
   }
-  const duration =
-    filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
-  if (duration)
-    conditions.push({ after: new Date(Date.now() - duration * 3_600_000).toISOString() })
   return { operator: 'AND', conditions }
 }
 
@@ -410,30 +382,8 @@ async function getEmails(
   return { list, missing }
 }
 
-function newsletterMatches(email: ReviewEmailSummary, filter: ReviewFilters['newsletter']) {
-  if (filter === 'all') return true
-  return filter === 'only' ? email.isNewsletter : !email.isNewsletter
-}
-
-function spamMatches(
-  email: JmapEmail,
-  mailboxes: Map<string, Mailbox>,
-  filter: ReviewFilters['spam'],
-) {
-  const isSpam = assignedMailboxes(email, mailboxes).some((mailbox) => mailbox.role === 'junk')
-  return filter === 'only' ? isSpam : !isSpam
-}
-
-export async function fetchReviewOptions(token: string) {
-  const context = await accountContext(token)
-  const mailboxes = await fetchMailboxes(context, token)
-  return {
-    context,
-    mailboxes: mailboxes
-      .filter((mailbox) => mailbox.myRights?.mayReadItems !== false)
-      .map(({ id, name, role }) => ({ id, name, role }))
-      .sort((a, b) => a.name.localeCompare(b.name)),
-  }
+function isSpam(email: JmapEmail, mailboxes: Map<string, Mailbox>) {
+  return assignedMailboxes(email, mailboxes).some((mailbox) => mailbox.role === 'junk')
 }
 
 export async function fetchUnreadEmailIds(
@@ -465,110 +415,61 @@ export async function fetchUnreadEmailIds(
   return unreadIds
 }
 
-export async function fetchUnreadSnapshot(
-  token: string,
-  filters: ReviewFilters = {
-    hideReviewed: false,
-    mailboxId: null,
-    newsletter: 'all',
-    spam: 'exclude',
-    timeRange: 'all',
-  },
-  retainedIds: ReadonlySet<string> = new Set(),
-  signal?: AbortSignal,
-): Promise<LiveSnapshotData> {
-  signal?.throwIfAborted()
+export interface MailAccount {
+  context: MailAccountContext
+  mailboxes: MailboxOption[]
+}
+
+/** Resolves the Fastmail account and its mailboxes for a long-lived mail session. */
+export async function fetchMailAccount(token: string, signal?: AbortSignal): Promise<MailAccount> {
   const context = await accountContext(token, signal)
-  const mailboxList = await fetchMailboxes(context, token, signal)
-  const mailboxes = new Map(mailboxList.map((mailbox) => [mailbox.id, mailbox]))
-  const junkMailboxId = mailboxList.find((mailbox) => mailbox.role === 'junk')?.id
-  if (filters.spam === 'only' && !junkMailboxId) {
-    return {
-      context,
-      emails: [],
-      filters,
-      mailboxes: mailboxList.map(({ id, name, role }) => ({ id, name, role })),
-      missingIds: [],
-      totalBeforeLimit: 0,
-      truncated: false,
-    }
-  }
+  const mailboxes = await fetchMailboxes(context, token, signal)
+  return { context, mailboxes: mailboxes.map(({ id, name, role }) => ({ id, name, role })) }
+}
+
+/**
+ * Lists every unread, non-draft message outside Spam. The query state must be
+ * stable across all pages so a concurrent change cannot hide a message.
+ */
+export async function queryUnreadEmailIds(
+  account: MailAccount,
+  token: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const { context } = account
+  const junkMailboxId = account.mailboxes.find((mailbox) => mailbox.role === 'junk')?.id
   const queryArguments = {
     accountId: context.accountId,
     calculateTotal: true,
-    filter: unreadFilter(filters, junkMailboxId),
+    filter: unreadFilter(junkMailboxId),
     sort: [{ property: 'receivedAt', isAscending: false }],
   }
-
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    let position = 0
+    const ids: string[] = []
     let queryState: string | undefined
-    let candidateTotal = 0
-    let exhausted = false
     let changed = false
-    const selected: ReviewEmailSummary[] = []
-    const missingIds: string[] = []
-
-    while (!exhausted) {
+    let total = 0
+    while (true) {
       signal?.throwIfAborted()
-      const pageResponses = await callJmap<never>(
+      const responses = await callJmap<never>(
         context.apiUrl,
         token,
-        [['Email/query', { ...queryArguments, position, limit: QUERY_PAGE_SIZE }, 'query']],
+        [['Email/query', { ...queryArguments, position: ids.length, limit: QUERY_PAGE_SIZE }, 'q']],
         false,
         signal,
       )
-      const page = responseFor(pageResponses, 'query')
+      const page = responseFor(responses, 'q')
       if (queryState === undefined) queryState = page.queryState
       else if (page.queryState !== queryState) {
         changed = true
         break
       }
-      const ids = page.ids ?? []
-      candidateTotal = page.total ?? Math.max(candidateTotal, position + ids.length)
-      if (ids.length === 0) {
-        exhausted = true
-        break
-      }
-      const fetched = await getEmails(context, token, ids, false, signal)
-      missingIds.push(...fetched.missing)
-      const byId = new Map(fetched.list.map((email) => [email.id, email]))
-      selected.push(
-        ...ids
-          .map((id) => byId.get(id))
-          .filter((email): email is JmapEmail => Boolean(email))
-          .filter((email) => isIncoming(email, mailboxes))
-          .filter((email) => spamMatches(email, mailboxes, filters.spam))
-          .filter((email) => !filters.hideReviewed || !retainedIds.has(email.id))
-          .map((email) => summary(email, mailboxes))
-          .filter((email) => newsletterMatches(email, filters.newsletter)),
-      )
-      position += ids.length
-      if (position >= candidateTotal) {
-        exhausted = true
-        break
-      }
+      const pageIds = page.ids ?? []
+      total = page.total ?? Math.max(total, ids.length + pageIds.length)
+      ids.push(...pageIds)
+      if (pageIds.length === 0 || ids.length >= total) break
     }
-    if (changed) continue
-    signal?.throwIfAborted()
-    const secondResponses = await callJmap<never>(
-      context.apiUrl,
-      token,
-      [['Email/query', { ...queryArguments, position: 0, limit: 1 }, 'query-check']],
-      false,
-      signal,
-    )
-    const second = responseFor(secondResponses, 'query-check')
-    if (queryState !== second.queryState) continue
-    return {
-      context,
-      emails: selected,
-      filters,
-      mailboxes: mailboxList.map(({ id, name, role }) => ({ id, name, role })),
-      missingIds,
-      totalBeforeLimit: selected.length,
-      truncated: false,
-    }
+    if (!changed) return ids
   }
   throw new JmapError(
     'Das Postfach hat sich während des Ladens wiederholt verändert. Bitte erneut versuchen.',
@@ -576,35 +477,91 @@ export async function fetchUnreadSnapshot(
   )
 }
 
-export async function resumeSnapshot(
+/**
+ * Loads summaries for the given IDs. Messages that are missing, outgoing-only
+ * or in Spam are reported as excluded instead of being returned.
+ */
+export async function fetchEmailSummaries(
+  account: MailAccount,
   token: string,
   ids: readonly string[],
-  filters: ReviewFilters,
-) {
-  const context = await accountContext(token)
-  const mailboxList = await fetchMailboxes(context, token)
-  const mailboxes = new Map(mailboxList.map((mailbox) => [mailbox.id, mailbox]))
-  const fetched = await getEmails(context, token, ids, false)
+  signal?: AbortSignal,
+): Promise<{ emails: ReviewEmailSummary[]; excludedIds: string[] }> {
+  const mailboxes = new Map(account.mailboxes.map((mailbox) => [mailbox.id, mailbox as Mailbox]))
+  const fetched = await getEmails(account.context, token, ids, false, signal)
   const byId = new Map(fetched.list.map((email) => [email.id, email]))
-  const missingIds = [...fetched.missing]
   const emails: ReviewEmailSummary[] = []
+  const excludedIds: string[] = []
   for (const id of ids) {
     const email = byId.get(id)
-    if (!email || !isIncoming(email, mailboxes) || !spamMatches(email, mailboxes, filters.spam)) {
-      if (!missingIds.includes(id)) missingIds.push(id)
+    if (!email || !isIncoming(email, mailboxes) || isSpam(email, mailboxes)) {
+      excludedIds.push(id)
       continue
     }
     emails.push(summary(email, mailboxes))
   }
-  return {
-    context,
-    emails,
-    filters,
-    mailboxes: mailboxList.map(({ id, name, role }) => ({ id, name, role })),
-    missingIds,
-    totalBeforeLimit: ids.length,
-    truncated: false,
-  } satisfies LiveSnapshotData
+  return { emails, excludedIds }
+}
+
+export interface MailSearchQuery {
+  after?: string
+  before?: string
+  from?: string
+  limit: number
+  subject?: string
+  text?: string
+}
+
+export interface MailSearchHit extends ReviewEmailSummary {
+  unread: boolean
+}
+
+/** Searches the whole mailbox, read and unread, excluding drafts and Spam. */
+export async function searchEmailSummaries(
+  account: MailAccount,
+  token: string,
+  query: MailSearchQuery,
+  signal?: AbortSignal,
+): Promise<MailSearchHit[]> {
+  const { context } = account
+  const junkMailboxId = account.mailboxes.find((mailbox) => mailbox.role === 'junk')?.id
+  const conditions: Array<Record<string, unknown>> = [{ notKeyword: '$draft' }]
+  if (junkMailboxId) {
+    conditions.push({ operator: 'NOT', conditions: [{ inMailbox: junkMailboxId }] })
+  }
+  if (query.text) conditions.push({ text: query.text })
+  if (query.from) conditions.push({ from: query.from })
+  if (query.subject) conditions.push({ subject: query.subject })
+  if (query.after) conditions.push({ after: query.after })
+  if (query.before) conditions.push({ before: query.before })
+  const responses = await callJmap<never>(
+    context.apiUrl,
+    token,
+    [
+      [
+        'Email/query',
+        {
+          accountId: context.accountId,
+          filter: { operator: 'AND', conditions },
+          limit: Math.min(50, Math.max(1, Math.floor(query.limit))),
+          sort: [{ property: 'receivedAt', isAscending: false }],
+        },
+        'search',
+      ],
+    ],
+    false,
+    signal,
+  )
+  const ids = responseFor(responses, 'search').ids ?? []
+  if (ids.length === 0) return []
+  const mailboxes = new Map(account.mailboxes.map((mailbox) => [mailbox.id, mailbox as Mailbox]))
+  const fetched = await getEmails(context, token, ids, false, signal)
+  const unreadIds = await fetchUnreadEmailIds(context, token, ids)
+  const byId = new Map(fetched.list.map((email) => [email.id, email]))
+  return ids
+    .map((id) => byId.get(id))
+    .filter((email): email is JmapEmail => Boolean(email))
+    .map((email) => ({ ...summary(email, mailboxes), unread: unreadIds.has(email.id) }))
 }
 
 function partValue(parts: BodyPart[] | undefined, values: JmapEmail['bodyValues']) {

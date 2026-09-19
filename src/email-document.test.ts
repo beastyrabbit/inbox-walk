@@ -32,18 +32,16 @@ const email: ReviewEmail = {
 
 describe('email document isolation', () => {
   it('sanitizes scripts and blocks remote resources by default', () => {
-    const document = emailDocument(email, 'snap-1', false)
+    const document = emailDocument(email, false)
     expect(document).not.toContain('<script')
     expect(document).not.toContain('https://tracker.example')
-    expect(document).toContain('/api/reviews/snap-1/blobs/inline-1?inline=1')
+    expect(document).toContain('/api/todo/blobs/inline-1?inline=1')
     expect(document).toContain('target="_blank"')
   })
 
   it('routes explicitly requested remote images through the backend proxy', () => {
-    const document = emailDocument(email, 'snap-1', true, 'image-token')
-    expect(document).toContain(
-      '/api/reviews/snap-1/emails/mail-1/images/opaque-image-id?token=image-token',
-    )
+    const document = emailDocument(email, true, 'image-token')
+    expect(document).toContain('/api/todo/emails/mail-1/images/opaque-image-id?token=image-token')
     expect(document).not.toContain('url=')
     expect(document).not.toContain('src="https://tracker.example/pixel"')
   })
@@ -54,7 +52,6 @@ describe('email document isolation', () => {
         ...email,
         html: `<svg><image href="https://tracker.example/svg"></image><use xlink:href="https://tracker.example/sprite"></use></svg><video poster="https://tracker.example/poster"><source src="https://tracker.example/movie"></video><table background="https://tracker.example/bg"><tr><td>Text</td></tr></table>`,
       },
-      'snap-1',
       true,
       'image-token',
     )
@@ -63,18 +60,13 @@ describe('email document isolation', () => {
   })
 
   it('removes empty placeholder images instead of showing broken icons', () => {
-    const document = emailDocument(
-      { ...email, html: '<p>Text</p><img src="#"><img>' },
-      'snap-1',
-      true,
-    )
+    const document = emailDocument({ ...email, html: '<p>Text</p><img src="#"><img>' }, true)
     expect(document).not.toContain('<img')
   })
 
   it('hides unresolved CID and relative images instead of rendering broken icons', () => {
     const document = emailDocument(
       { ...email, html: '<img src="cid:missing"><img src="/relative-logo.png">' },
-      'snap-1',
       true,
     )
     expect(document.match(/data-remote-image="blocked"/g)).toHaveLength(2)
@@ -90,7 +82,6 @@ describe('email document presentation', () => {
         ...email,
         html: `<html><head><style>.btn{background:#1a73e8}</style></head><body bgcolor="#f2f2f2" style="margin:0"><a class="btn">Go</a></body></html>`,
       },
-      'snap-1',
       true,
     )
     expect(document).toContain('.btn{background:#1a73e8}')
@@ -101,20 +92,14 @@ describe('email document presentation', () => {
   })
 
   it('adapts mail colours to the dark reader by default and keeps images unchanged', () => {
-    const document = emailDocument({ ...email, html: '<p>Text</p>' }, 'snap-1', true)
+    const document = emailDocument({ ...email, html: '<p>Text</p>' }, true)
     expect(document).toContain('body { min-height: 100vh; background: #e2e0dc;')
     expect(document).toContain('filter: invert(1) hue-rotate(180deg)')
     expect(document).toContain('img, picture, svg, video { filter: invert(1) hue-rotate(180deg); }')
   })
 
   it('shows original colours without any filter when requested', () => {
-    const document = emailDocument(
-      { ...email, html: '<p>Text</p>' },
-      'snap-1',
-      true,
-      '',
-      'original',
-    )
+    const document = emailDocument({ ...email, html: '<p>Text</p>' }, true, '', 'original')
     expect(document).not.toContain('filter: invert')
     expect(document).toContain('background: #ffffff')
   })
@@ -125,7 +110,6 @@ describe('email document presentation', () => {
         ...email,
         html: `<style>p{color:#111}@media (prefers-color-scheme: dark){p{color:#eee}.x{background:#000}}p{margin:0}</style><p>Text</p>`,
       },
-      'snap-1',
       true,
     )
     expect(document).not.toContain('prefers-color-scheme')
@@ -139,7 +123,6 @@ describe('email document presentation', () => {
         ...email,
         html: `<img src="data:image/png;base64,AA" style="width:100%;max-width:560px"><img src="data:image/png;base64,AA" width="900">`,
       },
-      'snap-1',
       true,
     )
     expect(document).toContain('max-width: min(560px, 100%) !important')
@@ -147,7 +130,7 @@ describe('email document presentation', () => {
   })
 
   it('renders plain text natively without inversion', () => {
-    const document = emailDocument({ ...email, html: null, text: 'Hallo' }, 'snap-1', true)
+    const document = emailDocument({ ...email, html: null, text: 'Hallo' }, true)
     expect(document).not.toContain('invert(1)')
     expect(document).toContain('<div class="plain-text">Hallo')
   })

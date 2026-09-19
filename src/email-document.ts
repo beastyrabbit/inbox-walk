@@ -111,7 +111,6 @@ const plainTextStyles = `
 
 export function emailDocument(
   email: ReviewEmail,
-  snapshotId: string,
   loadRemoteImages: boolean,
   imageToken = '',
   colorMode: MailColorMode = 'dark',
@@ -153,7 +152,7 @@ export function emailDocument(
   const cids = new Map(
     email.inlineResources
       .filter((resource) => resource.cid)
-      .map((resource) => [resource.cid?.toLowerCase(), blobUrl(snapshotId, resource.blobId, true)]),
+      .map((resource) => [resource.cid?.toLowerCase(), blobUrl(resource.blobId, true)]),
   )
   const blockImage = (image: HTMLImageElement) => {
     image.removeAttribute('src')
@@ -179,7 +178,7 @@ export function emailDocument(
         // Malformed remote URLs stay blocked.
       }
       if (loadRemoteImages && imageId) {
-        image.setAttribute('src', remoteImageUrl(snapshotId, email.id, imageId, imageToken))
+        image.setAttribute('src', remoteImageUrl(email.id, imageId, imageToken))
       } else {
         blockImage(image)
       }

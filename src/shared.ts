@@ -57,13 +57,6 @@ export interface ReviewEmail extends ReviewEmailSummary {
   remoteImageIds?: Record<string, string>
 }
 
-export interface ReviewOptions {
-  codex: CodexAuthStatus
-  mailboxes: MailboxOption[]
-  mode: 'demo' | 'live'
-  reviewedCount: number
-}
-
 export const codexModels = [
   {
     description: 'Neuestes und stärkstes Modell.',
@@ -152,142 +145,12 @@ export interface CodexLoginState {
   userCode?: string
 }
 
-export interface ReviewSnapshot {
-  analysis: ReviewAnalysisState
-  bundleRun?: ReviewBundleRun
-  csrfToken: string
-  imageToken: string
-  emails: ReviewEmailSummary[]
-  finalization: ReviewFinalizationState
-  filters: ReviewFilters
-  missingIds: string[]
-  mode: 'demo' | 'live'
-  snapshotId: string
-  totalBeforeLimit: number
-  truncated: boolean
-  userState: ReviewRoundUserState
-}
-
-export type ReviewRunStatus = 'queued' | 'fetching' | 'analyzing' | 'ready' | 'failed'
-
-export interface ReviewRunSummary {
-  analysis: ReviewAnalysisState
-  createdAt: string
-  csrfToken: string
-  emailCount: number
-  filters: ReviewFilters
-  generation: number
-  id: string
-  mode: 'demo' | 'live'
-  reanalyzable: boolean
-  reviewStatus: 'active' | 'finalizing' | 'finalized'
-  status: ReviewRunStatus
-  updatedAt: string
-}
-
-export type ReviewAnalysisStatus = 'pending' | 'running' | 'complete'
-export type ReviewAnalysisEngine = 'codex' | 'heuristic' | 'fallback'
-
-export interface ReviewAnalysisState {
-  callCount: number
-  engine: ReviewAnalysisEngine
-  error?: string
-  model?: string
-  thinkingLevel?: CodexThinkingLevel
-  phase: string
-  processedEmailCount: number
-  progress: number
-  status: ReviewAnalysisStatus
-  totalEmailCount: number
-}
-
 export type BundleKind =
   | 'development_workstream'
   | 'order_delivery'
   | 'incident'
   | 'conversation'
   | 'standalone'
-
-export interface ReviewBundleTimelineItem {
-  emailId: string
-  event: string
-  occurredAt: string
-  source: string
-}
-
-export interface ReviewBundle {
-  bundleId: string
-  currentState: string
-  emailIds: string[]
-  kind: BundleKind
-  linkEvidence: string[]
-  membershipConfidence: number
-  summary: string
-  timeline: ReviewBundleTimelineItem[]
-  title: string
-}
-
-export interface ReviewBundleRun {
-  bundles: ReviewBundle[]
-  fallback: boolean
-  snapshotId: string
-}
-
-export interface ReviewRoundUserState {
-  bundleGroups: string[][]
-  index: number
-  keptUnreadIds: string[]
-  processedIds: string[]
-  revision: number
-  secondaryActionIds: string[]
-  selectedMemberId: string | null
-  replyDrafts: Record<string, ReplyEditorState>
-}
-
-export interface ReviewCheckpoint {
-  roundId: string
-  version: 7
-}
-
-export interface LegacyReviewCheckpoint {
-  version: 6
-  bundleGroups: string[][]
-  emailIds: string[]
-  filters: ReviewFilters
-  index: number
-  keptUnreadIds: string[]
-  processedIds: string[]
-  secondaryActionIds: string[]
-  replyDrafts: Record<string, ReplyEditorState>
-  migrationRoundId?: string
-}
-
-export type LoadedReviewCheckpoint = ReviewCheckpoint | LegacyReviewCheckpoint
-
-export interface FinalizeFailure {
-  id: string
-  reason: string
-}
-
-export interface FinalizeResult {
-  actionFailed: FinalizeFailure[]
-  failed: FinalizeFailure[]
-  finalized: boolean
-  keptUnread: number
-  markedRead: number
-  mode: 'demo' | 'live'
-  processed: number
-  remaining: number
-  rescuedFromSpam: number
-  taggedForUnsubscribe: number
-  untouched: number
-}
-
-export interface ReviewFinalizationState {
-  result: FinalizeResult | null
-  selectionLocked: boolean
-  status: 'active' | 'finalized' | 'finalizing'
-}
 
 export interface MailIdentity {
   id: string
@@ -316,17 +179,12 @@ export interface ThreadContext {
   recipients: ReplyRecipients
 }
 
-export interface SupportedDetail {
-  detail: string
-  sourceMessageIds: string[]
-}
-
 export interface ReplyProposal {
   attachmentManifest: MailResource[]
   bodyText: string
   questions: string[]
   requestId: string
-  supportedDetails: SupportedDetail[]
+  supportedDetails: Array<{ detail: string; sourceMessageIds: string[] }>
   warnings: string[]
 }
 
@@ -359,10 +217,74 @@ export interface ApiError {
   }
 }
 
-export const defaultReviewFilters: ReviewFilters = {
-  hideReviewed: false,
-  mailboxId: null,
-  newsletter: 'all',
-  spam: 'exclude',
-  timeRange: 'all',
+export type TriageMessageStatus = 'queued' | 'sorted' | 'parked' | 'done' | 'gone'
+
+export interface TriageMessage {
+  /** Failed automatic sorting attempts; sorting pauses at the retry limit. */
+  attempts: number
+  bucketId: string | null
+  lastError?: string
+  status: TriageMessageStatus
+  summary: ReviewEmailSummary
 }
+
+export interface TriageBucket {
+  activityAt: string
+  bucketId: string
+  currentState: string
+  /** Members already handled; kept so a reopened story shows its history size. */
+  handledCount: number
+  kind: BundleKind
+  linkEvidence: string[]
+  /** Open members in chronological order. */
+  messages: TriageMessage[]
+  summary: string
+  title: string
+  /** A message Codex has not sorted yet, shown as its own entry. */
+  unsorted: boolean
+}
+
+export interface TriageStatus {
+  engine: 'codex' | 'heuristic'
+  /** Messages whose automatic sorting stopped at the retry limit. */
+  failedCount: number
+  lastPollAt: string | null
+  lastPollError: string | null
+  lastSortAt: string | null
+  lastSortError: string | null
+  model?: string
+  polling: boolean
+  queuedCount: number
+  sorting: boolean
+  waitingForCodex: boolean
+}
+
+export interface TriageMemoryProposal {
+  createdAt: string
+  id: string
+  note: string
+}
+
+export interface TriageMemory {
+  notes: string
+  proposals: TriageMemoryProposal[]
+}
+
+export interface TriageSnapshot {
+  buckets: TriageBucket[]
+  codex: CodexAuthStatus
+  csrfToken: string
+  imageToken: string
+  memory: TriageMemory
+  mode: 'demo' | 'live'
+  parked: TriageMessage[]
+  status: TriageStatus
+}
+
+export interface TriageActionResult {
+  failed: Array<{ id: string; reason: string }>
+  snapshot: TriageSnapshot
+}
+
+export const TRIAGE_MAX_ATTEMPTS = 3
+export const TRIAGE_MEMORY_MAX_LENGTH = 8_000

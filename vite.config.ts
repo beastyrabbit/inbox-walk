@@ -1,10 +1,7 @@
 import { readFileSync } from 'node:fs'
 import react from '@vitejs/plugin-react'
 import { defineConfig, loadEnv } from 'vite'
-import { abortApiJobs, createApiMiddleware, waitForApiJobs } from './server/api.ts'
-import { createBundleStore } from './server/bundle-store.ts'
-import { createReviewHistory } from './server/review-history.ts'
-import { createRoundStore } from './server/round-store.ts'
+import { createRuntime } from './server/runtime.ts'
 
 const packageMetadata = JSON.parse(
   readFileSync(new URL('./package.json', import.meta.url), 'utf8'),
@@ -17,16 +14,17 @@ if (typeof packageMetadata.version !== 'string' || !packageMetadata.version.trim
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '')
   for (const key of [
-    'CODEX_BUNDLE_TIMEOUT_MS',
     'CODEX_INFERENCE_TIMEOUT_MS',
     'CODEX_MODEL',
     'CODEX_THINKING_LEVEL',
     'DATA_DIR',
     'TIKA_URL',
+    'TRIAGE_POLL_INTERVAL_MS',
+    'TRIAGE_TIMEOUT_MS',
   ]) {
     if (!process.env[key] && env[key]) process.env[key] = env[key]
   }
-  const apiOptions = {
+  const runtimeOptions = {
     fastmailToken: process.env.FASTMAIL_JMAP_TOKEN || env.FASTMAIL_JMAP_TOKEN,
     forceDemo: (process.env.MAIL_REVIEW_DEMO || env.MAIL_REVIEW_DEMO) === '1',
   }
@@ -44,20 +42,10 @@ export default defineConfig(({ mode }) => {
       {
         name: 'mail-review-api',
         configureServer(server) {
-          const reviewHistory = createReviewHistory()
-          const bundleStore = createBundleStore()
-          const roundStore = createRoundStore()
-          server.middlewares.use(
-            createApiMiddleware({ ...apiOptions, bundleStore, reviewHistory, roundStore }),
-          )
-          server.httpServer?.once('close', () => {
-            abortApiJobs()
-            void waitForApiJobs().finally(() => {
-              reviewHistory.close()
-              bundleStore.close()
-              roundStore.close()
-            })
-          })
+          const runtime = createRuntime(runtimeOptions)
+          server.middlewares.use(runtime.api)
+          server.httpServer?.once('listening', () => runtime.start())
+          server.httpServer?.once('close', () => void runtime.close())
         },
       },
     ],

@@ -3,11 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, normalize, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
-import { abortApiJobs, createApiMiddleware, waitForApiJobs } from './api.ts'
-import { createBundleStore } from './bundle-store.ts'
-import { ensureCodexStorageReady } from './codex.ts'
-import { createReviewHistory } from './review-history.ts'
-import { createRoundStore } from './round-store.ts'
+import { createRuntime } from './runtime.ts'
 
 const port = Number.parseInt(process.env.PORT || '3000', 10)
 const host = process.env.HOST || '0.0.0.0'
@@ -27,24 +23,14 @@ if (tikaUrl) {
     throw new Error('TIKA_URL must use http or https')
   }
 }
-if (!forceDemo) ensureCodexStorageReady()
-
 const moduleDirectory = fileURLToPath(new URL('.', import.meta.url))
 const staticDirectory = resolve(moduleDirectory, '../dist')
 if (!existsSync(join(staticDirectory, 'index.html'))) {
   throw new Error(`Production frontend was not found at ${staticDirectory}`)
 }
 
-const reviewHistory = createReviewHistory()
-const bundleStore = createBundleStore()
-const roundStore = createRoundStore()
-const api = createApiMiddleware({
-  bundleStore,
-  fastmailToken,
-  forceDemo,
-  reviewHistory,
-  roundStore,
-})
+const runtime = createRuntime({ fastmailToken, forceDemo })
+const { api } = runtime
 const mimeTypes: Record<string, string> = {
   '.css': 'text/css; charset=utf-8',
   '.html': 'text/html; charset=utf-8',
@@ -161,6 +147,7 @@ const server = createServer((req, res) => {
 
 server.listen(port, host, () => {
   process.stdout.write(`Inbox Walk listening on ${host}:${port}\n`)
+  runtime.start()
 })
 
 let shuttingDown = false
@@ -169,12 +156,8 @@ function shutdown(signal: string) {
   if (shuttingDown) return
   shuttingDown = true
   process.stdout.write(`Inbox Walk received ${signal}; shutting down\n`)
-  abortApiJobs()
   server.close((error) => {
-    void waitForApiJobs().finally(() => {
-      reviewHistory.close()
-      bundleStore.close()
-      roundStore.close()
+    void runtime.close().finally(() => {
       if (error) {
         process.stderr.write(`Shutdown failed: ${error.message}\n`)
         process.exitCode = 1

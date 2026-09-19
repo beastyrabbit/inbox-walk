@@ -27,7 +27,7 @@ export default defineConfig({
       MAIL_REVIEW_DEMO: '1',
       PORT: port,
     },
-    url: `${baseURL}/api/review/options`,
+    url: `${baseURL}/api/todo`,
     reuseExistingServer: false,
     timeout: 120_000,
   },

@@ -8,110 +8,34 @@ import type {
   CodexAuthStatus,
   CodexLoginState,
   DraftResult,
-  FinalizeResult,
-  MailboxOption,
-  MailIdentity,
   MailResource,
+  ReplyEditorState,
   ReplyProposal,
-  ReviewAnalysisState,
-  ReviewBundleRun,
   ReviewEmail,
-  ReviewEmailSummary,
-  ReviewFilters,
-  ReviewFinalizationState,
-  ReviewRoundUserState,
-  ReviewRunSummary,
-  ReviewSnapshot,
   ThreadMessage,
+  TriageActionResult,
+  TriageSnapshot,
 } from '../src/shared.ts'
-import {
-  defaultReviewFilters,
-  isCodexModelId,
-  isCodexSpeed,
-  isCodexThinkingLevel,
-} from '../src/shared.ts'
-import { createCheckpointedBundlePartitionDecider } from './bundle-checkpoint.ts'
-import type { BundleStore } from './bundle-store.ts'
-import {
-  type BundleBuildProgress,
-  type BundleExample,
-  buildReviewBundlesFromPartition,
-  type DecideBundlePartition,
-  heuristicBundlePartition,
-  validateBundlePartition,
-} from './bundles.ts'
-import {
-  BUNDLE_PARTITION_PROMPT_VERSION,
-  CodexAuthenticationError,
-  CodexContextLengthError,
-  codexAuthStatus,
-  getCodexAuthStorage,
-  runCodexBundlePartition,
-  selectedCodexSettings,
-} from './codex.ts'
-import { demoEmails } from './demo.ts'
-import { IoError, ioSignal, withIoDeadline, withoutIoDeadline } from './io.ts'
-import {
-  createAndVerifyDraft,
-  downloadBlob,
-  fetchEmailDetail,
-  fetchIdentities,
-  fetchReviewOptions,
-  fetchThread,
-  fetchUnreadEmailIds,
-  fetchUnreadSnapshot,
-  JmapError,
-  type LiveSnapshotData,
-  type MailAccountContext,
-  markEmailsRead,
-  moveEmailsOutOfSpam,
-  resumeSnapshot,
-  tagEmailsForLaterUnsubscribe,
-} from './jmap.ts'
-import {
-  appendSignature,
-  computeReplyRecipients,
-  escapeDraftHtml,
-  generateReply,
-  ReplyError,
-  type ReplyRequest,
-} from './reply.ts'
-import type { ReviewHistory } from './review-history.ts'
-import {
-  cleanBundleExamples,
-  isStoredReviewRoundReanalyzable,
-  type RoundFinalizationUpdate,
-  RoundNotFoundError,
-  RoundReanalysisConflictError,
-  RoundRevisionConflictError,
-  type RoundStore,
-  type StoredReviewRound,
-  type StoredReviewRunSummary,
-} from './round-store.ts'
+import { TRIAGE_MEMORY_MAX_LENGTH } from '../src/shared.ts'
+import { codexAuthStatus, getCodexAuthStorage, selectedCodexSettings } from './codex.ts'
+import { IoError, ioSignal, withIoDeadline } from './io.ts'
+import { JmapError } from './jmap.ts'
+import { type Mailbox, threadResources } from './mailbox.ts'
+import { appendSignature, computeReplyRecipients, escapeDraftHtml, ReplyError } from './reply.ts'
 import { fetchRemoteImage, SafeHttpError } from './safe-http.ts'
+import type { TriageEngine } from './triage-engine.ts'
+import { type TriageStore, TriageStoreError } from './triage-store.ts'
 
 const MAX_JSON_BYTES = 256 * 1024
-const MAX_SELECTION_JSON_BYTES = 16 * 1024 * 1024
-const MAX_SNAPSHOTS = 20
-const SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000
-const SNAPSHOT_PRUNE_INTERVAL_MS = 60 * 1000
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
+const MAX_CACHED_DETAILS = 300
 const INLINE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp'])
-
-const filtersSchema = z.object({
-  hideReviewed: z.boolean().default(false),
-  mailboxId: z.string().min(1).nullable(),
-  newsletter: z.enum(['all', 'exclude', 'only']),
-  spam: z.enum(['exclude', 'only']).default('exclude'),
-  timeRange: z.enum(['all', '24h', '7d', '30d']),
-})
 
 const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
 const replyEditorAddressSchema = z.object({
   name: z.string().max(320),
   email: z.string().max(320),
 })
-
 const replyEditorSchema = z.object({
   bodyText: z.string().max(256_000),
   cc: z.array(replyEditorAddressSchema).max(100),
@@ -124,106 +48,43 @@ const replyEditorSchema = z.object({
   to: z.array(replyEditorAddressSchema).max(100),
   toText: z.string().max(64_000).optional(),
 })
-
-interface StoredSnapshot {
-  analysis: ReviewAnalysisState
-  blobMetadata: Map<string, MailResource>
-  bundleExamples: BundleExample[]
-  bundleRun?: ReviewBundleRun
-  context?: MailAccountContext
-  createdAt: number
-  csrfToken: string
-  detailCache: Map<string, ReviewEmail>
-  draftRequestFingerprints: Map<string, string>
-  draftResults: Map<string, DraftResult>
-  draftWork: Map<string, Promise<DraftResult>>
-  emailIds: string[]
-  filters: ReviewFilters
-  generation: number
-  finalEmailIds?: Set<string>
-  finalKeepIds?: Set<string>
-  finalSecondaryActionIds?: Set<string>
-  finalizationState: 'active' | 'finalized' | 'finalizing'
-  finalizationResult: FinalizeResult | null
-  identities?: MailIdentity[]
-  imageToken: string
-  lastAccessedAt: number
-  mailboxes: MailboxOption[]
-  missingIds: string[]
-  mode: 'demo' | 'live'
-  nonAbortableRequests: number
-  replyCache: Map<string, Promise<ReplyProposal>>
-  replyInFlight: Set<string>
-  remoteImageIds: Map<string, Map<string, string>>
-  remoteImageSources: Map<string, string>
-  summaries: Map<string, ReviewEmailSummary>
-  secondaryActionFailures: Map<string, string>
-  secondaryActionSucceededIds: Set<string>
-  succeededIds: Set<string>
-  threadCache: Map<string, ThreadMessage[]>
-  totalBeforeLimit: number
-  truncated: boolean
-  userState: ReviewRoundUserState
-}
+const emailIdsSchema = z.object({
+  emailIds: z.array(z.string().min(1).max(512)).min(1).max(500),
+})
 
 export interface ApiOptions {
-  autoStartBundles?: boolean
-  bundlePartitionDecider?: DecideBundlePartition
-  bundleStore?: Pick<BundleStore, 'examples' | 'record'>
   codexAuthStatus?: () => CodexAuthStatus
   codexAuthStorage?: () => Pick<ReturnType<typeof getCodexAuthStorage>, 'login'>
-  demoMessages?: ReviewEmail[]
-  fastmailToken?: string
-  fetchMailSnapshot?: typeof fetchUnreadSnapshot
-  forceDemo?: boolean
-  markRead?: typeof markEmailsRead
-  moveOutOfSpam?: typeof moveEmailsOutOfSpam
-  reviewHistory?: ReviewHistory
-  resumeMailSnapshot?: typeof resumeSnapshot
-  roundStore?: RoundStore
-  tagForLaterUnsubscribe?: typeof tagEmailsForLaterUnsubscribe
+  engine: TriageEngine
+  mailbox: Mailbox
+  store: TriageStore
 }
 
-const snapshots = new Map<string, StoredSnapshot>()
-const bundleJobs = new Map<string, Promise<void>>()
-const snapshotJobs = new Map<string, Promise<void>>()
-const jobTransitions = new Set<Promise<void>>()
-const jobControllers = new Map<string, { controller: AbortController; generation: number }>()
-const resumeCreations = new Map<
+/** Process-local caches for mail bodies and the resources they reference. */
+interface MailCache {
+  blobMetadata: Map<string, MailResource>
+  details: Map<string, ReviewEmail>
+  draftResults: Map<string, DraftResult>
+  draftWork: Map<string, Promise<DraftResult>>
+  identities?: TriageSnapshotIdentities
+  remoteImageIds: Map<string, Map<string, string>>
+  remoteImageSources: Map<string, string>
+  replyInFlight: Set<string>
+  replyWork: Map<string, Promise<ReplyProposal>>
+  threads: Map<string, ThreadMessage[]>
+}
+
+type TriageSnapshotIdentities = Awaited<ReturnType<Mailbox['identities']>>
+
+const codexLogins = new Map<
   string,
-  {
-    emailIds: string[]
-    filters: ReviewFilters
-    mode: 'demo' | 'live'
-    work: Promise<StoredReviewRound>
-  }
+  CodexLoginState & { controller: AbortController; createdAt: number }
 >()
-let jobLifecycleEpoch = 0
-let jobsStopping = false
-interface CodexLoginRecord extends CodexLoginState {
-  controller: AbortController
-  createdAt: number
-}
-const codexLogins = new Map<string, CodexLoginRecord>()
-
-function autoStartBundles(options: ApiOptions) {
-  return options.autoStartBundles ?? !process.env.VITEST
-}
 
 function securityHeaders(res: ServerResponse) {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('Referrer-Policy', 'no-referrer')
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
-}
-
-function uniqueResources(messages: ThreadMessage[]) {
-  const resources = new Map<string, MailResource>()
-  for (const message of messages) {
-    for (const resource of [...message.inlineResources, ...message.attachments]) {
-      resources.set(resource.blobId, resource)
-    }
-  }
-  return [...resources.values()]
 }
 
 function json(res: ServerResponse, status: number, value: unknown) {
@@ -293,1260 +154,6 @@ function validateOrigin(req: IncomingMessage) {
   if (!expectedHost || originHost !== expectedHost) {
     throw new ApiHttpError(403, 'INVALID_ORIGIN', 'Request origin does not match this service')
   }
-}
-
-function ownsRoundWork(snapshot: StoredSnapshot) {
-  return (
-    snapshot.finalizationState === 'finalizing' ||
-    snapshot.nonAbortableRequests > 0 ||
-    snapshot.replyInFlight.size > 0 ||
-    snapshot.draftWork.size > 0
-  )
-}
-
-function pruneSnapshots() {
-  const cutoff = Date.now() - SNAPSHOT_TTL_MS
-  for (const [id, snapshot] of snapshots) {
-    if (snapshot.lastAccessedAt < cutoff && !bundleJobs.has(id) && !ownsRoundWork(snapshot))
-      snapshots.delete(id)
-  }
-  if (snapshots.size <= MAX_SNAPSHOTS) return
-  const oldest = [...snapshots.entries()].sort(
-    ([, left], [, right]) => left.lastAccessedAt - right.lastAccessedAt,
-  )
-  let remaining = snapshots.size - MAX_SNAPSHOTS
-  for (const [id] of oldest) {
-    if (remaining <= 0) break
-    const snapshot = snapshots.get(id)
-    if (bundleJobs.has(id) || (snapshot && ownsRoundWork(snapshot))) continue
-    snapshots.delete(id)
-    remaining -= 1
-  }
-}
-
-const snapshotPruneTimer = setInterval(pruneSnapshots, SNAPSHOT_PRUNE_INTERVAL_MS)
-snapshotPruneTimer.unref()
-
-function filterDemoEmails(
-  filters: ReviewFilters,
-  retainedIds: ReadonlySet<string>,
-  messages = demoEmails,
-) {
-  const hours =
-    filters.timeRange === 'all' ? 0 : { '24h': 24, '7d': 24 * 7, '30d': 24 * 30 }[filters.timeRange]
-  const cutoff = hours ? Date.now() - hours * 3_600_000 : 0
-  return messages.filter((email) => {
-    if (filters.hideReviewed && retainedIds.has(email.id)) return false
-    const isSpam = email.mailboxNames.includes('Spam')
-    if ((filters.spam === 'only') !== isSpam) return false
-    if (filters.mailboxId && !email.mailboxNames.includes(filters.mailboxId)) return false
-    if (cutoff && Date.parse(email.receivedAt) < cutoff) return false
-    if (filters.newsletter === 'only' && !email.isNewsletter) return false
-    if (filters.newsletter === 'exclude' && email.isNewsletter) return false
-    return true
-  })
-}
-
-function summariesFor(emails: ReviewEmail[]) {
-  return emails.map(
-    ({
-      html: _html,
-      text: _text,
-      bodyTruncated: _truncated,
-      inlineResources: _inline,
-      attachments: _attachments,
-      cc: _cc,
-      replyTo: _replyTo,
-      messageId: _messageId,
-      inReplyTo: _inReplyTo,
-      references: _references,
-      ...summary
-    }) => summary,
-  )
-}
-
-function initialAnalysis(
-  mode: 'demo' | 'live',
-  totalEmailCount: number,
-  options: ApiOptions,
-): ReviewAnalysisState {
-  const auth =
-    mode === 'live' ? (options.codexAuthStatus ?? codexAuthStatus)() : { configured: false }
-  const usesCodex = Boolean(options.bundlePartitionDecider) || (mode === 'live' && auth.configured)
-  return {
-    callCount: 0,
-    engine: usesCodex ? 'codex' : 'heuristic',
-    ...(usesCodex && 'model' in auth && auth.model ? { model: auth.model } : {}),
-    ...(usesCodex && 'thinkingLevel' in auth && auth.thinkingLevel
-      ? { thinkingLevel: auth.thinkingLevel }
-      : {}),
-    phase: 'waiting',
-    processedEmailCount: 0,
-    progress: 0,
-    status: 'pending',
-    totalEmailCount,
-  }
-}
-
-function bundleExamplesForNewRound(options: ApiOptions) {
-  try {
-    return cleanBundleExamples(options.bundleStore?.examples() ?? [])
-  } catch (error) {
-    process.stderr.write(
-      `${JSON.stringify({
-        event: 'bundle_examples_snapshot_failed',
-        message: error instanceof Error ? error.message : 'unknown',
-      })}\n`,
-    )
-    return []
-  }
-}
-
-function storeSnapshot(
-  data: Pick<LiveSnapshotData, 'emails' | 'filters' | 'mailboxes'> & {
-    analysis: ReviewAnalysisState
-    bundleExamples: BundleExample[]
-    context?: MailAccountContext
-    mode: 'demo' | 'live'
-    details?: ReviewEmail[]
-    missingIds?: string[]
-    totalBeforeLimit?: number
-    truncated?: boolean
-    generation?: number
-    snapshotId?: string
-  },
-) {
-  pruneSnapshots()
-  const snapshotId = data.snapshotId ?? randomUUID()
-  const csrfToken = randomBytes(24).toString('base64url')
-  const imageToken = randomBytes(24).toString('base64url')
-  const details = new Map((data.details ?? []).map((email) => [email.id, email]))
-  const snapshot: StoredSnapshot = {
-    analysis: data.analysis,
-    blobMetadata: new Map(),
-    bundleExamples: data.bundleExamples,
-    context: data.context,
-    createdAt: Date.now(),
-    csrfToken,
-    detailCache: details,
-    draftRequestFingerprints: new Map(),
-    draftResults: new Map(),
-    draftWork: new Map(),
-    emailIds: data.emails.map((email) => email.id),
-    filters: data.filters,
-    generation: data.generation ?? 0,
-    finalizationState: 'active',
-    finalizationResult: null,
-    imageToken,
-    lastAccessedAt: Date.now(),
-    mailboxes: data.mailboxes,
-    missingIds: data.missingIds ?? [],
-    mode: data.mode,
-    nonAbortableRequests: 0,
-    replyCache: new Map(),
-    replyInFlight: new Set(),
-    remoteImageIds: new Map(),
-    remoteImageSources: new Map(),
-    secondaryActionFailures: new Map(),
-    secondaryActionSucceededIds: new Set(),
-    succeededIds: new Set(),
-    summaries: new Map(data.emails.map((email) => [email.id, email])),
-    threadCache: new Map(),
-    totalBeforeLimit: data.totalBeforeLimit ?? data.emails.length,
-    truncated: data.truncated ?? false,
-    userState: {
-      bundleGroups: [],
-      index: 0,
-      keptUnreadIds: [],
-      processedIds: [],
-      replyDrafts: {},
-      revision: 0,
-      secondaryActionIds: [],
-      selectedMemberId: null,
-    },
-  }
-  for (const email of details.values()) registerResources(snapshot, email)
-  snapshots.set(snapshotId, snapshot)
-  return { snapshotId, csrfToken, snapshot }
-}
-
-function persistNewRound(
-  id: string,
-  snapshot: StoredSnapshot,
-  roundStore: RoundStore | undefined,
-  metadata: {
-    missingIds?: string[]
-    runStatus?: StoredReviewRound['runStatus']
-    totalBeforeLimit?: number
-    truncated?: boolean
-  } = {},
-) {
-  return roundStore?.create({
-    analysis: snapshot.analysis,
-    bundleExamples: snapshot.bundleExamples,
-    csrfToken: snapshot.csrfToken,
-    emails: snapshot.emailIds
-      .map((emailId) => snapshot.summaries.get(emailId))
-      .filter((email): email is ReviewEmailSummary => Boolean(email)),
-    filters: snapshot.filters,
-    generation: snapshot.generation,
-    id,
-    imageToken: snapshot.imageToken,
-    mailboxes: snapshot.mailboxes,
-    missingIds: metadata.missingIds ?? snapshot.missingIds,
-    mode: snapshot.mode,
-    runStatus: metadata.runStatus,
-    totalBeforeLimit: metadata.totalBeforeLimit ?? snapshot.totalBeforeLimit,
-    truncated: metadata.truncated ?? snapshot.truncated,
-  })
-}
-
-function storedSnapshot(round: StoredReviewRound, details: ReviewEmail[]) {
-  const detailCache = new Map(details.map((email) => [email.id, email]))
-  const hasFinalizationSelection =
-    round.finalization.state !== 'active' ||
-    round.finalization.finalizeIds.length > 0 ||
-    round.finalization.keepUnreadIds.length > 0 ||
-    round.finalization.secondaryActionIds.length > 0
-  const snapshot: StoredSnapshot = {
-    analysis: {
-      callCount: round.analysis.callCount,
-      engine: round.analysis.engine,
-      ...(round.analysis.error ? { error: round.analysis.error } : {}),
-      ...(round.analysis.model ? { model: round.analysis.model } : {}),
-      ...(round.analysis.thinkingLevel ? { thinkingLevel: round.analysis.thinkingLevel } : {}),
-      phase: round.analysis.phase,
-      processedEmailCount: round.analysis.processedEmailCount,
-      progress: round.analysis.progress,
-      status: round.analysis.status,
-      totalEmailCount: round.analysis.totalEmailCount,
-    },
-    blobMetadata: new Map(),
-    bundleExamples: round.bundleExamples,
-    ...(round.bundleRun ? { bundleRun: round.bundleRun } : {}),
-    createdAt: Date.parse(round.createdAt),
-    csrfToken: round.csrfToken,
-    detailCache,
-    draftRequestFingerprints: new Map(),
-    draftResults: new Map(),
-    draftWork: new Map(),
-    emailIds: round.emails.map((email) => email.id),
-    filters: round.filters,
-    generation: round.generation,
-    finalEmailIds: hasFinalizationSelection ? new Set(round.finalization.finalizeIds) : undefined,
-    finalKeepIds: hasFinalizationSelection ? new Set(round.finalization.keepUnreadIds) : undefined,
-    finalSecondaryActionIds: hasFinalizationSelection
-      ? new Set(round.finalization.secondaryActionIds)
-      : undefined,
-    finalizationResult: round.finalization.result,
-    finalizationState:
-      round.finalization.state === 'finalizing' ? 'active' : round.finalization.state,
-    imageToken: round.imageToken,
-    lastAccessedAt: Date.now(),
-    mailboxes: round.mailboxes,
-    missingIds: round.missingIds,
-    mode: round.mode,
-    nonAbortableRequests: 0,
-    replyCache: new Map(),
-    replyInFlight: new Set(),
-    remoteImageIds: new Map(),
-    remoteImageSources: new Map(),
-    secondaryActionFailures: new Map(
-      round.finalization.actionFailed.map((failure) => [failure.id, failure.reason]),
-    ),
-    secondaryActionSucceededIds: new Set(round.finalization.secondaryActionSucceededIds),
-    succeededIds: new Set(round.finalization.succeededIds),
-    summaries: new Map(round.emails.map((email) => [email.id, email])),
-    threadCache: new Map(),
-    totalBeforeLimit: round.totalBeforeLimit,
-    truncated: round.truncated,
-    userState: round.userState,
-  }
-  for (const email of details) registerResources(snapshot, email)
-  return snapshot
-}
-
-function demoDetailsForStoredRound(round: StoredReviewRound, apiOptions: ApiOptions) {
-  if (round.mode !== 'demo') return []
-  const byId = new Map((apiOptions.demoMessages ?? demoEmails).map((email) => [email.id, email]))
-  return round.emails
-    .map((email) => byId.get(email.id))
-    .filter((email): email is ReviewEmail => Boolean(email))
-}
-
-async function ensureSnapshot(id: string, apiOptions: ApiOptions) {
-  const existing = snapshots.get(id)
-  if (existing) {
-    existing.lastAccessedAt = Date.now()
-    return
-  }
-  const round = apiOptions.roundStore?.get(id)
-  if (!round) return
-  const details = demoDetailsForStoredRound(round, apiOptions)
-  if (round.analysis.status === 'running') {
-    round.analysis.status = 'pending'
-    round.analysis.phase = 'waiting'
-    apiOptions.roundStore?.updateAnalysis(
-      id,
-      { phase: 'waiting', status: 'pending' },
-      round.generation,
-    )
-  }
-  if (round.finalization.state === 'finalizing') {
-    apiOptions.roundStore?.saveFinalization(id, { state: 'active' })
-  }
-  const snapshot = storedSnapshot(round, details)
-  snapshots.set(id, snapshot)
-  if (snapshot.analysis.status !== 'complete' && autoStartBundles(apiOptions)) {
-    startPersistedAnalysisJob(round, apiOptions)
-  }
-}
-
-async function ensureMailContext(snapshot: StoredSnapshot, apiOptions: ApiOptions) {
-  if (snapshot.mode === 'demo' || snapshot.context) return
-  const token = apiOptions.fastmailToken?.trim()
-  if (!token)
-    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-  const resumed = await (apiOptions.resumeMailSnapshot ?? resumeSnapshot)(
-    token,
-    snapshot.emailIds,
-    snapshot.filters,
-  )
-  snapshot.context = resumed.context
-  snapshot.mailboxes = resumed.mailboxes
-}
-
-function snapshotPayload(
-  id: string,
-  snapshot: StoredSnapshot,
-  metadata: { missingIds?: string[]; totalBeforeLimit?: number; truncated?: boolean } = {},
-): ReviewSnapshot {
-  const userState: ReviewRoundUserState = snapshot.finalEmailIds
-    ? {
-        ...snapshot.userState,
-        keptUnreadIds: [...(snapshot.finalKeepIds ?? [])],
-        processedIds: [...snapshot.finalEmailIds],
-        secondaryActionIds: [...(snapshot.finalSecondaryActionIds ?? [])],
-      }
-    : snapshot.userState
-  return {
-    analysis: snapshot.analysis,
-    ...(snapshot.bundleRun ? { bundleRun: snapshot.bundleRun } : {}),
-    csrfToken: snapshot.csrfToken,
-    imageToken: snapshot.imageToken,
-    emails: snapshot.emailIds
-      .map((emailId) => snapshot.summaries.get(emailId))
-      .filter((email): email is ReviewEmailSummary => Boolean(email)),
-    filters: snapshot.filters,
-    finalization: {
-      result: snapshot.finalizationResult,
-      selectionLocked: Boolean(snapshot.finalEmailIds),
-      status: snapshot.finalizationState,
-    } satisfies ReviewFinalizationState,
-    missingIds: metadata.missingIds ?? snapshot.missingIds,
-    mode: snapshot.mode,
-    snapshotId: id,
-    totalBeforeLimit: metadata.totalBeforeLimit ?? snapshot.totalBeforeLimit,
-    truncated: metadata.truncated ?? snapshot.truncated,
-    userState,
-  }
-}
-
-const INCOMPLETE_SNAPSHOT_MESSAGE =
-  'Der gespeicherte Zwischenstand ist unvollständig, weil mindestens eine Nachricht nicht mehr verfügbar ist. Der Zwischenstand bleibt erhalten.'
-
-function runSummary(summary: StoredReviewRunSummary): ReviewRunSummary {
-  const { incompleteSnapshot } = summary
-  const { updatedAt: _analysisUpdatedAt, ...analysis } = summary.analysis
-  return {
-    analysis: incompleteSnapshot
-      ? {
-          ...analysis,
-          error: INCOMPLETE_SNAPSHOT_MESSAGE,
-          phase: 'failed',
-          status: 'pending',
-        }
-      : analysis,
-    createdAt: summary.createdAt,
-    csrfToken: summary.csrfToken,
-    emailCount: summary.emailCount,
-    filters: summary.filters,
-    generation: summary.generation,
-    id: summary.id,
-    mode: summary.mode,
-    reanalyzable: !incompleteSnapshot && summary.reanalyzable,
-    reviewStatus: summary.reviewStatus,
-    status: incompleteSnapshot ? 'failed' : summary.runStatus,
-    updatedAt: summary.updatedAt,
-  }
-}
-
-function storedRoundSummary(round: StoredReviewRound): ReviewRunSummary {
-  return runSummary({
-    analysis: round.analysis,
-    createdAt: round.createdAt,
-    csrfToken: round.csrfToken,
-    emailCount: round.emails.length,
-    filters: round.filters,
-    generation: round.generation,
-    id: round.id,
-    incompleteSnapshot: round.missingIds.length > 0,
-    mode: round.mode,
-    reanalyzable: isStoredReviewRoundReanalyzable(round),
-    reviewStatus: round.status,
-    runStatus: round.runStatus,
-    updatedAt: round.updatedAt,
-  })
-}
-
-function registerResources(snapshot: StoredSnapshot, email: ReviewEmail) {
-  for (const resource of [...email.inlineResources, ...email.attachments]) {
-    snapshot.blobMetadata.set(resource.blobId, resource)
-  }
-  const registered = snapshot.remoteImageIds.get(email.id) ?? new Map<string, string>()
-  for (const source of allowedRemoteImages(email)) {
-    if (registered.has(source)) continue
-    const imageId = randomBytes(18).toString('base64url')
-    registered.set(source, imageId)
-    snapshot.remoteImageSources.set(`${email.id}/${imageId}`, source)
-  }
-  snapshot.remoteImageIds.set(email.id, registered)
-}
-
-function emailPayload(snapshot: StoredSnapshot, email: ReviewEmail): ReviewEmail {
-  return {
-    ...email,
-    remoteImageIds: Object.fromEntries(snapshot.remoteImageIds.get(email.id) ?? []),
-  }
-}
-
-function getSnapshot(id: string) {
-  pruneSnapshots()
-  const snapshot = snapshots.get(id)
-  if (!snapshot) throw new ApiHttpError(410, 'REVIEW_EXPIRED', 'Diese Sitzung ist abgelaufen.')
-  snapshot.lastAccessedAt = Date.now()
-  return snapshot
-}
-
-function requireCsrf(req: IncomingMessage, snapshot: StoredSnapshot) {
-  validateOrigin(req)
-  if (req.headers['x-inbox-walk-csrf'] !== snapshot.csrfToken) {
-    throw new ApiHttpError(403, 'INVALID_CSRF', 'Ungültiger Sicherheitsschlüssel.')
-  }
-}
-
-function requireCurrentSnapshot(snapshotId: string, snapshot: StoredSnapshot) {
-  // Request-body/context awaits may outlive eviction, deletion or rehydration.
-  if (snapshots.get(snapshotId) !== snapshot) {
-    throw new ApiHttpError(
-      409,
-      'ROUND_RELOAD_REQUIRED',
-      'Der Rundenstand wurde neu geladen. Bitte die Runde erneut öffnen.',
-      true,
-    )
-  }
-}
-
-function requireMutableRoundState(snapshotId: string, snapshot: StoredSnapshot) {
-  requireCurrentSnapshot(snapshotId, snapshot)
-  if (snapshot.finalizationState === 'active' && !snapshot.finalEmailIds) return
-  throw new ApiHttpError(
-    409,
-    snapshot.finalizationState === 'finalized'
-      ? 'ROUND_FINALIZED'
-      : snapshot.finalEmailIds
-        ? 'FINALIZE_SELECTION_LOCKED'
-        : 'FINALIZE_IN_PROGRESS',
-    snapshot.finalizationState === 'finalized'
-      ? 'Diese Runde ist bereits abgeschlossen.'
-      : snapshot.finalEmailIds
-        ? 'Die Abschlussauswahl ist bereits festgeschrieben.'
-        : 'Der Review wird bereits abgeschlossen.',
-  )
-}
-
-function parseFilters(value: unknown) {
-  const parsed = filtersSchema.safeParse(value ?? defaultReviewFilters)
-  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_FILTERS', 'Ungültige Filter.')
-  return parsed.data
-}
-
-function updateReviewHistory(
-  history: ReviewHistory | undefined,
-  keptUnreadIds: ReadonlySet<string> | undefined,
-  markedReadIds: readonly string[],
-) {
-  if (!history) return
-  try {
-    if (keptUnreadIds?.size) history.rememberKeptUnread([...keptUnreadIds])
-    if (markedReadIds.length) history.forget(markedReadIds)
-  } catch (error) {
-    process.stderr.write(
-      `${JSON.stringify({
-        event: 'review_history_update_failed',
-        message: error instanceof Error ? error.message : 'unknown',
-      })}\n`,
-    )
-  }
-}
-
-function initialBackgroundAnalysis(
-  mode: 'demo' | 'live',
-  apiOptions: ApiOptions,
-): ReviewAnalysisState {
-  if (mode === 'demo') {
-    return {
-      callCount: 0,
-      engine: 'heuristic',
-      phase: 'queued',
-      processedEmailCount: 0,
-      progress: 0,
-      status: 'pending',
-      totalEmailCount: 0,
-    }
-  }
-  const auth = (apiOptions.codexAuthStatus ?? codexAuthStatus)()
-  const settings = selectedCodexSettings()
-  return {
-    callCount: 0,
-    engine: 'codex',
-    model: auth.model ?? settings.model,
-    thinkingLevel: auth.thinkingLevel ?? settings.thinkingLevel,
-    phase: 'queued',
-    processedEmailCount: 0,
-    progress: 0,
-    status: 'pending',
-    totalEmailCount: 0,
-  }
-}
-
-function filtersEqual(left: ReviewFilters, right: ReviewFilters) {
-  return JSON.stringify(left) === JSON.stringify(right)
-}
-
-function createBackgroundReview(
-  res: ServerResponse,
-  id: string,
-  filters: ReviewFilters,
-  apiOptions: ApiOptions,
-) {
-  const store = apiOptions.roundStore
-  if (!store) {
-    throw new ApiHttpError(
-      503,
-      'ROUND_STORE_UNAVAILABLE',
-      'Neue Runden können gerade nicht dauerhaft gespeichert werden.',
-      true,
-    )
-  }
-  const mode = apiOptions.forceDemo ? 'demo' : 'live'
-  const existing = store.get(id)
-  if (existing) {
-    if (existing.mode !== mode || !filtersEqual(existing.filters, filters)) {
-      throw new ApiHttpError(
-        409,
-        'ROUND_ID_CONFLICT',
-        'Diese Runden-ID wurde bereits für eine andere Auswahl verwendet.',
-      )
-    }
-    resumeIncompleteRuns(apiOptions)
-    return json(res, 202, storedRoundSummary(existing))
-  }
-  const created = store.create({
-    analysis: initialBackgroundAnalysis(mode, apiOptions),
-    bundleExamples: bundleExamplesForNewRound(apiOptions),
-    csrfToken: randomBytes(24).toString('base64url'),
-    emails: [],
-    filters,
-    generation: 1,
-    id,
-    imageToken: randomBytes(24).toString('base64url'),
-    mailboxes: [],
-    mode,
-    runStatus: 'queued',
-  })
-  startSnapshotJob(created, apiOptions)
-  return json(res, 202, storedRoundSummary(created))
-}
-
-function isAbortError(error: unknown) {
-  return error instanceof DOMException && error.name === 'AbortError'
-}
-
-function startSnapshotJob(round: StoredReviewRound, apiOptions: ApiOptions) {
-  const store = apiOptions.roundStore
-  if (jobsStopping || !store || snapshotJobs.has(round.id) || bundleJobs.has(round.id)) return
-  const controller = new AbortController()
-  jobControllers.set(round.id, { controller, generation: round.generation })
-  const fetchingAnalysis = {
-    error: null,
-    phase: 'fetching',
-    processedEmailCount: 0,
-    progress: 0.02,
-    status: 'running',
-    totalEmailCount: 0,
-  } satisfies Parameters<RoundStore['updateRunStatus']>[3]
-  if (
-    !persistBackgroundRunStatus(
-      'review_snapshot_fetching_persist_failed',
-      store,
-      round.id,
-      round.generation,
-      'fetching',
-      fetchingAnalysis,
-    )
-  ) {
-    persistBackgroundRunStatus(
-      'review_snapshot_start_failure_persist_failed',
-      store,
-      round.id,
-      round.generation,
-      'failed',
-      {
-        ...fetchingAnalysis,
-        error: 'Die Runde konnte nicht sicher gestartet werden. Prüfe den App-Speicher.',
-        phase: 'failed',
-        status: 'pending',
-      },
-    )
-    if (jobControllers.get(round.id)?.controller === controller) jobControllers.delete(round.id)
-    return
-  }
-  const work = withoutIoDeadline(async () => {
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    controller.signal.throwIfAborted()
-    const retainedIds = apiOptions.reviewHistory?.retainedIds() ?? new Set<string>()
-    let data: LiveSnapshotData
-    let details: ReviewEmail[] = []
-    if (round.mode === 'demo') {
-      details = filterDemoEmails(round.filters, retainedIds, apiOptions.demoMessages)
-      data = {
-        context: {
-          accountId: 'demo',
-          apiUrl: 'https://example.invalid',
-          downloadUrl: 'https://example.invalid',
-          maxObjectsInGet: 1,
-          maxObjectsInSet: 1,
-          username: 'demo',
-        },
-        emails: summariesFor(details),
-        filters: round.filters,
-        mailboxes: [
-          { id: 'Inbox', name: 'Inbox', role: 'inbox' },
-          { id: 'Newsletter', name: 'Newsletter' },
-          { id: 'Reisen', name: 'Reisen' },
-          { id: 'Spam', name: 'Spam', role: 'junk' },
-        ],
-        missingIds: [],
-        totalBeforeLimit: details.length,
-        truncated: false,
-      }
-    } else {
-      const token = apiOptions.fastmailToken?.trim()
-      if (!token) {
-        throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
-      }
-      data = await (apiOptions.fetchMailSnapshot ?? fetchUnreadSnapshot)(
-        token,
-        round.filters,
-        retainedIds,
-        controller.signal,
-      )
-    }
-    controller.signal.throwIfAborted()
-    const populated = store.populate(round.id, round.generation, {
-      analysis: {
-        error: null,
-        phase: 'indexing',
-        processedEmailCount: 0,
-        progress: 0,
-        status: 'pending',
-        totalEmailCount: data.emails.length,
-      },
-      emails: data.emails,
-      mailboxes: data.mailboxes,
-      missingIds: data.missingIds,
-      totalBeforeLimit: data.totalBeforeLimit,
-      truncated: data.truncated,
-    })
-    if (!populated) {
-      throw new DOMException('Review run was superseded or deleted.', 'AbortError')
-    }
-    if (populated.missingIds.length > 0) {
-      persistBackgroundRunStatus(
-        'review_snapshot_incomplete_persist_failed',
-        store,
-        round.id,
-        round.generation,
-        'failed',
-        {
-          error: INCOMPLETE_SNAPSHOT_MESSAGE,
-          phase: 'failed',
-          status: 'pending',
-        },
-      )
-      snapshots.delete(round.id)
-      return
-    }
-    const snapshot = storedSnapshot(populated, details)
-    if (round.mode === 'live') snapshot.context = data.context
-    snapshots.set(round.id, snapshot)
-    await startBundleJob(round.id, snapshot, apiOptions, {
-      expectedGeneration: round.generation,
-      failClosed: true,
-      signal: controller.signal,
-    })
-  })
-    .catch((error) => {
-      if (controller.signal.aborted || isAbortError(error)) return
-      process.stderr.write(
-        `${JSON.stringify({
-          event: 'review_snapshot_job_failed',
-          message: error instanceof Error ? error.message : 'unknown',
-        })}\n`,
-      )
-      persistBackgroundRunStatus(
-        'review_snapshot_failure_persist_failed',
-        store,
-        round.id,
-        round.generation,
-        'failed',
-        {
-          error:
-            error instanceof ApiHttpError || error instanceof JmapError
-              ? error.message
-              : 'Das Postfach konnte für diese Runde nicht vollständig geladen werden.',
-          phase: 'failed',
-          status: 'pending',
-        },
-      )
-    })
-    .finally(() => {
-      if (snapshotJobs.get(round.id) === work) snapshotJobs.delete(round.id)
-      const active = jobControllers.get(round.id)
-      if (active?.controller === controller) jobControllers.delete(round.id)
-    })
-  snapshotJobs.set(round.id, work)
-}
-
-function startPersistedAnalysisJob(round: StoredReviewRound, apiOptions: ApiOptions) {
-  if (jobsStopping || bundleJobs.has(round.id) || snapshotJobs.has(round.id)) return
-  const snapshot = storedSnapshot(round, demoDetailsForStoredRound(round, apiOptions))
-  snapshots.set(round.id, snapshot)
-  const controller = new AbortController()
-  jobControllers.set(round.id, { controller, generation: round.generation })
-  const cleanup = () => {
-    const active = jobControllers.get(round.id)
-    if (active?.controller === controller) jobControllers.delete(round.id)
-  }
-  let work: Promise<void>
-  try {
-    work = startBundleJob(round.id, snapshot, apiOptions, {
-      expectedGeneration: round.generation,
-      failClosed: true,
-      signal: controller.signal,
-    })
-  } catch (error) {
-    cleanup()
-    process.stderr.write(
-      `${JSON.stringify({
-        event: 'review_persisted_analysis_start_failed',
-        message: error instanceof Error ? error.message : 'unknown',
-      })}\n`,
-    )
-    persistBackgroundRunStatus(
-      'review_persisted_analysis_start_failure_persist_failed',
-      apiOptions.roundStore,
-      round.id,
-      round.generation,
-      'failed',
-      {
-        error: 'Die Analyse konnte nicht sicher gestartet werden.',
-        phase: 'failed',
-        status: 'pending',
-      },
-    )
-    return
-  }
-  void work.then(cleanup, cleanup)
-}
-
-function resumeIncompleteRuns(apiOptions: ApiOptions) {
-  const store = apiOptions.roundStore
-  if (!store) return
-  for (const summary of store.list()) {
-    if (summary.incompleteSnapshot) continue
-    if (
-      summary.runStatus !== 'queued' &&
-      summary.runStatus !== 'fetching' &&
-      summary.runStatus !== 'analyzing'
-    ) {
-      continue
-    }
-    const round = store.get(summary.id)
-    if (!round) continue
-    if (summary.runStatus === 'queued' || summary.runStatus === 'fetching') {
-      startSnapshotJob(round, apiOptions)
-    } else {
-      startPersistedAnalysisJob(round, apiOptions)
-    }
-  }
-}
-
-async function createReview(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  options: ApiOptions,
-) {
-  const filters = parseFilters(body.filters)
-  const id = z
-    .string()
-    .uuid()
-    .safeParse(body.id ?? randomUUID())
-  if (!id.success) throw new ApiHttpError(400, 'INVALID_ROUND_ID', 'Ungültige Runden-ID.')
-  return createBackgroundReview(res, id.data, filters, options)
-}
-
-function listReviews(res: ServerResponse, apiOptions: ApiOptions) {
-  if (!apiOptions.roundStore) return json(res, 200, { runs: [] })
-  resumeIncompleteRuns(apiOptions)
-  return json(res, 200, {
-    runs: apiOptions.roundStore.list().map(runSummary),
-  })
-}
-
-function requireReadyStoredRound(roundId: string, apiOptions: ApiOptions) {
-  const store = apiOptions.roundStore
-  if (!store) return
-  const round = store.get(roundId)
-  if (!round) {
-    throw new ApiHttpError(404, 'ROUND_NOT_FOUND', 'Diese Runde wurde nicht gefunden.')
-  }
-  if (round.missingIds.length > 0) {
-    throw new ApiHttpError(
-      409,
-      'ROUND_SNAPSHOT_INCOMPLETE',
-      INCOMPLETE_SNAPSHOT_MESSAGE,
-      false,
-      storedRoundSummary(round),
-    )
-  }
-  if (round.runStatus !== 'ready') {
-    throw new ApiHttpError(
-      409,
-      'ROUND_NOT_READY',
-      round.runStatus === 'failed'
-        ? round.analysis.error || 'Die Analyse dieser Runde ist fehlgeschlagen.'
-        : 'Diese Runde wird noch vorbereitet.',
-      round.runStatus !== 'failed',
-      storedRoundSummary(round),
-    )
-  }
-}
-
-function requireStoredRoundCsrf(req: IncomingMessage, round: StoredReviewRound) {
-  validateOrigin(req)
-  if (req.headers['x-inbox-walk-csrf'] !== round.csrfToken) {
-    throw new ApiHttpError(403, 'INVALID_CSRF', 'Ungültiger Sicherheitsschlüssel.')
-  }
-}
-
-function requireNoNonAbortableRoundWork(roundId: string) {
-  const snapshot = snapshots.get(roundId)
-  if (
-    !snapshot ||
-    (snapshot.nonAbortableRequests === 0 &&
-      snapshot.replyInFlight.size === 0 &&
-      snapshot.draftWork.size === 0)
-  ) {
-    return
-  }
-  throw new ApiHttpError(
-    409,
-    'ROUND_DRAFT_IN_PROGRESS',
-    'Die Runde kann nicht gelöscht oder neu analysiert werden, solange ein Entwurf erstellt oder gespeichert wird.',
-    true,
-  )
-}
-
-function deleteReview(
-  req: IncomingMessage,
-  res: ServerResponse,
-  roundId: string,
-  apiOptions: ApiOptions,
-) {
-  const store = apiOptions.roundStore
-  const round = store?.get(roundId)
-  if (!store || !round) {
-    throw new ApiHttpError(404, 'ROUND_NOT_FOUND', 'Diese Runde wurde nicht gefunden.')
-  }
-  requireStoredRoundCsrf(req, round)
-  if (round.finalization.state === 'finalizing') {
-    throw new ApiHttpError(
-      409,
-      'ROUND_FINALIZATION_IN_PROGRESS',
-      'Die Runde wird gerade abgeschlossen und kann erst danach gelöscht werden.',
-      true,
-    )
-  }
-  requireNoNonAbortableRoundWork(roundId)
-  jobControllers
-    .get(roundId)
-    ?.controller.abort(new DOMException('Review run deleted.', 'AbortError'))
-  snapshots.delete(roundId)
-  if (!store.delete(roundId)) {
-    throw new ApiHttpError(404, 'ROUND_NOT_FOUND', 'Diese Runde wurde nicht gefunden.')
-  }
-  securityHeaders(res)
-  res.statusCode = 204
-  res.setHeader('Cache-Control', 'no-store')
-  return res.end()
-}
-
-function reanalyzeReview(
-  req: IncomingMessage,
-  res: ServerResponse,
-  roundId: string,
-  apiOptions: ApiOptions,
-) {
-  const store = apiOptions.roundStore
-  const current = store?.get(roundId)
-  if (!store || !current) {
-    throw new ApiHttpError(404, 'ROUND_NOT_FOUND', 'Diese Runde wurde nicht gefunden.')
-  }
-  requireStoredRoundCsrf(req, current)
-  requireNoNonAbortableRoundWork(roundId)
-  if (current.missingIds.length > 0) {
-    throw new ApiHttpError(
-      409,
-      'ROUND_SNAPSHOT_INCOMPLETE',
-      INCOMPLETE_SNAPSHOT_MESSAGE,
-      false,
-      storedRoundSummary(current),
-    )
-  }
-  if (current.runStatus !== 'ready' && current.runStatus !== 'failed') {
-    throw new ApiHttpError(
-      409,
-      'ROUND_REANALYSIS_IN_PROGRESS',
-      'Diese Runde wird bereits vorbereitet oder analysiert.',
-    )
-  }
-  if (current.emails.length === 0 && current.runStatus === 'failed') {
-    throw new ApiHttpError(
-      409,
-      'ROUND_SNAPSHOT_MISSING',
-      'Diese Runde hat noch keinen vollständigen Nachrichtensnapshot.',
-    )
-  }
-  const auth =
-    current.mode === 'live'
-      ? (apiOptions.codexAuthStatus ?? codexAuthStatus)()
-      : { configured: false as const, ...selectedCodexSettings() }
-  const settings = selectedCodexSettings()
-  const previousJobs = [snapshotJobs.get(roundId), bundleJobs.get(roundId)].filter(
-    (job): job is Promise<void> => Boolean(job),
-  )
-  let restarted: StoredReviewRound | null
-  try {
-    restarted = store.reanalyze(roundId, {
-      callCount: 0,
-      engine: current.mode === 'live' ? 'codex' : 'heuristic',
-      error: null,
-      ...(current.mode === 'live' ? { model: auth.model ?? settings.model } : {}),
-      ...(current.mode === 'live'
-        ? { thinkingLevel: auth.thinkingLevel ?? settings.thinkingLevel }
-        : {}),
-      phase: 'indexing',
-      processedEmailCount: 0,
-      progress: 0,
-      status: 'pending',
-      totalEmailCount: current.emails.length,
-    })
-  } catch (error) {
-    if (error instanceof RoundReanalysisConflictError) {
-      throw new ApiHttpError(
-        409,
-        'ROUND_FINALIZATION_LOCKED',
-        'Diese Runde wird bereits abgeschlossen und kann nicht neu analysiert werden.',
-      )
-    }
-    throw error
-  }
-  if (!restarted) {
-    throw new ApiHttpError(409, 'ROUND_REANALYSIS_CONFLICT', 'Die Runde wurde bereits geändert.')
-  }
-  jobControllers
-    .get(roundId)
-    ?.controller.abort(new DOMException('Review analysis superseded.', 'AbortError'))
-  snapshots.delete(roundId)
-  if (previousJobs.length > 0) {
-    const transitionEpoch = jobLifecycleEpoch
-    const transition = Promise.allSettled(previousJobs)
-      .then(() => {
-        if (jobsStopping || transitionEpoch !== jobLifecycleEpoch) return
-        const latest = store.get(roundId)
-        if (latest?.generation === restarted?.generation && latest.runStatus === 'analyzing') {
-          startPersistedAnalysisJob(latest, apiOptions)
-        }
-      })
-      .catch((error) => {
-        process.stderr.write(
-          `${JSON.stringify({
-            event: 'review_reanalysis_handoff_failed',
-            message: error instanceof Error ? error.message : 'unknown',
-          })}\n`,
-        )
-        persistBackgroundRunStatus(
-          'review_reanalysis_handoff_failure_persist_failed',
-          store,
-          roundId,
-          restarted?.generation ?? current.generation + 1,
-          'failed',
-          {
-            error: 'Die erneute Analyse konnte nicht sicher gestartet werden.',
-            phase: 'failed',
-            status: 'pending',
-          },
-        )
-      })
-      .finally(() => jobTransitions.delete(transition))
-    jobTransitions.add(transition)
-  } else {
-    startPersistedAnalysisJob(restarted, apiOptions)
-  }
-  return json(res, 202, storedRoundSummary(restarted))
-}
-
-function requireCompleteResume(missingIds: readonly string[]) {
-  if (missingIds.length === 0) return
-  throw new ApiHttpError(409, 'ROUND_SNAPSHOT_INCOMPLETE', INCOMPLETE_SNAPSHOT_MESSAGE, false, {
-    missingCount: missingIds.length,
-  })
-}
-
-function orderedIdsEqual(left: readonly string[], right: readonly string[]) {
-  return left.length === right.length && left.every((id, index) => id === right[index])
-}
-
-function resumeInputMatches(
-  round: StoredReviewRound,
-  emailIds: readonly string[],
-  filters: ReviewFilters,
-  mode: 'demo' | 'live',
-) {
-  return (
-    round.mode === mode &&
-    filtersEqual(round.filters, filters) &&
-    orderedIdsEqual(
-      round.emails.map((email) => email.id),
-      emailIds,
-    )
-  )
-}
-
-function throwResumeIdConflict(): never {
-  throw new ApiHttpError(
-    409,
-    'ROUND_ID_CONFLICT',
-    'Diese Runden-ID wurde bereits für einen anderen Zwischenstand verwendet.',
-  )
-}
-
-async function createResumedRound(
-  id: string,
-  emailIds: string[],
-  filters: ReviewFilters,
-  options: ApiOptions,
-) {
-  const store = options.roundStore
-  if (!store) {
-    throw new ApiHttpError(
-      503,
-      'ROUND_STORE_UNAVAILABLE',
-      'Der alte Rundenstand kann gerade nicht dauerhaft gespeichert werden.',
-      true,
-    )
-  }
-  const mode = options.forceDemo ? 'demo' : 'live'
-  let snapshotData:
-    | (LiveSnapshotData & { details?: ReviewEmail[] })
-    | (Pick<LiveSnapshotData, 'emails' | 'filters' | 'mailboxes'> & {
-        details: ReviewEmail[]
-        missingIds: string[]
-        totalBeforeLimit: number
-        truncated: boolean
-      })
-  if (options.forceDemo) {
-    const wanted = new Set(emailIds)
-    const details = (options.demoMessages ?? demoEmails).filter((email) => wanted.has(email.id))
-    const missingIds = emailIds.filter((id) => !details.some((email) => email.id === id))
-    requireCompleteResume(missingIds)
-    const ordered = emailIds
-      .map((emailId) => details.find((email) => email.id === emailId))
-      .filter((email): email is ReviewEmail => Boolean(email))
-    snapshotData = {
-      details: ordered,
-      emails: summariesFor(ordered),
-      filters,
-      mailboxes: [
-        { id: 'Inbox', name: 'Inbox', role: 'inbox' },
-        { id: 'Spam', name: 'Spam', role: 'junk' },
-      ],
-      missingIds,
-      totalBeforeLimit: emailIds.length,
-      truncated: false,
-    }
-  } else {
-    const token = options.fastmailToken?.trim()
-    if (!token) {
-      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
-    }
-    snapshotData = await (options.resumeMailSnapshot ?? resumeSnapshot)(token, emailIds, filters)
-    requireCompleteResume(snapshotData.missingIds)
-  }
-
-  const existing = store.get(id)
-  if (existing) {
-    requireCompleteResume(existing.missingIds)
-    if (!resumeInputMatches(existing, emailIds, filters, mode)) throwResumeIdConflict()
-    resumeIncompleteRuns(options)
-    return existing
-  }
-
-  const stored = storeSnapshot({
-    ...snapshotData,
-    analysis: initialAnalysis(mode, snapshotData.emails.length, options),
-    bundleExamples: bundleExamplesForNewRound(options),
-    generation: 1,
-    mode,
-    snapshotId: id,
-  })
-  let persisted: StoredReviewRound | undefined
-  let created = true
-  try {
-    persisted = persistNewRound(id, stored.snapshot, store, {
-      missingIds: snapshotData.missingIds,
-      runStatus: 'analyzing',
-      totalBeforeLimit: snapshotData.totalBeforeLimit,
-      truncated: snapshotData.truncated,
-    })
-  } catch (error) {
-    const concurrent = store.get(id)
-    if (!concurrent || !resumeInputMatches(concurrent, emailIds, filters, mode)) {
-      snapshots.delete(id)
-      if (concurrent) throwResumeIdConflict()
-      throw error
-    }
-    requireCompleteResume(concurrent.missingIds)
-    snapshots.delete(id)
-    created = false
-    persisted = concurrent
-  }
-  if (!persisted) {
-    snapshots.delete(id)
-    throw new ApiHttpError(
-      503,
-      'ROUND_PERSIST_FAILED',
-      'Der alte Rundenstand konnte nicht dauerhaft gespeichert werden.',
-      true,
-    )
-  }
-  if (created) startPersistedAnalysisJob(persisted, options)
-  else resumeIncompleteRuns(options)
-  return persisted
-}
-
-async function resumeReview(
-  res: ServerResponse,
-  body: Record<string, unknown>,
-  options: ApiOptions,
-) {
-  const id = z.string().uuid().safeParse(body.id)
-  if (!id.success) throw new ApiHttpError(400, 'INVALID_ROUND_ID', 'Ungültige Runden-ID.')
-  const emailIds = z
-    .array(
-      z
-        .string()
-        .min(1)
-        .refine((emailId) => emailId.trim().length > 0),
-    )
-    .min(1)
-    .refine((ids) => new Set(ids).size === ids.length)
-    .safeParse(body.emailIds)
-  if (!emailIds.success) throw new ApiHttpError(400, 'INVALID_RESUME', 'Ungültiger Checkpoint.')
-  const filters = parseFilters(body.filters)
-  const mode = options.forceDemo ? 'demo' : 'live'
-  const store = options.roundStore
-  if (!store) {
-    throw new ApiHttpError(
-      503,
-      'ROUND_STORE_UNAVAILABLE',
-      'Der alte Rundenstand kann gerade nicht dauerhaft gespeichert werden.',
-      true,
-    )
-  }
-  const existing = store.get(id.data)
-  if (existing) {
-    requireCompleteResume(existing.missingIds)
-    if (!resumeInputMatches(existing, emailIds.data, filters, mode)) throwResumeIdConflict()
-    resumeIncompleteRuns(options)
-    return json(res, 202, storedRoundSummary(existing))
-  }
-  const active = resumeCreations.get(id.data)
-  if (active) {
-    if (
-      active.mode !== mode ||
-      !filtersEqual(active.filters, filters) ||
-      !orderedIdsEqual(active.emailIds, emailIds.data)
-    ) {
-      throwResumeIdConflict()
-    }
-    return json(res, 202, storedRoundSummary(await active.work))
-  }
-
-  const work = createResumedRound(id.data, emailIds.data, filters, options)
-  resumeCreations.set(id.data, { emailIds: emailIds.data, filters, mode, work })
-  try {
-    return json(res, 202, storedRoundSummary(await work))
-  } finally {
-    if (resumeCreations.get(id.data)?.work === work) resumeCreations.delete(id.data)
-  }
-}
-
-async function options(res: ServerResponse, apiOptions: ApiOptions) {
-  const codex = apiOptions.forceDemo
-    ? { configured: false, ...selectedCodexSettings() }
-    : (apiOptions.codexAuthStatus ?? codexAuthStatus)()
-  if (apiOptions.forceDemo) {
-    return json(res, 200, {
-      codex,
-      mode: 'demo',
-      reviewedCount: apiOptions.reviewHistory?.count() ?? 0,
-      mailboxes: [
-        { id: 'Inbox', name: 'Inbox', role: 'inbox' },
-        { id: 'Newsletter', name: 'Newsletter' },
-        { id: 'Reisen', name: 'Reisen' },
-        { id: 'Spam', name: 'Spam', role: 'junk' },
-      ],
-    })
-  }
-  const token = apiOptions.fastmailToken?.trim()
-  if (!token)
-    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht konfiguriert.')
-  const result = await fetchReviewOptions(token)
-  const retained = apiOptions.reviewHistory?.retainedSnapshot() ?? new Map<string, string>()
-  const retainedIds = new Set(retained.keys())
-  if (retainedIds.size > 0 && apiOptions.reviewHistory) {
-    const unreadIds = await fetchUnreadEmailIds(result.context, token, [...retainedIds])
-    apiOptions.reviewHistory.retainOnly(unreadIds, retained)
-  }
-  return json(res, 200, {
-    codex,
-    mode: 'live',
-    mailboxes: result.mailboxes,
-    reviewedCount: apiOptions.reviewHistory?.count() ?? 0,
-  })
 }
 
 export function safeCodexLoginUrl(value: string) {
@@ -1668,28 +275,6 @@ function codexLoginState(res: ServerResponse, id: string) {
   return json(res, 200, payload)
 }
 
-async function emailDetail(
-  res: ServerResponse,
-  snapshotId: string,
-  emailId: string,
-  apiOptions: ApiOptions,
-) {
-  const snapshot = getSnapshot(snapshotId)
-  if (!snapshot.summaries.has(emailId))
-    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-  let email = snapshot.detailCache.get(emailId)
-  if (!email) {
-    await ensureMailContext(snapshot, apiOptions)
-    const token = apiOptions.fastmailToken?.trim()
-    if (!token || !snapshot.context)
-      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-    email = await fetchEmailDetail(snapshot.context, token, emailId, snapshot.mailboxes)
-    snapshot.detailCache.set(emailId, email)
-    registerResources(snapshot, email)
-  }
-  return json(res, 200, emailPayload(snapshot, email))
-}
-
 function decodeHtmlAttribute(value: string) {
   return value
     .replace(/&amp;/gi, '&')
@@ -1725,22 +310,191 @@ function allowedRemoteImages(email: ReviewEmail) {
   return sources
 }
 
+function createMailCache(): MailCache {
+  return {
+    blobMetadata: new Map(),
+    details: new Map(),
+    draftResults: new Map(),
+    draftWork: new Map(),
+    remoteImageIds: new Map(),
+    remoteImageSources: new Map(),
+    replyInFlight: new Set(),
+    replyWork: new Map(),
+    threads: new Map(),
+  }
+}
+
+function registerResources(cache: MailCache, email: ReviewEmail) {
+  for (const resource of [...email.inlineResources, ...email.attachments]) {
+    cache.blobMetadata.set(resource.blobId, resource)
+  }
+  const registered = cache.remoteImageIds.get(email.id) ?? new Map<string, string>()
+  for (const source of allowedRemoteImages(email)) {
+    if (registered.has(source)) continue
+    const imageId = randomBytes(18).toString('base64url')
+    registered.set(source, imageId)
+    cache.remoteImageSources.set(`${email.id}/${imageId}`, source)
+  }
+  cache.remoteImageIds.set(email.id, registered)
+}
+
+function rememberDetail(cache: MailCache, email: ReviewEmail) {
+  if (cache.details.size >= MAX_CACHED_DETAILS) {
+    const oldest = cache.details.keys().next().value
+    if (oldest) {
+      cache.details.delete(oldest)
+      cache.threads.delete(oldest)
+    }
+  }
+  cache.details.set(email.id, email)
+  registerResources(cache, email)
+}
+
+function emailPayload(cache: MailCache, email: ReviewEmail): ReviewEmail {
+  return {
+    ...email,
+    remoteImageIds: Object.fromEntries(cache.remoteImageIds.get(email.id) ?? []),
+  }
+}
+
+function requireKnownEmail(store: TriageStore, emailId: string) {
+  const message = store.message(emailId)
+  if (!message) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
+  return message
+}
+
+function requireCsrf(req: IncomingMessage, store: TriageStore) {
+  validateOrigin(req)
+  const token = req.headers['x-inbox-walk-csrf']
+  if (token !== store.tokens().csrfToken) {
+    throw new ApiHttpError(403, 'INVALID_CSRF', 'Ungültiges Sitzungs-Token.')
+  }
+}
+
+function snapshot(options: ApiOptions): TriageSnapshot {
+  const { store, mailbox, engine } = options
+  const codex =
+    mailbox.mode === 'demo'
+      ? { configured: false, ...selectedCodexSettings() }
+      : (options.codexAuthStatus ?? codexAuthStatus)()
+  return {
+    buckets: store.todo(),
+    codex,
+    ...store.tokens(),
+    memory: store.memory(),
+    mode: mailbox.mode,
+    parked: store.parked(),
+    status: engine.status(),
+  }
+}
+
+async function loadDetail(cache: MailCache, mailbox: Mailbox, emailId: string) {
+  const cached = cache.details.get(emailId)
+  if (cached) return cached
+  const email = await mailbox.detail(emailId)
+  rememberDetail(cache, email)
+  return email
+}
+
+async function loadThread(cache: MailCache, mailbox: Mailbox, threadId: string) {
+  const cached = cache.threads.get(threadId)
+  if (cached) return cached
+  const messages = await mailbox.thread(threadId)
+  for (const email of messages) registerResources(cache, email)
+  cache.threads.set(threadId, messages)
+  return messages
+}
+
+async function loadIdentities(cache: MailCache, mailbox: Mailbox) {
+  if (cache.identities) return cache.identities
+  cache.identities = await mailbox.identities()
+  return cache.identities
+}
+
+async function todo(res: ServerResponse, options: ApiOptions) {
+  return json(res, 200, snapshot(options))
+}
+
+async function refresh(req: IncomingMessage, res: ServerResponse, options: ApiOptions) {
+  requireCsrf(req, options.store)
+  await options.engine.refresh()
+  return json(res, 200, snapshot(options))
+}
+
+/** Demo mode only: returns the sample inbox to its initial unread state. */
+async function demoReset(req: IncomingMessage, res: ServerResponse, options: ApiOptions) {
+  const { mailbox, store, engine } = options
+  if (mailbox.mode !== 'demo' || !mailbox.reset) {
+    throw new ApiHttpError(404, 'NOT_FOUND', 'Not found')
+  }
+  requireCsrf(req, store)
+  mailbox.reset()
+  store.reset()
+  await engine.refresh()
+  return json(res, 200, snapshot(options))
+}
+
+async function messageAction(
+  req: IncomingMessage,
+  res: ServerResponse,
+  action: 'done' | 'park' | 'unpark' | 'newsletter' | 'retry',
+  options: ApiOptions,
+) {
+  const { store, mailbox, engine } = options
+  requireCsrf(req, store)
+  const parsed = emailIdsSchema.safeParse(await readJson(req))
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_IDS', 'Ungültige Nachrichten-IDs.')
+  const emailIds = [...new Set(parsed.data.emailIds)]
+  for (const emailId of emailIds) requireKnownEmail(store, emailId)
+  const result: TriageActionResult = { failed: [], snapshot: snapshot(options) }
+  if (action === 'done') {
+    // Only an explicit user action marks mail read, and only the named IDs.
+    const marked = await mailbox.markRead(emailIds)
+    store.markDone(marked.markedIds)
+    result.failed = marked.failed
+    store.logEvent('user_done', { count: marked.markedIds.length })
+  } else if (action === 'park') {
+    store.park(emailIds)
+  } else if (action === 'unpark') {
+    store.unpark(emailIds)
+  } else if (action === 'newsletter') {
+    const tagged = await mailbox.tagNewsletter(emailIds)
+    result.failed = tagged.failed
+    store.logEvent('user_newsletter', { count: tagged.succeededIds.length })
+  } else {
+    store.resetAttempts(emailIds)
+    void engine.sort()
+  }
+  result.snapshot = snapshot(options)
+  return json(res, result.failed.length > 0 ? 207 : 200, result)
+}
+
+async function emailDetail(
+  res: ServerResponse,
+  cache: MailCache,
+  emailId: string,
+  options: ApiOptions,
+) {
+  requireKnownEmail(options.store, emailId)
+  const email = await loadDetail(cache, options.mailbox, emailId)
+  return json(res, 200, emailPayload(cache, email))
+}
+
 async function remoteImage(
   res: ServerResponse,
   url: URL,
-  snapshotId: string,
+  cache: MailCache,
   emailId: string,
   imageId: string,
+  options: ApiOptions,
 ) {
-  const snapshot = getSnapshot(snapshotId)
-  if (url.searchParams.get('token') !== snapshot.imageToken) {
+  if (url.searchParams.get('token') !== options.store.tokens().imageToken) {
     throw new ApiHttpError(403, 'INVALID_IMAGE_TOKEN', 'Ungültiger Bildzugriff.')
   }
-  if (!snapshot.summaries.has(emailId))
-    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-  if (!snapshot.detailCache.has(emailId))
+  requireKnownEmail(options.store, emailId)
+  if (!cache.details.has(emailId))
     throw new ApiHttpError(409, 'EMAIL_NOT_LOADED', 'Nachricht wurde noch nicht geladen.')
-  const source = snapshot.remoteImageSources.get(`${emailId}/${imageId}`)
+  const source = cache.remoteImageSources.get(`${emailId}/${imageId}`)
   if (!source) {
     throw new ApiHttpError(403, 'IMAGE_FORBIDDEN', 'Dieses Bild gehört nicht zur Nachricht.')
   }
@@ -1761,63 +515,18 @@ async function remoteImage(
   }
 }
 
-async function loadThread(snapshot: StoredSnapshot, threadId: string, apiOptions: ApiOptions) {
-  const cached = snapshot.threadCache.get(threadId)
-  if (cached) return cached
-  if (snapshot.mode === 'demo') {
-    const messages = (apiOptions.demoMessages ?? demoEmails)
-      .filter((email) => email.threadId === threadId)
-      .map((email) => ({ ...email, sentAt: null }))
-    snapshot.threadCache.set(threadId, messages)
-    return messages
-  }
-  await ensureMailContext(snapshot, apiOptions)
-  const token = apiOptions.fastmailToken?.trim()
-  if (!token || !snapshot.context)
-    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-  const messages = await fetchThread(snapshot.context, token, threadId, snapshot.mailboxes)
-  for (const email of messages) registerResources(snapshot, email)
-  snapshot.threadCache.set(threadId, messages)
-  return messages
-}
-
-async function loadIdentities(snapshot: StoredSnapshot, apiOptions: ApiOptions) {
-  if (snapshot.identities) return snapshot.identities
-  if (snapshot.mode === 'demo') {
-    snapshot.identities = [
-      {
-        id: 'demo-identity',
-        name: 'Alex',
-        email: 'alex@example.com',
-        textSignature: 'Viele Grüße\nAlex',
-        htmlSignature: '<div>Viele Grüße<br>Alex</div>',
-      },
-    ]
-    return snapshot.identities
-  }
-  await ensureMailContext(snapshot, apiOptions)
-  const token = apiOptions.fastmailToken?.trim()
-  if (!token || !snapshot.context)
-    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-  snapshot.identities = await fetchIdentities(snapshot.context, token)
-  return snapshot.identities
-}
-
 async function threadContext(
   res: ServerResponse,
-  snapshotId: string,
+  cache: MailCache,
   threadId: string,
   emailId: string,
-  apiOptions: ApiOptions,
+  options: ApiOptions,
 ) {
-  const snapshot = getSnapshot(snapshotId)
-  if (!snapshot.summaries.has(emailId))
-    throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-  const messages = await loadThread(snapshot, threadId, apiOptions)
-  const target = messages.find((message) => message.id === emailId)
-  if (!target)
+  requireKnownEmail(options.store, emailId)
+  const messages = await loadThread(cache, options.mailbox, threadId)
+  if (!messages.some((message) => message.id === emailId))
     throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht gehört nicht zu diesem Thread.')
-  const identities = await loadIdentities(snapshot, apiOptions)
+  const identities = await loadIdentities(cache, options.mailbox)
   const replyTarget = messages.at(-1)
   if (!replyTarget)
     throw new ApiHttpError(409, 'THREAD_EMPTY', 'Der Thread enthält keine Nachricht.')
@@ -1825,947 +534,25 @@ async function threadContext(
     messages,
     identities,
     recipients: computeReplyRecipients(replyTarget, identities),
-    attachmentManifest: uniqueResources(messages),
+    attachmentManifest: threadResources(messages),
   })
-}
-
-function publicBundleFailure(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error)
-  if (error instanceof CodexContextLengthError) {
-    return 'Die Runde ist für das Kontextfenster des in Codex konfigurierten Modells zu groß. Wähle einen kleineren Zeitraum oder stelle in Codex ein anderes Modell ein und analysiere dieselbe Runde erneut.'
-  }
-  if (/timeout|timed out|abort/i.test(message)) {
-    return 'Codex hat nicht rechtzeitig geantwortet. Analysiere dieselbe Runde erneut.'
-  }
-  if (/network|fetch|connect|econn|dns/i.test(message)) {
-    return 'Codex war nicht erreichbar. Analysiere dieselbe Runde erneut.'
-  }
-  return 'Die Zusammenhänge konnten nicht sicher bestimmt werden. Analysiere dieselbe Runde erneut.'
-}
-
-function persistAnalysisUpdate(event: string, action: () => unknown) {
-  try {
-    const result = action()
-    if (result === null || result === false) throw new Error('The round store rejected the update.')
-    return true
-  } catch (error) {
-    process.stderr.write(
-      `${JSON.stringify({
-        event,
-        message: error instanceof Error ? error.message : 'unknown',
-      })}\n`,
-    )
-    return false
-  }
-}
-
-function persistBackgroundRunStatus(
-  event: string,
-  store: RoundStore | undefined,
-  roundId: string,
-  generation: number,
-  status: 'fetching' | 'failed',
-  analysis: Parameters<RoundStore['updateRunStatus']>[3],
-) {
-  if (!store) return false
-  return persistAnalysisUpdate(event, () =>
-    store.updateRunStatus(roundId, generation, status, analysis),
-  )
-}
-
-function markAnalysisPersistenceFailure(snapshot: StoredSnapshot) {
-  snapshot.analysis = {
-    ...snapshot.analysis,
-    error:
-      'Das Analyseergebnis konnte nicht dauerhaft gespeichert werden. Lass diese Ansicht geöffnet und prüfe den App-Speicher.',
-  }
-}
-
-function persistFinalizationOrThrow(
-  store: RoundStore | undefined,
-  roundId: string,
-  update: RoundFinalizationUpdate,
-) {
-  if (!store) return
-  try {
-    const saved = store.saveFinalization(roundId, update)
-    if (!saved) throw new Error('The review round disappeared before finalization.')
-  } catch {
-    throw new ApiHttpError(
-      503,
-      'ROUND_PERSIST_FAILED',
-      'Der Abschluss konnte nicht dauerhaft gespeichert werden. Bitte versuche dieselbe Auswahl erneut.',
-      true,
-    )
-  }
-}
-
-function applyBundleProgress(
-  snapshotId: string,
-  snapshot: StoredSnapshot,
-  progress: BundleBuildProgress,
-  roundStore: RoundStore | undefined,
-  expectedGeneration?: number,
-) {
-  snapshot.analysis = {
-    callCount: progress.codexCallCount,
-    engine: progress.engine,
-    ...(progress.model ? { model: progress.model } : {}),
-    ...(snapshot.analysis.thinkingLevel ? { thinkingLevel: snapshot.analysis.thinkingLevel } : {}),
-    phase: progress.phase,
-    processedEmailCount: progress.processedEmailCount,
-    progress: progress.progress,
-    status: 'running',
-    totalEmailCount: progress.totalEmailCount,
-    ...(snapshot.analysis.error ? { error: snapshot.analysis.error } : {}),
-  }
-  if (roundStore) {
-    const updated = roundStore.updateAnalysis(snapshotId, snapshot.analysis, expectedGeneration)
-    if (!updated && expectedGeneration !== undefined) {
-      throw new DOMException('Review analysis was superseded or deleted.', 'AbortError')
-    }
-    if (!updated) {
-      process.stderr.write(`${JSON.stringify({ event: 'bundle_progress_persist_failed' })}\n`)
-    }
-  }
-}
-
-interface BundleJobContext {
-  expectedGeneration?: number
-  failClosed?: boolean
-  signal?: AbortSignal
-}
-
-function startBundleJob(
-  snapshotId: string,
-  snapshot: StoredSnapshot,
-  apiOptions: ApiOptions,
-  jobContext: BundleJobContext = {},
-): Promise<void> {
-  if (snapshot.bundleRun) return Promise.resolve()
-  const existingJob = bundleJobs.get(snapshotId)
-  if (existingJob) return existingJob
-  const emails = snapshot.emailIds
-    .map((id) => snapshot.summaries.get(id))
-    .filter((email): email is ReviewEmailSummary => Boolean(email))
-  const auth =
-    snapshot.mode === 'demo'
-      ? { configured: false as const }
-      : (apiOptions.codexAuthStatus ?? codexAuthStatus)()
-  const mustResumeWithCodex =
-    snapshot.mode === 'live' &&
-    snapshot.analysis.engine === 'codex' &&
-    !apiOptions.bundlePartitionDecider
-  if (mustResumeWithCodex && !auth.configured) {
-    snapshot.analysis = {
-      ...snapshot.analysis,
-      error: 'Codex muss erneut verbunden werden, bevor diese Analyse fortgesetzt werden kann.',
-      phase: 'waiting_for_codex',
-      status: 'pending',
-    }
-    if (jobContext.failClosed && apiOptions.roundStore) {
-      persistBackgroundRunStatus(
-        'bundle_waiting_for_codex_failure_persist_failed',
-        apiOptions.roundStore,
-        snapshotId,
-        jobContext.expectedGeneration ?? snapshot.generation,
-        'failed',
-        snapshot.analysis,
-      )
-    } else if (apiOptions.roundStore) {
-      persistAnalysisUpdate('bundle_waiting_for_codex_persist_failed', () =>
-        apiOptions.roundStore?.updateAnalysis(
-          snapshotId,
-          snapshot.analysis,
-          jobContext.expectedGeneration,
-        ),
-      )
-    }
-    return Promise.resolve()
-  }
-  const configuredModel = 'model' in auth ? auth.model : undefined
-  const persistedModel = snapshot.analysis.model
-  const frozenModel = isCodexModelId(persistedModel) ? persistedModel : configuredModel
-  const configuredThinkingLevel =
-    'thinkingLevel' in auth && isCodexThinkingLevel(auth.thinkingLevel)
-      ? auth.thinkingLevel
-      : selectedCodexSettings().thinkingLevel
-  const frozenThinkingLevel = isCodexThinkingLevel(snapshot.analysis.thinkingLevel)
-    ? snapshot.analysis.thinkingLevel
-    : configuredThinkingLevel
-  const frozenSpeed =
-    'speed' in auth && isCodexSpeed(auth.speed) ? auth.speed : selectedCodexSettings().speed
-  const providerDecidePartition =
-    apiOptions.bundlePartitionDecider ??
-    (snapshot.mode === 'live' && snapshot.analysis.engine === 'codex' && auth.configured
-      ? (input: Parameters<typeof runCodexBundlePartition>[0], signal?: AbortSignal) =>
-          runCodexBundlePartition(
-            input,
-            frozenModel ?? auth.model,
-            frozenThinkingLevel,
-            frozenSpeed,
-            signal ?? jobContext.signal,
-          )
-      : undefined)
-  const onCallStarted = (callCount: number) => {
-    snapshot.analysis = { ...snapshot.analysis, callCount }
-    const updated = apiOptions.roundStore?.updateAnalysis(
-      snapshotId,
-      snapshot.analysis,
-      jobContext.expectedGeneration,
-    )
-    if (!updated) throw new Error('The review round disappeared before a Codex decision.')
-  }
-  const onCallRolledBack = (callCount: number) => {
-    snapshot.analysis = { ...snapshot.analysis, callCount }
-    const updated = apiOptions.roundStore?.updateAnalysis(
-      snapshotId,
-      snapshot.analysis,
-      jobContext.expectedGeneration,
-    )
-    if (!updated) throw new Error('The review round disappeared after Codex auth failed.')
-  }
-  const checkpointedPartition =
-    providerDecidePartition && apiOptions.roundStore
-      ? createCheckpointedBundlePartitionDecider({
-          configuration: `${frozenModel ?? 'unknown'}:${frozenThinkingLevel}:prompt-${BUNDLE_PARTITION_PROMPT_VERSION}`,
-          decide: providerDecidePartition,
-          initialCallCount: snapshot.analysis.callCount,
-          ...(jobContext.expectedGeneration === undefined
-            ? {}
-            : { generation: jobContext.expectedGeneration }),
-          onCallRolledBack,
-          onCallStarted,
-          roundId: snapshotId,
-          shouldRollbackCall: (error) => error instanceof CodexAuthenticationError,
-          store: apiOptions.roundStore,
-        })
-      : undefined
-  const decidePartition: DecideBundlePartition =
-    checkpointedPartition?.decide ??
-    providerDecidePartition ??
-    (async (input) => heuristicBundlePartition(input.emails))
-  const codexCallCount = () => checkpointedPartition?.callCount() ?? snapshot.analysis.callCount
-  const engine = providerDecidePartition ? ('codex' as const) : ('heuristic' as const)
-  const model = frozenModel
-  const { error: _previousAnalysisError, ...previousAnalysis } = snapshot.analysis
-  snapshot.analysis = {
-    ...previousAnalysis,
-    engine,
-    ...(model ? { model } : {}),
-    ...(frozenThinkingLevel ? { thinkingLevel: frozenThinkingLevel } : {}),
-    phase: 'indexing',
-    status: 'running',
-  }
-  if (apiOptions.roundStore) {
-    const persisted = persistAnalysisUpdate('bundle_start_persist_failed', () =>
-      apiOptions.roundStore?.updateAnalysis(
-        snapshotId,
-        { ...snapshot.analysis, error: null },
-        jobContext.expectedGeneration,
-      ),
-    )
-    if (!persisted) {
-      snapshot.analysis = {
-        ...snapshot.analysis,
-        error: 'Die Analyse konnte nicht sicher gestartet werden. Prüfe den App-Speicher.',
-        phase: jobContext.failClosed ? 'failed' : 'waiting',
-        status: 'pending',
-      }
-      if (jobContext.failClosed && apiOptions.roundStore) {
-        persistBackgroundRunStatus(
-          'bundle_start_failure_persist_failed',
-          apiOptions.roundStore,
-          snapshotId,
-          jobContext.expectedGeneration ?? snapshot.generation,
-          'failed',
-          snapshot.analysis,
-        )
-      }
-      return Promise.resolve()
-    }
-  }
-  const work = withoutIoDeadline(async () => {
-    await new Promise<void>((resolve) => setImmediate(resolve))
-    jobContext.signal?.throwIfAborted()
-    try {
-      const buildOptions = {
-        codexCallCount: codexCallCount(),
-        engine,
-        ...(checkpointedPartition ? { getCodexCallCount: checkpointedPartition.callCount } : {}),
-        ...(model ? { model } : {}),
-        signal: jobContext.signal,
-        onProgress: (progress: BundleBuildProgress) =>
-          applyBundleProgress(
-            snapshotId,
-            snapshot,
-            progress,
-            apiOptions.roundStore,
-            jobContext.expectedGeneration,
-          ),
-      }
-      const run = await buildReviewBundlesFromPartition(
-        snapshotId,
-        emails,
-        decidePartition,
-        snapshot.bundleExamples,
-        buildOptions,
-      )
-      jobContext.signal?.throwIfAborted()
-      snapshot.bundleRun = run
-      snapshot.analysis = {
-        ...snapshot.analysis,
-        engine:
-          engine === 'codex' && snapshot.analysis.callCount === 0
-            ? 'heuristic'
-            : snapshot.analysis.engine,
-        phase: 'complete',
-        progress: 1,
-        status: 'complete',
-      }
-      if (apiOptions.roundStore) {
-        const persisted = persistAnalysisUpdate('bundle_result_persist_failed', () =>
-          apiOptions.roundStore?.saveBundleRun(
-            snapshotId,
-            run,
-            {
-              ...snapshot.analysis,
-              error: null,
-            },
-            jobContext.expectedGeneration,
-          ),
-        )
-        if (!persisted) {
-          snapshot.bundleRun = undefined
-          snapshot.analysis = {
-            ...snapshot.analysis,
-            error:
-              'Das Analyseergebnis konnte nicht dauerhaft gespeichert werden. Bitte analysiere dieselbe Runde erneut.',
-            phase: jobContext.failClosed ? 'failed' : 'waiting',
-            status: 'pending',
-          }
-          if (jobContext.failClosed && apiOptions.roundStore) {
-            persistBackgroundRunStatus(
-              'bundle_result_failure_persist_failed',
-              apiOptions.roundStore,
-              snapshotId,
-              jobContext.expectedGeneration ?? snapshot.generation,
-              'failed',
-              snapshot.analysis,
-            )
-          } else {
-            markAnalysisPersistenceFailure(snapshot)
-          }
-        }
-      }
-    } catch (error) {
-      if (
-        jobContext.signal?.aborted ||
-        (error instanceof DOMException && error.name === 'AbortError')
-      ) {
-        return
-      }
-      if (jobContext.failClosed) {
-        process.stderr.write(
-          `${JSON.stringify({
-            event: 'bundle_analysis_failed',
-            generation: jobContext.expectedGeneration ?? snapshot.generation,
-            message: error instanceof Error ? error.message : 'unknown',
-            roundId: snapshotId,
-          })}\n`,
-        )
-        snapshot.bundleRun = undefined
-        snapshot.analysis = {
-          ...snapshot.analysis,
-          error:
-            error instanceof CodexAuthenticationError
-              ? 'Codex muss erneut verbunden werden. Danach kannst du dieselbe Runde neu analysieren.'
-              : publicBundleFailure(error),
-          phase: 'failed',
-          status: 'pending',
-        }
-        persistBackgroundRunStatus(
-          'bundle_analysis_failure_persist_failed',
-          apiOptions.roundStore,
-          snapshotId,
-          jobContext.expectedGeneration ?? snapshot.generation,
-          'failed',
-          snapshot.analysis,
-        )
-        return
-      }
-      if (
-        error instanceof CodexAuthenticationError &&
-        engine === 'codex' &&
-        snapshot.mode === 'live'
-      ) {
-        snapshot.bundleRun = undefined
-        snapshot.analysis = {
-          ...snapshot.analysis,
-          callCount: codexCallCount(),
-          engine: 'codex',
-          error: 'Codex muss erneut verbunden werden, bevor diese Analyse fortgesetzt werden kann.',
-          phase: 'waiting_for_codex',
-          status: 'pending',
-        }
-        if (apiOptions.roundStore) {
-          const persisted = persistAnalysisUpdate('bundle_auth_wait_persist_failed', () =>
-            apiOptions.roundStore?.updateAnalysis(
-              snapshotId,
-              snapshot.analysis,
-              jobContext.expectedGeneration,
-            ),
-          )
-          if (!persisted) markAnalysisPersistenceFailure(snapshot)
-        }
-        return
-      }
-      process.stderr.write(
-        `${JSON.stringify({
-          event: 'bundle_analysis_failed',
-          generation: jobContext.expectedGeneration ?? snapshot.generation,
-          message: error instanceof Error ? error.message : 'unknown',
-          roundId: snapshotId,
-        })}\n`,
-      )
-      snapshot.bundleRun = undefined
-      snapshot.analysis = {
-        ...snapshot.analysis,
-        callCount: codexCallCount(),
-        error: publicBundleFailure(error),
-        phase: 'failed',
-        status: 'pending',
-      }
-      if (apiOptions.roundStore) {
-        const persisted = persistAnalysisUpdate('bundle_failure_persist_failed', () =>
-          apiOptions.roundStore?.updateAnalysis(
-            snapshotId,
-            snapshot.analysis,
-            jobContext.expectedGeneration,
-          ),
-        )
-        if (!persisted) markAnalysisPersistenceFailure(snapshot)
-      }
-    }
-  })
-    .catch((error) => {
-      if (
-        jobContext.signal?.aborted ||
-        (error instanceof DOMException && error.name === 'AbortError')
-      ) {
-        return
-      }
-      if (jobContext.failClosed) {
-        snapshot.bundleRun = undefined
-        snapshot.analysis = {
-          ...snapshot.analysis,
-          error: publicBundleFailure(error),
-          phase: 'failed',
-          status: 'pending',
-        }
-        persistBackgroundRunStatus(
-          'bundle_job_failure_persist_failed',
-          apiOptions.roundStore,
-          snapshotId,
-          jobContext.expectedGeneration ?? snapshot.generation,
-          'failed',
-          snapshot.analysis,
-        )
-        return
-      }
-      process.stderr.write(
-        `${JSON.stringify({
-          event: 'bundle_job_failed',
-          message: error instanceof Error ? error.message : 'unknown',
-        })}\n`,
-      )
-      snapshot.bundleRun = undefined
-      snapshot.analysis = {
-        ...snapshot.analysis,
-        error: publicBundleFailure(error),
-        phase: 'failed',
-        status: 'pending',
-      }
-      if (apiOptions.roundStore) {
-        const persisted = persistAnalysisUpdate('bundle_failure_persist_failed', () =>
-          apiOptions.roundStore?.updateAnalysis(
-            snapshotId,
-            snapshot.analysis,
-            jobContext.expectedGeneration,
-          ),
-        )
-        if (!persisted) markAnalysisPersistenceFailure(snapshot)
-      }
-    })
-    .finally(() => {
-      if (bundleJobs.get(snapshotId) === work) bundleJobs.delete(snapshotId)
-    })
-  bundleJobs.set(snapshotId, work)
-  return work
-}
-
-async function bundles(
-  req: IncomingMessage,
-  res: ServerResponse,
-  snapshotId: string,
-  apiOptions: ApiOptions,
-) {
-  const snapshot = getSnapshot(snapshotId)
-  requireCsrf(req, snapshot)
-  await readJson(req)
-  const storedRound = apiOptions.roundStore?.get(snapshotId)
-  const activeController = jobControllers.get(snapshotId)
-  const controller = activeController?.controller ?? new AbortController()
-  if (!activeController && storedRound) {
-    jobControllers.set(snapshotId, { controller, generation: storedRound.generation })
-  }
-  const work = startBundleJob(snapshotId, snapshot, apiOptions, {
-    ...(storedRound ? { expectedGeneration: storedRound.generation } : {}),
-    signal: controller.signal,
-  })
-  if (!activeController && storedRound) {
-    const cleanup = () => {
-      const active = jobControllers.get(snapshotId)
-      if (active?.controller === controller) jobControllers.delete(snapshotId)
-    }
-    void work.then(cleanup, cleanup)
-  }
-  return json(
-    res,
-    snapshot.analysis.status === 'complete' ? 200 : 202,
-    snapshotPayload(snapshotId, snapshot),
-  )
-}
-
-async function updateRoundState(
-  req: IncomingMessage,
-  res: ServerResponse,
-  snapshotId: string,
-  apiOptions: ApiOptions,
-) {
-  const snapshot = getSnapshot(snapshotId)
-  requireCsrf(req, snapshot)
-  requireMutableRoundState(snapshotId, snapshot)
-  const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
-  const parsed = z
-    .object({
-      revision: z.number().int().nonnegative(),
-      state: z.object({
-        bundleGroups: z.array(z.array(z.string().min(1)).min(1)),
-        index: z.number().int().nonnegative(),
-        keptUnreadIds: z.array(z.string().min(1)),
-        processedIds: z.array(z.string().min(1)),
-        replyDrafts: z.record(z.string(), replyEditorSchema),
-        secondaryActionIds: z.array(z.string().min(1)),
-        selectedMemberId: z.string().min(1).nullable(),
-      }),
-    })
-    .safeParse(body)
-  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_ROUND_STATE', 'Ungültiger Rundenstand.')
-  if (!apiOptions.roundStore && parsed.data.revision !== snapshot.userState.revision) {
-    throw new ApiHttpError(
-      409,
-      'ROUND_REVISION_CONFLICT',
-      'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
-    )
-  }
-  const known = new Set(snapshot.emailIds)
-  const state = parsed.data.state
-  const referencedIds = [
-    ...state.keptUnreadIds,
-    ...state.processedIds,
-    ...state.secondaryActionIds,
-    ...Object.keys(state.replyDrafts),
-    ...(state.selectedMemberId ? [state.selectedMemberId] : []),
-  ]
-  if (referencedIds.some((id) => !known.has(id))) {
-    throw new ApiHttpError(
-      400,
-      'UNKNOWN_EMAIL',
-      'Der Rundenstand enthält eine unbekannte Nachricht.',
-    )
-  }
-  for (const ids of [state.keptUnreadIds, state.processedIds, state.secondaryActionIds]) {
-    if (new Set(ids).size !== ids.length) {
-      throw new ApiHttpError(400, 'INVALID_ROUND_STATE', 'Der Rundenstand enthält doppelte IDs.')
-    }
-  }
-  if (state.bundleGroups.length > 0) {
-    try {
-      validateBundlePartition(
-        snapshot.emailIds,
-        state.bundleGroups.map((emailIds) => ({ emailIds })),
-      )
-    } catch {
-      throw new ApiHttpError(
-        400,
-        'INVALID_BUNDLE_GROUPS',
-        'Die gespeicherten Storys bilden die Runde nicht vollständig ab.',
-      )
-    }
-  }
-  if (
-    snapshot.filters.spam === 'exclude' &&
-    state.secondaryActionIds.some((id) => !snapshot.summaries.get(id)?.isNewsletter)
-  ) {
-    throw new ApiHttpError(
-      400,
-      'UNSUBSCRIBE_UNAVAILABLE',
-      'Nur erkannte Newsletter können für eine spätere Abmeldung markiert werden.',
-    )
-  }
-  // The request body can arrive slowly while another tab finalizes the round.
-  // Recheck immediately before the synchronous revision-guarded write.
-  requireMutableRoundState(snapshotId, snapshot)
-  if (apiOptions.roundStore) {
-    try {
-      snapshot.userState = apiOptions.roundStore.updateUserState(
-        snapshotId,
-        parsed.data.revision,
-        state,
-      ).userState
-    } catch (error) {
-      if (error instanceof RoundRevisionConflictError) {
-        throw new ApiHttpError(
-          409,
-          'ROUND_REVISION_CONFLICT',
-          'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
-          false,
-          { actualRevision: error.actualRevision },
-        )
-      }
-      if (error instanceof RoundNotFoundError) {
-        throw new ApiHttpError(404, 'ROUND_NOT_FOUND', 'Diese Runde wurde nicht gefunden.')
-      }
-      throw error
-    }
-  } else {
-    snapshot.userState = {
-      ...state,
-      revision: snapshot.userState.revision + 1,
-    }
-  }
-  return json(res, 200, snapshot.userState)
-}
-
-async function finalize(
-  req: IncomingMessage,
-  res: ServerResponse,
-  snapshotId: string,
-  apiOptions: ApiOptions,
-) {
-  const snapshot = getSnapshot(snapshotId)
-  requireCsrf(req, snapshot)
-  const body = await readJson(req, MAX_SELECTION_JSON_BYTES)
-  const revision = z.number().int().nonnegative().safeParse(body.revision)
-  const finalized = z.array(z.string().min(1)).min(1).safeParse(body.finalizeIds)
-  const kept = z.array(z.string().min(1)).safeParse(body.keepUnreadIds)
-  const secondaryAction = z
-    .array(z.string().min(1))
-    .safeParse(body.secondaryActionIds ?? body.unsubscribeIds ?? [])
-  if (!revision.success || !finalized.success || !kept.success || !secondaryAction.success)
-    throw new ApiHttpError(400, 'INVALID_SELECTION', 'Ungültige Auswahl.')
-  const requireCurrentRevision = () => {
-    const actualRevision =
-      apiOptions.roundStore?.get(snapshotId)?.userState.revision ?? snapshot.userState.revision
-    if (revision.data !== actualRevision) {
-      throw new ApiHttpError(
-        409,
-        'ROUND_REVISION_CONFLICT',
-        'Diese Runde wurde bereits in einem anderen Tab geändert. Bitte neu laden.',
-        false,
-        { actualRevision },
-      )
-    }
-  }
-  const requireFinalizeAvailable = () => {
-    requireCurrentSnapshot(snapshotId, snapshot)
-    if (snapshot.finalizationState === 'finalizing') {
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_IN_PROGRESS',
-        'Der Review wird bereits abgeschlossen.',
-        true,
-      )
-    }
-  }
-  requireCurrentRevision()
-  requireFinalizeAvailable()
-  const known = new Set(snapshot.emailIds)
-  if (finalized.data.some((id) => !known.has(id))) {
-    throw new ApiHttpError(
-      400,
-      'UNKNOWN_EMAIL',
-      'Die Abschlussauswahl enthält eine unbekannte Nachricht.',
-    )
-  }
-  if (kept.data.some((id) => !known.has(id))) {
-    throw new ApiHttpError(400, 'UNKNOWN_EMAIL', 'Die Auswahl enthält eine unbekannte Nachricht.')
-  }
-  if (secondaryAction.data.some((id) => !known.has(id))) {
-    throw new ApiHttpError(
-      400,
-      'UNKNOWN_EMAIL',
-      'Die Aktionsauswahl enthält eine unbekannte Nachricht.',
-    )
-  }
-  if (
-    snapshot.filters.spam === 'exclude' &&
-    secondaryAction.data.some((id) => !snapshot.summaries.get(id)?.isNewsletter)
-  ) {
-    throw new ApiHttpError(
-      400,
-      'UNSUBSCRIBE_UNAVAILABLE',
-      'Nur erkannte Newsletter können für eine spätere Abmeldung markiert werden.',
-    )
-  }
-  const requestedFinalize = new Set(finalized.data)
-  const requestedKeep = new Set(kept.data)
-  const requestedSecondaryAction = new Set(secondaryAction.data)
-  let selectionWasLocked = Boolean(snapshot.finalEmailIds)
-  const requireSameLockedSelection = () => {
-    const same = (requested: ReadonlySet<string>, locked: ReadonlySet<string> | undefined) =>
-      !locked || (requested.size === locked.size && [...requested].every((id) => locked.has(id)))
-    if (!same(requestedFinalize, snapshot.finalEmailIds)) {
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_SELECTION_LOCKED',
-        'Die Abschlussauswahl ist bereits festgeschrieben.',
-      )
-    }
-    if (!same(requestedKeep, snapshot.finalKeepIds)) {
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_SELECTION_LOCKED',
-        'Die Auswahl ist bereits festgeschrieben.',
-      )
-    }
-    if (!same(requestedSecondaryAction, snapshot.finalSecondaryActionIds)) {
-      throw new ApiHttpError(
-        409,
-        'FINALIZE_SELECTION_LOCKED',
-        'Die Aktionsauswahl ist bereits festgeschrieben.',
-      )
-    }
-  }
-  if ([...requestedKeep].some((id) => !requestedFinalize.has(id))) {
-    throw new ApiHttpError(
-      400,
-      'INVALID_SELECTION',
-      'Ungelesen geschützte Nachrichten müssen bereits bearbeitet sein.',
-    )
-  }
-  if ([...requestedSecondaryAction].some((id) => !requestedFinalize.has(id))) {
-    throw new ApiHttpError(
-      400,
-      'INVALID_SELECTION',
-      'Zusatzaktionen müssen zu bereits bearbeiteten Nachrichten gehören.',
-    )
-  }
-  requireSameLockedSelection()
-
-  if (snapshot.mode === 'live') {
-    await ensureMailContext(snapshot, apiOptions)
-    const token = apiOptions.fastmailToken?.trim()
-    if (!token || !snapshot.context)
-      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-  }
-  // Loading the live mailbox context can yield long enough for another tab to save
-  // a newer revision or lock a different final selection. Recheck immediately before
-  // the synchronous durable lock, which then runs without another await.
-  requireCurrentRevision()
-  requireFinalizeAvailable()
-  requireSameLockedSelection()
-  selectionWasLocked ||= Boolean(snapshot.finalEmailIds)
-  snapshot.finalEmailIds ??= requestedFinalize
-  snapshot.finalKeepIds ??= requestedKeep
-  snapshot.finalSecondaryActionIds ??= requestedSecondaryAction
-
-  const toMark = [...requestedFinalize].filter(
-    (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
-  )
-  const untouched = snapshot.emailIds.length - requestedFinalize.size
-  snapshot.finalizationState = 'finalizing'
-  try {
-    persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
-      actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({ id, reason })),
-      finalizeIds: [...requestedFinalize],
-      keepUnreadIds: [...requestedKeep],
-      secondaryActionIds: [...requestedSecondaryAction],
-      secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
-      state: 'finalizing',
-      succeededIds: [...snapshot.succeededIds],
-    })
-  } catch (error) {
-    snapshot.finalizationState = 'active'
-    if (!selectionWasLocked) {
-      snapshot.finalEmailIds = undefined
-      snapshot.finalKeepIds = undefined
-      snapshot.finalSecondaryActionIds = undefined
-    }
-    throw error
-  }
-  try {
-    if (snapshot.mode === 'demo') {
-      for (const id of toMark) snapshot.succeededIds.add(id)
-      for (const id of requestedSecondaryAction) snapshot.secondaryActionSucceededIds.add(id)
-      updateReviewHistory(apiOptions.reviewHistory, requestedKeep, [...snapshot.succeededIds])
-      snapshot.finalizationState = 'finalized'
-      const result: FinalizeResult = {
-        actionFailed: [],
-        failed: [],
-        finalized: true,
-        keptUnread: requestedKeep.size,
-        markedRead: snapshot.succeededIds.size,
-        mode: 'demo',
-        processed: requestedFinalize.size,
-        remaining: 0,
-        rescuedFromSpam:
-          snapshot.filters.spam === 'only' ? snapshot.secondaryActionSucceededIds.size : 0,
-        taggedForUnsubscribe:
-          snapshot.filters.spam === 'exclude' ? snapshot.secondaryActionSucceededIds.size : 0,
-        untouched,
-      }
-      snapshot.finalizationResult = result
-      persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
-        actionFailed: result.actionFailed,
-        failed: result.failed,
-        result,
-        secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
-        state: 'finalized',
-        succeededIds: [...snapshot.succeededIds],
-      })
-      return json(res, 200, result)
-    }
-    const token = apiOptions.fastmailToken?.trim()
-    if (!token || !snapshot.context)
-      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-    const pendingSecondaryActions = [...requestedSecondaryAction].filter(
-      (id) => !snapshot.secondaryActionSucceededIds.has(id),
-    )
-    const persistProgress = () =>
-      persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
-        secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
-        succeededIds: [...snapshot.succeededIds],
-        actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({ id, reason })),
-        state: 'finalizing',
-      })
-    const recordAction = (action: Awaited<ReturnType<typeof moveEmailsOutOfSpam>>) => {
-      for (const id of action.succeededIds) {
-        snapshot.secondaryActionSucceededIds.add(id)
-        snapshot.secondaryActionFailures.delete(id)
-      }
-      for (const failure of action.failed)
-        snapshot.secondaryActionFailures.set(failure.id, failure.reason)
-      persistProgress()
-    }
-    let keptHistoryRecorded = false
-    const recordRead = (update: Awaited<ReturnType<typeof markEmailsRead>>) => {
-      const newlyMarkedIds = update.markedIds.filter((id) => !snapshot.succeededIds.has(id))
-      for (const id of newlyMarkedIds) snapshot.succeededIds.add(id)
-      persistProgress()
-      updateReviewHistory(
-        apiOptions.reviewHistory,
-        keptHistoryRecorded ? undefined : requestedKeep,
-        newlyMarkedIds,
-      )
-      keptHistoryRecorded = true
-    }
-    if (pendingSecondaryActions.length > 0) {
-      const action =
-        snapshot.filters.spam === 'only'
-          ? await (apiOptions.moveOutOfSpam ?? moveEmailsOutOfSpam)(
-              snapshot.context,
-              token,
-              pendingSecondaryActions,
-              recordAction,
-            )
-          : await (apiOptions.tagForLaterUnsubscribe ?? tagEmailsForLaterUnsubscribe)(
-              snapshot.context,
-              token,
-              pendingSecondaryActions,
-              recordAction,
-            )
-      recordAction(action)
-    }
-    const update = await (apiOptions.markRead ?? markEmailsRead)(
-      snapshot.context,
-      token,
-      toMark,
-      recordRead,
-    )
-    recordRead(update)
-    const remainingRead = [...requestedFinalize].filter(
-      (id) => !requestedKeep.has(id) && !snapshot.succeededIds.has(id),
-    ).length
-    const remainingActions = [...requestedSecondaryAction].filter(
-      (id) => !snapshot.secondaryActionSucceededIds.has(id),
-    ).length
-    const remaining = remainingRead + remainingActions
-    snapshot.finalizationState = remaining === 0 ? 'finalized' : 'active'
-    const result: FinalizeResult = {
-      actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({ id, reason })),
-      failed: update.failed,
-      finalized: remaining === 0,
-      keptUnread: requestedKeep.size,
-      markedRead: snapshot.succeededIds.size,
-      mode: 'live',
-      processed: requestedFinalize.size,
-      remaining,
-      rescuedFromSpam:
-        snapshot.filters.spam === 'only' ? snapshot.secondaryActionSucceededIds.size : 0,
-      taggedForUnsubscribe:
-        snapshot.filters.spam === 'exclude' ? snapshot.secondaryActionSucceededIds.size : 0,
-      untouched,
-    }
-    snapshot.finalizationResult = result
-    persistFinalizationOrThrow(apiOptions.roundStore, snapshotId, {
-      actionFailed: result.actionFailed,
-      failed: result.failed,
-      result,
-      secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
-      state: snapshot.finalizationState,
-      succeededIds: [...snapshot.succeededIds],
-    })
-    return json(res, remaining > 0 ? 207 : 200, result)
-  } catch (error) {
-    snapshot.finalizationState = 'active'
-    if (apiOptions.roundStore) {
-      persistAnalysisUpdate('finalization_rollback_persist_failed', () =>
-        apiOptions.roundStore?.saveFinalization(snapshotId, {
-          actionFailed: [...snapshot.secondaryActionFailures].map(([id, reason]) => ({
-            id,
-            reason,
-          })),
-          secondaryActionSucceededIds: [...snapshot.secondaryActionSucceededIds],
-          state: 'active',
-          succeededIds: [...snapshot.succeededIds],
-        }),
-      )
-    }
-    throw error
-  }
 }
 
 async function blob(
   res: ServerResponse,
   url: URL,
-  snapshotId: string,
+  cache: MailCache,
   blobId: string,
-  apiOptions: ApiOptions,
+  options: ApiOptions,
 ) {
-  const snapshot = getSnapshot(snapshotId)
-  if (snapshot.mode !== 'live')
+  if (options.mailbox.mode !== 'live')
     throw new ApiHttpError(404, 'BLOB_NOT_FOUND', 'Datei nicht gefunden.')
-  const resource = snapshot.blobMetadata.get(blobId)
+  const resource = cache.blobMetadata.get(blobId)
   if (!resource) throw new ApiHttpError(403, 'BLOB_FORBIDDEN', 'Datei ist nicht freigegeben.')
   if (resource.size > MAX_DOWNLOAD_BYTES)
     throw new ApiHttpError(413, 'BLOB_TOO_LARGE', 'Datei ist größer als 100 MiB.')
-  const token = apiOptions.fastmailToken?.trim()
-  if (!token || !snapshot.context)
-    throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
   const signal = ioSignal(120_000)
-  const upstream = await downloadBlob(snapshot.context, token, resource, signal)
+  const upstream = await options.mailbox.downloadBlob(resource, signal)
   if (!upstream.body)
     throw new ApiHttpError(502, 'EMPTY_BLOB', 'Fastmail hat keine Dateidaten geliefert.', true)
   const inline =
@@ -2809,43 +596,27 @@ async function blob(
 async function reply(
   req: IncomingMessage,
   res: ServerResponse,
-  snapshotId: string,
-  apiOptions: ApiOptions,
+  cache: MailCache,
+  emailId: string,
+  options: ApiOptions,
 ) {
-  const snapshot = getSnapshot(snapshotId)
-  requireCsrf(req, snapshot)
-  snapshot.nonAbortableRequests += 1
-  try {
-    return await replyForSnapshot(req, res, snapshot, apiOptions)
-  } finally {
-    snapshot.nonAbortableRequests -= 1
-  }
-}
-
-async function replyForSnapshot(
-  req: IncomingMessage,
-  res: ServerResponse,
-  snapshot: StoredSnapshot,
-  apiOptions: ApiOptions,
-) {
-  const body = await readJson(req)
+  const { store, mailbox } = options
+  requireCsrf(req, store)
   const parsed = z
     .object({
-      emailId: z.string().min(1),
       requestId: z.string().uuid(),
       roughNotes: z.string().max(64_000),
       currentDraft: z.string().max(128_000).optional(),
       revisionInstruction: z.string().max(64_000).optional(),
     })
-    .safeParse(body)
+    .safeParse(await readJson(req))
   if (!parsed.success)
     throw new ApiHttpError(400, 'INVALID_REPLY_REQUEST', 'Ungültige Entwurfsanfrage.')
-  const { emailId, requestId } = parsed.data
-  const summary = snapshot.summaries.get(emailId)
-  if (!summary) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-  const existing = snapshot.replyCache.get(requestId)
+  const { requestId } = parsed.data
+  const { summary } = requireKnownEmail(store, emailId)
+  const existing = cache.replyWork.get(requestId)
   if (existing) return json(res, 200, await existing)
-  if (snapshot.replyInFlight.has(emailId)) {
+  if (cache.replyInFlight.has(emailId)) {
     throw new ApiHttpError(
       409,
       'REPLY_IN_PROGRESS',
@@ -2853,102 +624,69 @@ async function replyForSnapshot(
       true,
     )
   }
-  snapshot.replyInFlight.add(emailId)
+  cache.replyInFlight.add(emailId)
   const work = (async () => {
-    const messages = await loadThread(snapshot, summary.threadId, apiOptions)
-    if (snapshot.mode === 'demo') {
-      const result: ReplyProposal = {
-        attachmentManifest: uniqueResources(messages),
-        bodyText:
-          parsed.data.currentDraft?.trim() ||
-          parsed.data.roughNotes.trim() ||
-          'Danke für deine Nachricht. Ich melde mich dazu in Kürze noch einmal.',
-        questions: [],
-        requestId,
-        supportedDetails: [],
-        warnings: ['Demo-Modus: Es wurde keine Anfrage an Codex gesendet.'],
-      }
-      return result
+    const messages = await loadThread(cache, mailbox, summary.threadId)
+    if (mailbox.mode === 'live') {
+      const auth = (options.codexAuthStatus ?? codexAuthStatus)()
+      if (!auth.configured)
+        throw new ApiHttpError(
+          503,
+          'CODEX_NOT_CONFIGURED',
+          'Codex ist noch nicht mit dem ChatGPT-Abo angemeldet.',
+        )
     }
-    const token = apiOptions.fastmailToken?.trim()
-    if (!token || !snapshot.context)
-      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
-    const auth = (apiOptions.codexAuthStatus ?? codexAuthStatus)()
-    if (!auth.configured)
-      throw new ApiHttpError(
-        503,
-        'CODEX_NOT_CONFIGURED',
-        'Codex ist noch nicht mit dem ChatGPT-Abo angemeldet.',
-      )
-    const request: ReplyRequest = parsed.data
-    return await generateReply(snapshot.context, token, messages, request)
+    return await mailbox.generateReply(messages, parsed.data)
   })()
-  snapshot.replyCache.set(requestId, work)
+  cache.replyWork.set(requestId, work)
   try {
     return json(res, 200, await work)
   } catch (error) {
-    snapshot.replyCache.delete(requestId)
+    cache.replyWork.delete(requestId)
     throw error
   } finally {
-    snapshot.replyInFlight.delete(emailId)
+    cache.replyInFlight.delete(emailId)
   }
 }
 
 async function draft(
   req: IncomingMessage,
   res: ServerResponse,
-  snapshotId: string,
-  apiOptions: ApiOptions,
+  cache: MailCache,
+  emailId: string,
+  options: ApiOptions,
 ) {
-  const snapshot = getSnapshot(snapshotId)
-  requireCsrf(req, snapshot)
-  snapshot.nonAbortableRequests += 1
-  try {
-    return await draftForSnapshot(req, res, snapshot, apiOptions)
-  } finally {
-    snapshot.nonAbortableRequests -= 1
-  }
-}
-
-async function draftForSnapshot(
-  req: IncomingMessage,
-  res: ServerResponse,
-  snapshot: StoredSnapshot,
-  apiOptions: ApiOptions,
-) {
-  const body = await readJson(req)
+  const { store, mailbox } = options
+  requireCsrf(req, store)
   const parsed = z
     .object({
       requestId: z.string().uuid(),
-      emailId: z.string().min(1),
       identityId: z.string().min(1),
       to: z.array(addressSchema).min(1).max(100),
       cc: z.array(addressSchema).max(100),
       subject: z.string().min(1).max(998),
       bodyText: z.string().min(1).max(256_000),
     })
-    .safeParse(body)
+    .safeParse(await readJson(req))
   if (!parsed.success) throw new ApiHttpError(400, 'INVALID_DRAFT', 'Ungültige Draft-Daten.')
   const { requestId, ...draftPayload } = parsed.data
   const fingerprint = createHash('sha256').update(JSON.stringify(draftPayload)).digest('hex')
-  const existingFingerprint = snapshot.draftRequestFingerprints.get(requestId)
-  if (existingFingerprint && existingFingerprint !== fingerprint) {
+  const key = `${requestId}:${fingerprint}`
+  const cached = cache.draftResults.get(key)
+  if (cached) return json(res, 200, cached)
+  if ([...cache.draftResults.keys()].some((entry) => entry.startsWith(`${requestId}:`))) {
     throw new ApiHttpError(
       409,
       'DRAFT_REQUEST_CONFLICT',
       'Diese Draft-Anfrage wurde bereits mit anderem Inhalt verwendet. Bitte versuche es erneut.',
     )
   }
-  snapshot.draftRequestFingerprints.set(requestId, fingerprint)
-  const cached = snapshot.draftResults.get(parsed.data.requestId)
-  if (cached) return json(res, 200, cached)
-  const inFlight = snapshot.draftWork.get(parsed.data.requestId)
+  const inFlight = cache.draftWork.get(key)
   if (inFlight) return json(res, 200, await inFlight)
+  const { summary } = requireKnownEmail(store, emailId)
   const work = (async (): Promise<DraftResult> => {
-    const summary = snapshot.summaries.get(parsed.data.emailId)
-    if (!summary) throw new ApiHttpError(404, 'EMAIL_NOT_FOUND', 'Nachricht nicht gefunden.')
-    const messages = await loadThread(snapshot, summary.threadId, apiOptions)
-    const identities = await loadIdentities(snapshot, apiOptions)
+    const messages = await loadThread(cache, mailbox, summary.threadId)
+    const identities = await loadIdentities(cache, mailbox)
     const identity = identities.find((item) => item.id === parsed.data.identityId)
     if (!identity) throw new ApiHttpError(400, 'INVALID_IDENTITY', 'Unbekannte Absenderidentität.')
     const latest = messages.at(-1)
@@ -2958,19 +696,8 @@ async function draftForSnapshot(
       ? identity.htmlSignature
       : escapeDraftHtml(identity.textSignature.trim())
     const bodyHtml = `${escapeDraftHtml(parsed.data.bodyText.trim())}${htmlSignature ? `<br><br>${htmlSignature}` : ''}`
-    if (snapshot.mode === 'demo') {
-      return {
-        draftId: `demo-draft-${parsed.data.requestId}`,
-        recovered: false,
-        threadId: summary.threadId,
-        verified: true,
-      }
-    }
-    const token = apiOptions.fastmailToken?.trim()
-    if (!token || !snapshot.context)
-      throw new ApiHttpError(503, 'FASTMAIL_NOT_CONFIGURED', 'Fastmail ist nicht verfügbar.')
     const references = [...new Set([...latest.references, ...latest.messageId])]
-    return await createAndVerifyDraft(snapshot.context, token, {
+    return await mailbox.createDraft({
       bodyHtml,
       bodyText,
       cc: parsed.data.cc,
@@ -2982,17 +709,60 @@ async function draftForSnapshot(
       to: parsed.data.to,
     })
   })()
-  snapshot.draftWork.set(parsed.data.requestId, work)
+  cache.draftWork.set(key, work)
   try {
     const result = await work
-    snapshot.draftResults.set(parsed.data.requestId, result)
+    cache.draftResults.set(key, result)
+    store.logEvent('user_draft', { threadId: summary.threadId })
     return json(res, 201, result)
-  } catch (error) {
-    snapshot.draftRequestFingerprints.delete(requestId)
-    throw error
   } finally {
-    snapshot.draftWork.delete(parsed.data.requestId)
+    cache.draftWork.delete(key)
   }
+}
+
+function replyEditor(res: ServerResponse, emailId: string, options: ApiOptions) {
+  requireKnownEmail(options.store, emailId)
+  return json(res, 200, { editor: options.store.replyEditor(emailId) })
+}
+
+async function saveReplyEditor(
+  req: IncomingMessage,
+  res: ServerResponse,
+  emailId: string,
+  options: ApiOptions,
+) {
+  requireCsrf(req, options.store)
+  requireKnownEmail(options.store, emailId)
+  const parsed = z.object({ editor: replyEditorSchema }).safeParse(await readJson(req))
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_EDITOR', 'Ungültiger Entwurfsstand.')
+  options.store.saveReplyEditor(emailId, parsed.data.editor as ReplyEditorState)
+  return json(res, 200, { editor: parsed.data.editor })
+}
+
+async function saveMemory(req: IncomingMessage, res: ServerResponse, options: ApiOptions) {
+  requireCsrf(req, options.store)
+  const parsed = z
+    .object({ notes: z.string().max(TRIAGE_MEMORY_MAX_LENGTH) })
+    .safeParse(await readJson(req))
+  if (!parsed.success) throw new ApiHttpError(400, 'INVALID_MEMORY', 'Ungültige Notizen.')
+  return json(res, 200, options.store.setMemoryNotes(parsed.data.notes))
+}
+
+function decideProposal(
+  req: IncomingMessage,
+  res: ServerResponse,
+  id: string,
+  accept: boolean,
+  options: ApiOptions,
+) {
+  requireCsrf(req, options.store)
+  if (accept) {
+    const memory = options.store.acceptProposal(id)
+    if (!memory) throw new ApiHttpError(404, 'PROPOSAL_NOT_FOUND', 'Vorschlag nicht gefunden.')
+    return json(res, 200, memory)
+  }
+  options.store.rejectProposal(id)
+  return json(res, 200, options.store.memory())
 }
 
 function logApiError(error: unknown) {
@@ -3019,6 +789,9 @@ function handleError(res: ServerResponse, error: unknown) {
     const status = error.status === 401 ? 401 : error.status === 404 ? 404 : 502
     return apiError(res, status, error.code, error.message, status >= 500, error.details)
   }
+  if (error instanceof TriageStoreError) {
+    return apiError(res, error.code === 'INVALID_BUCKET' ? 400 : 404, error.code, error.message)
+  }
   if (error instanceof ReplyError) {
     return apiError(res, error.status, error.code, error.message, error.retryable, error.details)
   }
@@ -3037,7 +810,8 @@ function handleError(res: ServerResponse, error: unknown) {
   return apiError(res, 500, 'INTERNAL_ERROR', 'Ein interner Fehler ist aufgetreten.', true)
 }
 
-export function createApiMiddleware(apiOptions: ApiOptions = {}) {
+export function createApiMiddleware(apiOptions: ApiOptions) {
+  const cache = createMailCache()
   return (req: IncomingMessage, res: ServerResponse, next: () => void) =>
     withIoDeadline(async () => {
       if (!req.url?.startsWith('/api/')) return next()
@@ -3048,116 +822,79 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
           return json(
             res,
             200,
-            apiOptions.forceDemo
+            apiOptions.mailbox.mode === 'demo'
               ? { configured: false, ...selectedCodexSettings() }
               : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
-          )
-        }
-        if (req.method === 'GET' && url.pathname === '/api/settings/codex') {
-          return json(
-            res,
-            200,
-            apiOptions.forceDemo
-              ? { configured: false, ...selectedCodexSettings() }
-              : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
-          )
-        }
-        if (
-          (req.method === 'POST' || req.method === 'PUT') &&
-          url.pathname === '/api/settings/codex'
-        ) {
-          validateOrigin(req)
-          throw new ApiHttpError(
-            405,
-            'CODEX_SETTINGS_READ_ONLY',
-            'Modell, Denkaufwand und Geschwindigkeit werden aus der Codex-Konfiguration gelesen.',
           )
         }
         if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
           validateOrigin(req)
           return await startCodexLogin(res, apiOptions)
         }
-        if (
-          req.method === 'GET' &&
-          parts[0] === 'api' &&
-          parts[1] === 'auth' &&
-          parts[2] === 'codex' &&
-          parts[3]
-        ) {
+        if (req.method === 'GET' && parts[1] === 'auth' && parts[2] === 'codex' && parts[3]) {
           return codexLoginState(res, parts[3])
         }
-        if (req.method === 'GET' && url.pathname === '/api/review/options') {
-          return await options(res, apiOptions)
-        }
-        if (req.method === 'GET' && url.pathname === '/api/reviews') {
+        if (parts[1] !== 'todo') return apiError(res, 404, 'NOT_FOUND', 'Not found')
+        if (req.method === 'GET' && !parts[2]) {
           validateOrigin(req)
-          return listReviews(res, apiOptions)
+          return await todo(res, apiOptions)
         }
-        if (req.method === 'POST' && url.pathname === '/api/reviews') {
-          validateOrigin(req)
-          return await createReview(res, await readJson(req), apiOptions)
+        if (req.method === 'POST' && parts[2] === 'refresh' && !parts[3]) {
+          return await refresh(req, res, apiOptions)
         }
-        if (req.method === 'POST' && url.pathname === '/api/reviews/resume') {
-          validateOrigin(req)
-          return await resumeReview(res, await readJson(req, MAX_SELECTION_JSON_BYTES), apiOptions)
+        if (req.method === 'POST' && parts[2] === 'demo-reset' && !parts[3]) {
+          return await demoReset(req, res, apiOptions)
         }
-        if (parts[0] === 'api' && parts[1] === 'reviews' && parts[2]) {
-          const snapshotId = parts[2]
-          if (req.method === 'DELETE' && !parts[3]) {
-            return deleteReview(req, res, snapshotId, apiOptions)
+        if (req.method === 'POST' && parts[2] === 'messages' && parts[3] && !parts[4]) {
+          const action = parts[3]
+          if (['done', 'park', 'unpark', 'newsletter', 'retry'].includes(action)) {
+            return await messageAction(req, res, action as never, apiOptions)
           }
-          if (req.method === 'POST' && parts[3] === 'reanalyze' && !parts[4]) {
-            return reanalyzeReview(req, res, snapshotId, apiOptions)
+        }
+        if (req.method === 'PUT' && parts[2] === 'memory' && !parts[3]) {
+          return await saveMemory(req, res, apiOptions)
+        }
+        if (
+          req.method === 'POST' &&
+          parts[2] === 'memory' &&
+          parts[3] === 'proposals' &&
+          parts[4]
+        ) {
+          if (parts[5] === 'accept') return decideProposal(req, res, parts[4], true, apiOptions)
+          if (parts[5] === 'reject') return decideProposal(req, res, parts[4], false, apiOptions)
+        }
+        if (parts[2] === 'emails' && parts[3]) {
+          const emailId = parts[3]
+          if (req.method === 'GET' && !parts[4]) {
+            return await emailDetail(res, cache, emailId, apiOptions)
           }
-          if (req.method === 'GET' && !parts[3] && apiOptions.roundStore) {
-            resumeIncompleteRuns(apiOptions)
+          if (req.method === 'GET' && parts[4] === 'images' && parts[5]) {
+            return await remoteImage(res, url, cache, emailId, parts[5], apiOptions)
           }
-          requireReadyStoredRound(snapshotId, apiOptions)
-          await ensureSnapshot(snapshotId, apiOptions)
-          if (req.method === 'GET' && !parts[3]) {
-            validateOrigin(req)
-            const snapshot = getSnapshot(snapshotId)
-            return json(res, 200, snapshotPayload(snapshotId, snapshot))
+          if (req.method === 'GET' && parts[4] === 'editor') {
+            return replyEditor(res, emailId, apiOptions)
           }
-          if (
-            req.method === 'GET' &&
-            parts[3] === 'emails' &&
-            parts[4] &&
-            parts[5] === 'images' &&
-            parts[6]
-          ) {
-            return await remoteImage(res, url, snapshotId, parts[4], parts[6])
+          if (req.method === 'PUT' && parts[4] === 'editor') {
+            return await saveReplyEditor(req, res, emailId, apiOptions)
           }
-          if (req.method === 'GET' && parts[3] === 'emails' && parts[4] && !parts[5]) {
-            return await emailDetail(res, snapshotId, parts[4], apiOptions)
+          if (req.method === 'POST' && parts[4] === 'replies') {
+            return await reply(req, res, cache, emailId, apiOptions)
           }
-          if (req.method === 'GET' && parts[3] === 'threads' && parts[4]) {
-            return await threadContext(
-              res,
-              snapshotId,
-              parts[4],
-              url.searchParams.get('emailId') ?? '',
-              apiOptions,
-            )
+          if (req.method === 'POST' && parts[4] === 'drafts') {
+            return await draft(req, res, cache, emailId, apiOptions)
           }
-          if (req.method === 'GET' && parts[3] === 'blobs' && parts[4]) {
-            return await blob(res, url, snapshotId, parts[4], apiOptions)
-          }
-          if (req.method === 'POST' && parts[3] === 'finalize') {
-            return await finalize(req, res, snapshotId, apiOptions)
-          }
-          if (req.method === 'POST' && parts[3] === 'bundles' && !parts[4]) {
-            return await bundles(req, res, snapshotId, apiOptions)
-          }
-          if (req.method === 'POST' && parts[3] === 'state') {
-            return await updateRoundState(req, res, snapshotId, apiOptions)
-          }
-          if (req.method === 'POST' && parts[3] === 'replies') {
-            return await reply(req, res, snapshotId, apiOptions)
-          }
-          if (req.method === 'POST' && parts[3] === 'drafts') {
-            return await draft(req, res, snapshotId, apiOptions)
-          }
+        }
+        if (req.method === 'GET' && parts[2] === 'threads' && parts[3]) {
+          return await threadContext(
+            res,
+            cache,
+            parts[3],
+            url.searchParams.get('emailId') ?? '',
+            apiOptions,
+          )
+        }
+        if (req.method === 'GET' && parts[2] === 'blobs' && parts[3]) {
+          return await blob(res, url, cache, parts[3], apiOptions)
         }
         return apiError(res, 404, 'NOT_FOUND', 'Not found')
       } catch (error) {
@@ -3167,42 +904,6 @@ export function createApiMiddleware(apiOptions: ApiOptions = {}) {
 }
 
 export function clearApiStateForTests() {
-  jobsStopping = true
-  jobLifecycleEpoch += 1
-  for (const job of jobControllers.values()) {
-    job.controller.abort(new DOMException('Test API state cleared.', 'AbortError'))
-  }
-  snapshots.clear()
-  bundleJobs.clear()
-  snapshotJobs.clear()
-  jobTransitions.clear()
-  jobControllers.clear()
-  resumeCreations.clear()
   for (const state of codexLogins.values()) state.controller.abort()
   codexLogins.clear()
-  jobsStopping = false
-}
-
-export function abortApiJobs() {
-  jobsStopping = true
-  jobLifecycleEpoch += 1
-  for (const job of jobControllers.values()) {
-    job.controller.abort(new DOMException('Server shutting down.', 'AbortError'))
-  }
-}
-
-export async function waitForApiJobs() {
-  while (
-    snapshotJobs.size > 0 ||
-    bundleJobs.size > 0 ||
-    jobTransitions.size > 0 ||
-    resumeCreations.size > 0
-  ) {
-    await Promise.allSettled([
-      ...snapshotJobs.values(),
-      ...bundleJobs.values(),
-      ...jobTransitions.values(),
-      ...[...resumeCreations.values()].map((creation) => creation.work),
-    ])
-  }
 }
