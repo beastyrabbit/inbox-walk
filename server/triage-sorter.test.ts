@@ -149,6 +149,8 @@ describe('triage tools', () => {
     expect(htmlToText('<style>noise<p>Order 123</p>')).toContain('Order 123')
     expect(htmlToText('<style data=">">Order 123')).toBe('Order 123')
     expect(htmlToText('<p title="a>b">Text</p>')).toBe('Text')
+    expect(htmlToText('Amount < 50 EUR')).toBe('Amount < 50 EUR')
+    expect(htmlToText('<style data="x>Amount < 50 EUR')).toContain('Amount < 50 EUR')
     const started = performance.now()
     expect(htmlToText(`${'<style>'.repeat(50_000)}Order 123`)).toContain('Order 123')
     expect(performance.now() - started).toBeLessThan(500)

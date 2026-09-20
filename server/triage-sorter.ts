@@ -182,7 +182,10 @@ export function triagePrompt(batch: readonly TriageMessage[], buckets: TriageBuc
 }
 
 /** Removes every `<tag …>…</tag>` block without regex backtracking over untrusted HTML. */
-/** Index just past the `>` that ends the tag opened at `start`, honouring quoted attributes. */
+/**
+ * Index just past the `>` that ends the tag opened at `start`, honouring
+ * quoted attributes. Returns -1 when the tag is never closed.
+ */
 function tagEnd(html: string, start: number) {
   let quote: string | undefined
   for (let index = start + 1; index < html.length; index += 1) {
@@ -195,7 +198,7 @@ function tagEnd(html: string, start: number) {
       return index + 1
     }
   }
-  return html.length
+  return -1
 }
 
 /** Removes every `<tag …>…</tag>` block in one linear pass over untrusted HTML. */
@@ -222,7 +225,9 @@ function stripElements(html: string, tag: string) {
     if (end < 0) {
       closeMissing = true
       // Unclosed block in malformed mail: drop only the tag, keep the text after it.
-      cursor = tagEnd(html, start)
+      const end = tagEnd(html, start)
+      cursor = end < 0 ? start + open.length : end
+      if (end < 0) output += html.slice(start, cursor)
       continue
     }
     cursor = end + close.length
@@ -241,6 +246,7 @@ function stripTags(html: string) {
     const start = html.indexOf('<', cursor)
     if (start < 0) break
     const end = tagEnd(html, start)
+    if (end < 0) break
     output += html.slice(cursor, start)
     output += BLOCK_TAG.test(html.slice(start, end)) ? '\n' : ' '
     cursor = end
