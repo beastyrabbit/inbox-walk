@@ -6,7 +6,7 @@ and makes every mailbox mutation explicit and recoverable.
 
 ## Todo contract
 
-1. Poll Fastmail for unread, non-draft incoming mail outside Spam about once a minute. Queue every new message with its summary only.
+1. Keep a JMAP push connection to Fastmail and refresh on every Email state change, plus a poll about once a minute as fallback. Each refresh lists unread, non-draft incoming mail outside Spam and queues every new message with its summary only.
 2. Drop a message from the todo when it is no longer unread in Fastmail, whatever changed it. Never re-queue a message this app marked done within the last two minutes.
 3. Show queued messages as unsorted entries at the top until a bucket claims them. They can be opened, read, replied to, parked, and marked done like any other message.
 4. A bucket is one real-world story. It is open while it has at least one sorted, unread member and closes on its own when the last member is done or parked. New mail that continues a closed story reopens it.

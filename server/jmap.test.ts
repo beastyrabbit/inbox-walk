@@ -8,8 +8,10 @@ import {
   markEmailsRead,
   moveEmailsOutOfSpam,
   queryUnreadEmailIds,
+  readEventStream,
   tagEmailsForLaterUnsubscribe,
   unreadFilter,
+  watchMailChanges,
 } from './jmap.ts'
 
 const draftContext = {
@@ -813,5 +815,88 @@ describe('Fastmail JMAP adapter', () => {
     expect(tagRequest.methodCalls[0][1].update).toEqual({
       news: { 'mailboxIds/unsubscribe-label': true },
     })
+  })
+
+  it('parses server-sent events across chunk boundaries', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'event: state\ndata: {"changed":{"a',
+      'cc":{"Email":"s1"}}}\n\nevent: ping\ndata: {}\n\n',
+      'data: plain\r\n\r\n',
+    ]
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+    const events: Array<{ data: string; type: string }> = []
+    await readEventStream(body, (event) => events.push(event), new AbortController().signal)
+    expect(events).toEqual([
+      { data: '{"changed":{"acc":{"Email":"s1"}}}', type: 'state' },
+      { data: '{}', type: 'ping' },
+      { data: 'plain', type: 'message' },
+    ])
+  })
+
+  it('reports Email state changes over push and reconnects after the stream ends', async () => {
+    const encoder = new TextEncoder()
+    let connections = 0
+    const stream = (states: string[]) =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const state of states) {
+            controller.enqueue(
+              encoder.encode(
+                `event: state\ndata: ${JSON.stringify({ changed: { acc: { Email: state } } })}\n\n`,
+              ),
+            )
+          }
+          controller.enqueue(encoder.encode('event: ping\ndata: {}\n\n'))
+          controller.close()
+        },
+      })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async (input, init) => {
+        if (String(input).endsWith('/jmap/session')) {
+          return new Response(
+            JSON.stringify({
+              apiUrl: draftContext.apiUrl,
+              downloadUrl: draftContext.downloadUrl,
+              eventSourceUrl:
+                'https://api.example/jmap/event/?types={types}&closeafter={closeafter}&ping={ping}',
+              primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acc' },
+              capabilities: {},
+            }),
+          )
+        }
+        expect(String(input)).toBe(
+          'https://api.example/jmap/event/?types=Email&closeafter=no&ping=300',
+        )
+        expect((init?.headers as Record<string, string> | undefined)?.Accept).toBe(
+          'text/event-stream',
+        )
+        connections += 1
+        return new Response(connections === 1 ? stream(['s1', 's1', 's2']) : stream(['s2', 's3']), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }),
+    )
+    const controller = new AbortController()
+    const changes: number[] = []
+    const status: boolean[] = []
+    const watching = watchMailChanges(
+      'token',
+      () => changes.push(changes.length + 1),
+      controller.signal,
+      (connected) => status.push(connected),
+    )
+    await expect.poll(() => connections).toBe(2)
+    await expect.poll(() => changes.length).toBe(3)
+    controller.abort()
+    await watching
+    expect(status.slice(0, 4)).toEqual([true, false, true, false])
   })
 })

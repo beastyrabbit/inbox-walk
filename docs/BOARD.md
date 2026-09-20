@@ -10,7 +10,7 @@ its immutable image, and Flux deploys the pinned tag through kub-homelab to
 
 ## Shipped
 
-- [x] Continuous todo: unread mail is polled, queued and sorted without a manual run.
+- [x] Continuous todo: JMAP push plus a fallback poll queue and sort unread mail without a manual run.
 - [x] Codex sorting sessions with read-only mailbox tools and app-only bucket tools.
 - [x] Bounded automatic retries, manual retry, and a visible pause while Codex is logged out.
 - [x] User-written memory note for Codex with accept-or-reject proposals.
@@ -28,6 +28,5 @@ its immutable image, and Flux deploys the pinned tag through kub-homelab to
 ## Deferred until needed
 
 - [ ] Spam triage as a separate queue with a "Not Spam" action.
-- [ ] JMAP push instead of polling.
 - [ ] Operational metrics if live troubleshooting shows a concrete need.
 - [ ] Per-message done inside a bucket if whole-bucket completion turns out to be too coarse.

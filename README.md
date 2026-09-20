@@ -4,14 +4,14 @@ Inbox Walk is a private, keyboard-first Fastmail todo list. It watches your unre
 
 ## Highlights
 
-- Nothing to start. New mail is picked up within a minute and sorted in the background.
+- Nothing to start. Fastmail pushes changes over JMAP; new mail is queued within seconds and sorted in the background.
 - Every bucket shows all its messages at once, with the original mail design.
 - Prepare a thread-aware Fastmail draft with Codex.
 - Keep sending in Fastmail. Inbox Walk has no send endpoint.
 
 ## What it does
 
-- Polls Fastmail over JMAP for unread incoming mail outside Spam and queues every new message.
+- Listens to Fastmail's JMAP push stream and refreshes the unread set on every change, with a one-minute poll as fallback and reconciliation. Queues every new unread incoming message outside Spam.
 - Sends each batch of new messages to Codex together with the open buckets and your notes. Codex may search the whole mailbox, read a thread or a message body, then creates a bucket, adds to one, merges two, or updates a title and state.
 - Shows the todo as buckets ordered by newest activity. Messages that are not sorted yet appear on top and can be opened right away.
 - Marks a bucket done with one key, which marks exactly its shown messages read in Fastmail and moves on to the next bucket.
@@ -71,8 +71,11 @@ at high effort is the final default. Models Pi does not know yet, such as
 
 ## How sorting works
 
-Every poll lists unread mail, queues new IDs with their summaries, and drops
-IDs that are no longer unread. Queued messages go to Codex in batches of up to
+A JMAP EventSource connection to Fastmail reports Email state changes; each
+change triggers a refresh two seconds later, and a one-minute poll runs
+regardless so a dropped connection never loses mail. Every refresh lists
+unread mail, queues new IDs with their summaries, and drops IDs that are no
+longer unread. Queued messages go to Codex in batches of up to
 eight. Each Codex session runs isolated: no built-in tools, skills, extensions,
 or project context. It receives the new summaries, the buckets active in the
 last 45 days, and your memory note. Its tools are:
@@ -91,7 +94,9 @@ button. An expired Codex login pauses sorting without counting attempts. Every
 tool action is appended to an event log in SQLite; message bodies fetched for
 sorting live only in the session.
 
-`TRIAGE_POLL_INTERVAL_MS` sets the poll interval and defaults to one minute.
+`TRIAGE_POLL_INTERVAL_MS` sets the fallback poll interval and defaults to one
+minute. The push connection needs no configuration; the status line shows
+"Push aktiv" while it is open, and a stalled connection reopens with backoff.
 `TRIAGE_TIMEOUT_MS` bounds one sorting session, defaulting to 15 minutes with a
 60-minute ceiling. `CODEX_INFERENCE_TIMEOUT_MS` keeps the five-minute default
 for reply drafts.

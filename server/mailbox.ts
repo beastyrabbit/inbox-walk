@@ -28,6 +28,7 @@ import {
   queryUnreadEmailIds,
   searchEmailSummaries,
   tagEmailsForLaterUnsubscribe,
+  watchMailChanges,
 } from './jmap.ts'
 import { generateReply, type ReplyRequest } from './reply.ts'
 
@@ -59,6 +60,12 @@ export interface Mailbox {
   unreadIds(signal?: AbortSignal): Promise<string[]>
   /** Demo only: forget every read mark so tests start from the full sample inbox. */
   reset?(): void
+  /** Live only: push notifications for mail changes until the signal aborts. */
+  watch?(
+    onChange: () => void,
+    signal: AbortSignal,
+    onStatus?: (connected: boolean) => void,
+  ): Promise<void>
 }
 
 export function createLiveMailbox(token: string): Mailbox {
@@ -105,6 +112,7 @@ export function createLiveMailbox(token: string): Mailbox {
       withAccount(({ context, mailboxes }) => fetchThread(context, token, threadId, mailboxes)),
     unreadIds: (signal) =>
       withAccount((current) => queryUnreadEmailIds(current, token, signal), signal),
+    watch: (onChange, signal, onStatus) => watchMailChanges(token, onChange, signal, onStatus),
   }
 }
 

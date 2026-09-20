@@ -20,6 +20,7 @@ const THREAD_LIMIT = 100
 interface JmapSession {
   apiUrl: string
   downloadUrl: string
+  eventSourceUrl?: string
   primaryAccounts: Record<string, string>
   capabilities: Record<string, { maxObjectsInGet?: number; maxObjectsInSet?: number }>
   username?: string
@@ -418,6 +419,153 @@ export async function fetchUnreadEmailIds(
 export interface MailAccount {
   context: MailAccountContext
   mailboxes: MailboxOption[]
+}
+
+export interface ServerSentEvent {
+  data: string
+  type: string
+}
+
+/** Parses a text/event-stream body and reports every complete event. */
+export async function readEventStream(
+  body: ReadableStream<Uint8Array>,
+  onEvent: (event: ServerSentEvent) => void,
+  signal: AbortSignal,
+) {
+  const reader = body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let type = 'message'
+  let data: string[] = []
+  const flush = () => {
+    if (data.length > 0) onEvent({ data: data.join('\n'), type })
+    type = 'message'
+    data = []
+  }
+  try {
+    while (true) {
+      const { done, value } = await abortable(reader.read(), signal)
+      if (done) break
+      buffer += decoder.decode(value, { stream: true })
+      let newline = buffer.indexOf('\n')
+      while (newline >= 0) {
+        const line = buffer.slice(0, newline).replace(/\r$/, '')
+        buffer = buffer.slice(newline + 1)
+        if (line === '') flush()
+        else if (line.startsWith('event:')) type = line.slice(6).trim()
+        else if (line.startsWith('data:')) data.push(line.slice(5).replace(/^ /, ''))
+        newline = buffer.indexOf('\n')
+      }
+    }
+    flush()
+  } finally {
+    void reader.cancel().catch(() => {})
+    reader.releaseLock()
+  }
+}
+
+const PUSH_PING_SECONDS = 300
+const PUSH_STALL_MS = 3 * PUSH_PING_SECONDS * 1000
+const PUSH_MAX_BACKOFF_MS = 5 * 60_000
+
+function sleep(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(done, ms)
+    function done() {
+      signal.removeEventListener('abort', done)
+      clearTimeout(timer)
+      resolve()
+    }
+    signal.addEventListener('abort', done, { once: true })
+  })
+}
+
+/**
+ * Keeps a JMAP EventSource connection open and calls onChange whenever the
+ * Email state of the account changes. Reconnects with backoff until the
+ * signal aborts. A connection that stays silent past three ping intervals is
+ * treated as stalled and reopened.
+ */
+export async function watchMailChanges(
+  token: string,
+  onChange: () => void,
+  signal: AbortSignal,
+  onStatus?: (connected: boolean) => void,
+) {
+  let backoff = 1_000
+  let lastState: string | undefined
+  while (!signal.aborted) {
+    const connection = new AbortController()
+    const abortConnection = () => connection.abort(signal.reason)
+    signal.addEventListener('abort', abortConnection, { once: true })
+    let stall: ReturnType<typeof setTimeout> | undefined
+    const resetStall = () => {
+      if (stall) clearTimeout(stall)
+      stall = setTimeout(
+        () => connection.abort(new Error('JMAP push connection stalled.')),
+        PUSH_STALL_MS,
+      )
+    }
+    try {
+      const session = await getSession(token, connection.signal)
+      const template = session.eventSourceUrl
+      if (!template) {
+        throw new JmapError('Fastmail offers no JMAP push endpoint.', 'PUSH_UNSUPPORTED')
+      }
+      const url = template
+        .replace('{types}', 'Email')
+        .replace('{closeafter}', 'no')
+        .replace('{ping}', String(PUSH_PING_SECONDS))
+      const response = await fetch(url, {
+        headers: { Accept: 'text/event-stream', Authorization: `Bearer ${token}` },
+        signal: connection.signal,
+      })
+      if (!response.ok || !response.body) {
+        throw new JmapError(
+          `Fastmail push connection failed (${response.status})`,
+          response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'PUSH_FAILED',
+          response.status,
+        )
+      }
+      onStatus?.(true)
+      backoff = 1_000
+      resetStall()
+      await readEventStream(
+        response.body,
+        (event) => {
+          resetStall()
+          if (event.type !== 'state') return
+          let emailState: string | undefined
+          try {
+            const changed = (
+              JSON.parse(event.data) as { changed?: Record<string, { Email?: string }> }
+            ).changed
+            emailState = Object.values(changed ?? {})
+              .map((types) => types.Email ?? '')
+              .join('|')
+          } catch {
+            emailState = event.data
+          }
+          if (emailState === lastState) return
+          lastState = emailState
+          onChange()
+        },
+        connection.signal,
+      )
+    } catch (error) {
+      if (signal.aborted) return
+      process.stderr.write(
+        `${JSON.stringify({ event: 'jmap_push_disconnected', message: error instanceof Error ? error.message : 'unknown' })}\n`,
+      )
+    } finally {
+      if (stall) clearTimeout(stall)
+      signal.removeEventListener('abort', abortConnection)
+      onStatus?.(false)
+    }
+    if (signal.aborted) return
+    await sleep(backoff, signal)
+    backoff = Math.min(PUSH_MAX_BACKOFF_MS, backoff * 2)
+  }
 }
 
 /** Resolves the Fastmail account and its mailboxes for a long-lived mail session. */

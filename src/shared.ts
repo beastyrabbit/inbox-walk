@@ -254,6 +254,8 @@ export interface TriageStatus {
   lastSortError: string | null
   model?: string
   polling: boolean
+  /** True while the JMAP push connection to Fastmail is open. */
+  pushConnected: boolean
   queuedCount: number
   sorting: boolean
   waitingForCodex: boolean

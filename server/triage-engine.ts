@@ -6,6 +6,7 @@ import type { TriageSorter } from './triage-sorter.ts'
 import type { TriageStore } from './triage-store.ts'
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000
+const PUSH_DEBOUNCE_MS = 2_000
 const SORT_BATCH_SIZE = 8
 const SUMMARY_PAGE_SIZE = 200
 
@@ -70,6 +71,18 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
   let sorting: Promise<void> | null = null
   let polling = false
   let waitingForCodex = false
+  let pushConnected = false
+  let pushTimer: ReturnType<typeof setTimeout> | undefined
+  let watching: Promise<void> | null = null
+
+  /** Push events arrive in bursts; one refresh shortly after the last one is enough. */
+  function onPush() {
+    if (pushTimer) clearTimeout(pushTimer)
+    pushTimer = setTimeout(() => {
+      pushTimer = undefined
+      void refresh()
+    }, PUSH_DEBOUNCE_MS)
+  }
 
   async function poll() {
     const { signal } = controller
@@ -167,6 +180,16 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       if (timer) return
       timer = setInterval(() => void refresh(), pollIntervalMs)
       timer.unref()
+      if (mailbox.watch && !watching) {
+        const watch = mailbox.watch
+        watching = withoutIoDeadline(() =>
+          watch(onPush, controller.signal, (connected) => {
+            pushConnected = connected
+          }),
+        ).catch((error) => {
+          log('triage_push_failed', { message: error instanceof Error ? error.message : 'unknown' })
+        })
+      }
       void refresh()
     },
     status() {
@@ -182,6 +205,7 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
         lastSortError: run.lastSortError,
         ...(model ? { model } : {}),
         polling,
+        pushConnected,
         queuedCount: counts.queued,
         sorting: sorting !== null,
         waitingForCodex,
@@ -190,8 +214,9 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
     async stop() {
       if (timer) clearInterval(timer)
       timer = undefined
+      if (pushTimer) clearTimeout(pushTimer)
       controller.abort(new DOMException('Triage engine stopped.', 'AbortError'))
-      await Promise.allSettled([running, sorting].filter(Boolean))
+      await Promise.allSettled([running, sorting, watching].filter(Boolean))
     },
   }
 }

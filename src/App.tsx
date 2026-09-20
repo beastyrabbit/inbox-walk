@@ -172,7 +172,8 @@ function statusLine(status: TriageStatus, mode: 'demo' | 'live') {
     mode === 'demo'
       ? 'Lokale Sortierung'
       : `Codex${status.model ? ` · ${codexModelLabel(status.model)}` : ''}`
-  return `${origin} · Postfach zuletzt geprüft ${relativeTime(status.lastPollAt)}`
+  const push = status.pushConnected ? ' · Push aktiv' : ''
+  return `${origin}${push} · Postfach zuletzt geprüft ${relativeTime(status.lastPollAt)}`
 }
 
 function parkedBucket(message: TriageMessage): TriageBucket {

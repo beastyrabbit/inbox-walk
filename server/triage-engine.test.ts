@@ -156,4 +156,45 @@ describe('triage engine', () => {
     await engine.stop()
     store.close()
   })
+
+  it('refreshes on push notifications and reports the connection state', async () => {
+    vi.useFakeTimers()
+    try {
+      const store = createTriageStore(':memory:')
+      const mailbox = createDemoMailbox()
+      let notify: (() => void) | undefined
+      let setStatus: ((connected: boolean) => void) | undefined
+      const watch = vi.fn<NonNullable<typeof mailbox.watch>>(
+        (onChange, signal, onStatus) =>
+          new Promise<void>((resolve) => {
+            notify = onChange
+            setStatus = onStatus
+            onStatus?.(true)
+            signal.addEventListener('abort', () => resolve(), { once: true })
+          }),
+      )
+      const engine = createTriageEngine({
+        engine: 'heuristic',
+        mailbox: { ...mailbox, watch },
+        pollIntervalMs: 3_600_000,
+        sorter: heuristicSorter,
+        store,
+      })
+      engine.start()
+      await vi.runOnlyPendingTimersAsync()
+      expect(watch).toHaveBeenCalledOnce()
+      expect(engine.status().pushConnected).toBe(true)
+      await mailbox.markRead(['demo-train'])
+      notify?.()
+      notify?.()
+      await vi.advanceTimersByTimeAsync(2_500)
+      expect(store.message('demo-train')?.status).toBe('gone')
+      setStatus?.(false)
+      expect(engine.status().pushConnected).toBe(false)
+      await engine.stop()
+      store.close()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

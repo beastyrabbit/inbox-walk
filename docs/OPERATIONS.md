@@ -17,7 +17,7 @@
 - Persistent state: `DATA_DIR=/data` for Pi's rotating Codex OAuth record and `inbox-walk.sqlite`
 - Codex home: `CODEX_HOME` (default `~/.codex`) with `auth.json`, `config.toml`, and `models_cache.json` takes precedence for login, model, reasoning effort, and speed
 - Assisted-reply services: `CODEX_MODEL=gpt-5.6-sol`, `CODEX_THINKING_LEVEL=high`, `CODEX_SPEED=standard` as fallbacks, `TIKA_URL=http://inbox-walk-tika.tools.svc.cluster.local:9998`
-- Poll interval: `TRIAGE_POLL_INTERVAL_MS=60000` by default, between 5 seconds and one hour
+- Fallback poll interval: `TRIAGE_POLL_INTERVAL_MS=60000` by default, between 5 seconds and one hour; JMAP push is always on in live mode
 - Sorting session timeout: `TRIAGE_TIMEOUT_MS=900000` by default, maximum `3600000`
 - Reply inference timeout: `CODEX_INFERENCE_TIMEOUT_MS=300000`
 - Explicit demo override: `MAIL_REVIEW_DEMO=1`
@@ -40,8 +40,8 @@ app is stopped rebuilds the todo from the current unread mail on the next poll;
 it does not change mail in Fastmail, but loses bucket titles, notes and parked
 state.
 
-Run one Inbox Walk replica against this SQLite volume. The poll and sort loop
-is process-local; two replicas would sort the same mail twice.
+Run one Inbox Walk replica against this SQLite volume. The push, poll and sort
+loop is process-local; two replicas would sort the same mail twice.
 
 The engine only reads from Fastmail. Marking read and adding the newsletter
 label happen exclusively in response to user actions in the browser.
@@ -97,9 +97,11 @@ from the app when OAuth can no longer refresh. For the database, inspect
 schema and aggregate counts only rather than printing message IDs, subjects,
 previews, addresses, notes or editor text.
 
-Structured stderr events `triage_poll`, `triage_poll_failed` and
-`triage_sort_failed` carry counts and the raw error message, never mail
-content.
+Structured stderr events `triage_poll`, `triage_poll_failed`,
+`triage_sort_failed` and `jmap_push_disconnected` carry counts and the raw
+error message, never mail content. `status.pushConnected` in `/api/todo`
+shows whether the push stream is open; a closed stream only slows pickup to
+the poll interval.
 
 Do not print Kubernetes Secret values or application credentials while
 troubleshooting. Inspect key names and sync status only.
