@@ -311,6 +311,7 @@ function summary(email: JmapEmail, mailboxes: Map<string, Mailbox>): ReviewEmail
 
 const SUMMARY_PROPERTIES = [
   'id',
+  'keywords',
   'threadId',
   'mailboxIds',
   'receivedAt',
@@ -336,7 +337,6 @@ const DETAIL_PROPERTIES = [
   'bodyValues',
   'bodyStructure',
   'attachments',
-  'keywords',
 ]
 
 async function getEmails(
@@ -715,12 +715,11 @@ export async function searchEmailSummaries(
   if (ids.length === 0) return []
   const mailboxes = new Map(account.mailboxes.map((mailbox) => [mailbox.id, mailbox as Mailbox]))
   const fetched = await getEmails(context, token, ids, false, signal)
-  const unreadIds = await fetchUnreadEmailIds(context, token, ids, signal)
   const byId = new Map(fetched.list.map((email) => [email.id, email]))
   return ids
     .map((id) => byId.get(id))
     .filter((email): email is JmapEmail => Boolean(email))
-    .map((email) => ({ ...summary(email, mailboxes), unread: unreadIds.has(email.id) }))
+    .map((email) => ({ ...summary(email, mailboxes), unread: email.keywords?.$seen !== true }))
 }
 
 function partValue(parts: BodyPart[] | undefined, values: JmapEmail['bodyValues']) {

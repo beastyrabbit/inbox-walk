@@ -1,34 +1,9 @@
 import type { BundleKind, ReviewEmailSummary } from '../src/shared.ts'
 
-const GENERIC_TERMS = new Set([
-  'about',
-  'and',
-  'bestellung',
-  'deine',
-  'deployment',
-  'der',
-  'die',
-  'email',
-  'for',
-  'from',
-  'github',
-  'ist',
-  'mail',
-  'message',
-  'mit',
-  'nachricht',
-  'railway',
-  'the',
-  'und',
-  'von',
-  'your',
-])
-
 export interface BundleSignals {
   conflictKeys: string[]
   exactKeys: string[]
   provider: string
-  searchTerms: string[]
 }
 
 export interface BundlePartitionStory {
@@ -121,19 +96,10 @@ export function extractBundleSignals(email: ReviewEmailSummary): BundleSignals {
     ...pullRequests.flatMap((pr) => repos.map((repo) => `${repo}|${pr}`)),
     ...commits.flatMap((commit) => repos.map((repo) => `${repo}|${commit}`)),
   ])
-  const searchTerms = unique(
-    text
-      .split(/[^\p{L}\p{N}_./-]+/u)
-      .map((term) => term.replace(/^[-./]+|[-./]+$/g, ''))
-      .filter((term) => term.length >= 4 && !GENERIC_TERMS.has(term))
-      .sort((left, right) => right.length - left.length)
-      .slice(0, 16),
-  )
   return {
     conflictKeys: unique([...repos, ...tracking, ...orders]),
     exactKeys,
     provider: providerFor(email),
-    searchTerms,
   }
 }
 

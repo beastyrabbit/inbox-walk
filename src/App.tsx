@@ -259,6 +259,8 @@ function App() {
   const [submitting, setSubmitting] = useState(false)
   const [mailColorMode, setMailColorModeState] = useState<MailColorMode>(storedMailColorMode)
   const detailRequestsRef = useRef(new Map<string, Promise<ReviewEmail>>())
+  /** Bumped whenever the shown bucket changes so late responses for the old one are ignored. */
+  const viewEpochRef = useRef(0)
   const replyBodyEditsRef = useRef(new Map<string, number>())
   const editorSaveTimersRef = useRef(new Map<string, number>())
   const snapshotRef = useRef<TriageSnapshot | null>(null)
@@ -352,6 +354,7 @@ function App() {
 
   /** Mail bodies and thread context belong to the bucket on screen; nothing else is retained. */
   const dropBucketState = useCallback(() => {
+    viewEpochRef.current += 1
     detailRequestsRef.current.clear()
     setDetails({})
     setPendingDetails(new Set())
@@ -442,21 +445,27 @@ function App() {
         request = api.email(emailId)
         detailRequestsRef.current.set(emailId, request)
       }
-      setPendingDetails((current) => new Set(current).add(emailId))
+      const epoch = viewEpochRef.current
+      const current = () => viewEpochRef.current === epoch
+      setPendingDetails((state) => new Set(state).add(emailId))
       void request
-        .then((loaded) => setDetails((current) => ({ ...current, [loaded.id]: loaded })))
+        .then((loaded) => {
+          if (current()) setDetails((state) => ({ ...state, [loaded.id]: loaded }))
+        })
         .catch((cause) => {
+          if (!current()) return
           detailRequestsRef.current.delete(emailId)
-          setFailedDetails((current) => new Set(current).add(emailId))
+          setFailedDetails((state) => new Set(state).add(emailId))
           setError(errorMessage(cause))
         })
-        .finally(() =>
-          setPendingDetails((current) => {
-            const next = new Set(current)
+        .finally(() => {
+          if (!current()) return
+          setPendingDetails((state) => {
+            const next = new Set(state)
             next.delete(emailId)
             return next
-          }),
-        )
+          })
+        })
     },
     [details, failedDetails, pendingDetails],
   )
@@ -605,6 +614,7 @@ function App() {
     setHelpOpen(false)
     // The thread is fetched on every open so mail that arrived since is included.
     const firstOpen = !threadContexts[summary.id]
+    const epoch = viewEpochRef.current
     if (firstOpen) setReplyLoading(true)
     setError(null)
     try {
@@ -614,6 +624,7 @@ function App() {
           ? api.replyEditor(summary.id).catch(() => ({ editor: null }))
           : Promise.resolve({ editor: null }),
       ])
+      if (viewEpochRef.current !== epoch) return
       setThreadContexts((current) => ({ ...current, [summary.id]: context }))
       setReplyDrafts((current) => ({
         ...current,
@@ -621,6 +632,7 @@ function App() {
       }))
       setStatus('Antwortkontext geladen.')
     } catch (cause) {
+      if (viewEpochRef.current !== epoch) return
       if (firstOpen) {
         setError(errorMessage(cause))
         setReplyOpen(false)
@@ -628,7 +640,7 @@ function App() {
         setStatus('Der Thread konnte nicht aktualisiert werden; der letzte Stand bleibt sichtbar.')
       }
     } finally {
-      setReplyLoading(false)
+      if (viewEpochRef.current === epoch) setReplyLoading(false)
     }
   }, [summary, threadContexts])
 
@@ -703,6 +715,7 @@ function App() {
     const current = snapshotRef.current
     if (!current || !summary || !editor) return
     const bodyEditRevision = replyBodyEditsRef.current.get(summary.id) ?? 0
+    const epoch = viewEpochRef.current
     setReplyLoading(true)
     setError(null)
     try {
@@ -716,6 +729,7 @@ function App() {
         },
         current.csrfToken,
       )
+      if (viewEpochRef.current !== epoch) return
       if ((replyBodyEditsRef.current.get(summary.id) ?? 0) !== bodyEditRevision) {
         setStatus('Vorschlag verworfen, weil der Antworttext zwischenzeitlich geändert wurde.')
         return
@@ -730,9 +744,9 @@ function App() {
       })
       setStatus('Antwortentwurf erstellt. Bitte prüfen und bearbeiten.')
     } catch (cause) {
-      setError(errorMessage(cause))
+      if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      setReplyLoading(false)
+      if (viewEpochRef.current === epoch) setReplyLoading(false)
     }
   }
 
@@ -752,6 +766,7 @@ function App() {
       setError('Empfänger, Betreff und Nachrichtentext werden für einen Draft benötigt.')
       return
     }
+    const epoch = viewEpochRef.current
     setSubmitting(true)
     setError(null)
     try {
@@ -773,12 +788,13 @@ function App() {
         },
         current.csrfToken,
       )
+      if (viewEpochRef.current !== epoch) return
       setDraftResults((state) => ({ ...state, [summary.id]: saved }))
       setStatus('Draft in Fastmail gespeichert; die Nachricht bleibt ungelesen.')
     } catch (cause) {
-      setError(errorMessage(cause))
+      if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      setSubmitting(false)
+      if (viewEpochRef.current === epoch) setSubmitting(false)
     }
   }
 

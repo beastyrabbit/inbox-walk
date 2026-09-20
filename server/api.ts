@@ -473,12 +473,12 @@ async function messageAction(
   if (!parsed.success) throw new ApiHttpError(400, 'INVALID_IDS', 'Ungültige Nachrichten-IDs.')
   const emailIds = [...new Set(parsed.data.emailIds)]
   for (const emailId of emailIds) requireKnownEmail(store, emailId)
-  const result: TriageActionResult = { failed: [], snapshot: snapshot(options) }
+  let failed: TriageActionResult['failed'] = []
   if (action === 'done') {
     // Only an explicit user action marks mail read, and only the named IDs.
     const marked = await mailbox.markRead(emailIds)
     store.markDone(marked.markedIds)
-    result.failed = marked.failed
+    failed = marked.failed
     store.logEvent('user_done', { count: marked.markedIds.length })
   } else if (action === 'park') {
     store.park(emailIds)
@@ -497,14 +497,14 @@ async function messageAction(
       )
     }
     const tagged = await mailbox.tagNewsletter(emailIds)
-    result.failed = tagged.failed
+    failed = tagged.failed
     store.logEvent('user_newsletter', { count: tagged.succeededIds.length })
   } else {
     store.resetAttempts(emailIds)
     void engine.sort()
   }
-  result.snapshot = snapshot(options)
-  return json(res, result.failed.length > 0 ? 207 : 200, result)
+  const result: TriageActionResult = { failed, snapshot: snapshot(options) }
+  return json(res, failed.length > 0 ? 207 : 200, result)
 }
 
 async function emailDetail(
