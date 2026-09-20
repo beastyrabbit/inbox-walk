@@ -182,12 +182,30 @@ export function triagePrompt(batch: readonly TriageMessage[], buckets: TriageBuc
 }
 
 /** Removes every `<tag …>…</tag>` block without regex backtracking over untrusted HTML. */
+/** Index just past the `>` that ends the tag opened at `start`, honouring quoted attributes. */
+function tagEnd(html: string, start: number) {
+  let quote: string | undefined
+  for (let index = start + 1; index < html.length; index += 1) {
+    const character = html[index]
+    if (quote) {
+      if (character === quote) quote = undefined
+    } else if (character === '"' || character === "'") {
+      quote = character
+    } else if (character === '>') {
+      return index + 1
+    }
+  }
+  return html.length
+}
+
+/** Removes every `<tag …>…</tag>` block in one linear pass over untrusted HTML. */
 function stripElements(html: string, tag: string) {
   const lower = html.toLowerCase()
   const open = `<${tag}`
   const close = `</${tag}>`
   let output = ''
   let cursor = 0
+  let closeMissing = false
   while (cursor < html.length) {
     const start = lower.indexOf(open, cursor)
     if (start < 0) break
@@ -198,12 +216,13 @@ function stripElements(html: string, tag: string) {
       cursor = start + open.length
       continue
     }
-    const end = lower.indexOf(close, start)
     output += html.slice(cursor, start)
+    // Once a closing tag is missing, no later opener can have one either.
+    const end = closeMissing ? -1 : lower.indexOf(close, start)
     if (end < 0) {
+      closeMissing = true
       // Unclosed block in malformed mail: drop only the tag, keep the text after it.
-      const tagEnd = html.indexOf('>', start)
-      cursor = tagEnd < 0 ? html.length : tagEnd + 1
+      cursor = tagEnd(html, start)
       continue
     }
     cursor = end + close.length
@@ -221,11 +240,10 @@ function stripTags(html: string) {
   while (cursor < html.length) {
     const start = html.indexOf('<', cursor)
     if (start < 0) break
-    const end = html.indexOf('>', start)
-    if (end < 0) break
+    const end = tagEnd(html, start)
     output += html.slice(cursor, start)
-    output += BLOCK_TAG.test(html.slice(start, end + 1)) ? '\n' : ' '
-    cursor = end + 1
+    output += BLOCK_TAG.test(html.slice(start, end)) ? '\n' : ' '
+    cursor = end
   }
   return output + html.slice(cursor)
 }
