@@ -68,6 +68,32 @@ describe('triage engine', () => {
     store.close()
   })
 
+  it('drops tracked mail that is unread but no longer incoming', async () => {
+    const store = createTriageStore(':memory:')
+    const mailbox = createDemoMailbox()
+    const engine = createTriageEngine({
+      engine: 'heuristic',
+      mailbox,
+      sorter: heuristicSorter,
+      store,
+    })
+    await engine.refresh()
+    expect(store.message('demo-train')?.status).toBe('sorted')
+    const original = mailbox.summaries
+    vi.spyOn(mailbox, 'summaries').mockImplementation(async (ids, signal) => {
+      const result = await original(ids, signal)
+      return {
+        emails: result.emails.filter((email) => email.id !== 'demo-train'),
+        excludedIds: ids.includes('demo-train') ? ['demo-train'] : result.excludedIds,
+      }
+    })
+    await engine.refresh()
+    expect(store.message('demo-train')?.status).toBe('gone')
+    expect(store.todo().flatMap((bucket) => bucket.messages).length).toBe(8)
+    await engine.stop()
+    store.close()
+  })
+
   it('retries a failing sorter three times per message and then waits for the user', async () => {
     const store = createTriageStore(':memory:')
     const mailbox = createDemoMailbox([demoEmails[0] as ReviewEmail])

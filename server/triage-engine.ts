@@ -93,8 +93,9 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       const unread = new Set(unreadIds)
       const tracked = store.trackedIds()
       const gone = [...tracked.keys()].filter((id) => !unread.has(id))
-      if (gone.length > 0) store.markGone(gone)
       const fresh = unreadIds.filter((id) => !tracked.has(id))
+      // Tracked mail is re-fetched too: a message moved to Sent-only stays unread but is no longer incoming.
+      const stillTracked = unreadIds.filter((id) => tracked.has(id))
       let added = 0
       for (let start = 0; start < fresh.length; start += SUMMARY_PAGE_SIZE) {
         signal.throwIfAborted()
@@ -104,6 +105,15 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
         )
         added += store.enqueue(emails)
       }
+      for (let start = 0; start < stillTracked.length; start += SUMMARY_PAGE_SIZE) {
+        signal.throwIfAborted()
+        const { excludedIds } = await mailbox.summaries(
+          stillTracked.slice(start, start + SUMMARY_PAGE_SIZE),
+          signal,
+        )
+        gone.push(...excludedIds)
+      }
+      if (gone.length > 0) store.markGone(gone)
       store.recordPoll(new Date().toISOString(), null)
       if (added > 0 || gone.length > 0) log('triage_poll', { added, gone: gone.length })
     } catch (error) {
