@@ -183,6 +183,48 @@ describe('todo API', () => {
     vi.restoreAllMocks()
   })
 
+  it('forgets blob and image registrations of evicted mail', async () => {
+    const original = mailbox.detail
+    const spy = vi.spyOn(mailbox, 'detail').mockImplementation(async (emailId) => {
+      if (!emailId.startsWith('synthetic-')) return original(emailId)
+      const base = await original('demo-shop')
+      return {
+        ...base,
+        id: emailId,
+        attachments: [
+          { blobId: `blob-${emailId}`, name: 'a.pdf', type: 'application/pdf', size: 1 },
+        ],
+      }
+    })
+    const spyMessage = vi
+      .spyOn(store, 'message')
+      .mockImplementation((emailId) =>
+        emailId.startsWith('synthetic-')
+          ? { attempts: 0, bucketId: null, status: 'sorted', summary: { id: emailId } as never }
+          : store.message.call(store, emailId),
+      )
+    try {
+      const first = await json<ReviewEmail>('/api/todo/emails/synthetic-0')
+      const firstImage = Object.values(first.body.remoteImageIds ?? {})[0]
+      for (let index = 1; index <= 305; index += 1) {
+        await fetch(`${baseUrl}/api/todo/emails/synthetic-${index}`)
+      }
+      const evicted = await fetch(`${baseUrl}/api/todo/emails/synthetic-0/images/${firstImage}`)
+      expect(evicted.status).toBe(403)
+      // Reloading registers fresh image IDs; the evicted one must stay unknown.
+      const reloaded = await json<ReviewEmail>('/api/todo/emails/synthetic-0')
+      expect(Object.values(reloaded.body.remoteImageIds ?? {})).not.toContain(firstImage)
+      const snapshot = await todo()
+      const image = await fetch(
+        `${baseUrl}/api/todo/emails/synthetic-0/images/${firstImage}?token=${snapshot.imageToken}`,
+      )
+      expect(image.status).toBe(403)
+    } finally {
+      spy.mockRestore()
+      spyMessage.mockRestore()
+    }
+  })
+
   it('creates a reply proposal and a draft without any send path', async () => {
     const snapshot = await todo()
     const proposal = await json<{ bodyText: string; warnings: string[] }>(

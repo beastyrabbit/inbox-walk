@@ -85,6 +85,7 @@ describe('triage store', () => {
     store.park(['a'])
     expect(store.parked().map((item) => item.summary.id)).toEqual(['a'])
     expect(store.todo()[0]?.messages.map((item) => item.summary.id)).toEqual(['b'])
+    expect(store.todo()[0]?.handledCount).toBe(0)
     expect(store.trackedIds().get('a')).toBe('parked')
     store.unpark(['a'])
     expect(store.parked()).toEqual([])

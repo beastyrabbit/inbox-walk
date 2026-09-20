@@ -328,19 +328,18 @@ function createMailCache(): MailCache {
 }
 
 /** Keeps an insertion-ordered map at its bound by dropping the oldest entries. */
-function bound<K, V>(map: Map<K, V>, maximum: number, onEvict?: (key: K) => void) {
+function bound<K, V>(map: Map<K, V>, maximum: number) {
   while (map.size > maximum) {
     const oldest = map.keys().next().value
     if (oldest === undefined) return
     map.delete(oldest)
-    onEvict?.(oldest)
   }
 }
 
 function forgetResources(cache: MailCache, emailId: string) {
   const owned = cache.resourceOwners.get(emailId)
-  if (!owned) return
   cache.resourceOwners.delete(emailId)
+  if (!owned) return
   cache.remoteImageIds.delete(emailId)
   for (const imageId of owned.imageIds) cache.remoteImageSources.delete(`${emailId}/${imageId}`)
   const stillOwned = new Set([...cache.resourceOwners.values()].flatMap((owner) => owner.blobIds))
@@ -366,10 +365,12 @@ function registerResources(cache: MailCache, email: ReviewEmail) {
   cache.remoteImageIds.set(email.id, registered)
   cache.resourceOwners.delete(email.id)
   cache.resourceOwners.set(email.id, { blobIds, imageIds: [...registered.values()] })
-  bound(cache.resourceOwners, MAX_CACHED_DETAILS, (evicted) => {
-    cache.details.delete(evicted)
-    forgetResources(cache, evicted)
-  })
+  while (cache.resourceOwners.size > MAX_CACHED_DETAILS) {
+    const oldest = cache.resourceOwners.keys().next().value
+    if (oldest === undefined) break
+    cache.details.delete(oldest)
+    forgetResources(cache, oldest)
+  }
 }
 
 function rememberDetail(cache: MailCache, email: ReviewEmail) {

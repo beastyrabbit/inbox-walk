@@ -735,7 +735,9 @@ export function createTriageStore(databasePath = triageStorePath()): TriageStore
             activityAt: bucket.activityAt,
             bucketId: bucket.bucketId,
             currentState: bucket.currentState,
-            handledCount: bucket.members.length - messages.length,
+            handledCount: bucket.members.filter(
+              (member) => member.status === 'done' || member.status === 'gone',
+            ).length,
             kind: bucket.kind,
             linkEvidence: bucket.linkEvidence,
             messages,

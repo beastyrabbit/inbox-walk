@@ -519,7 +519,6 @@ function App() {
       setError(null)
       try {
         const failed: TriageActionResult['failed'] = []
-        const ticket = takeSnapshotTicket()
         // Each chunk's snapshot is applied at once so a later failure never hides earlier changes.
         for (let start = 0; start < emailIds.length; start += ACTION_BATCH_SIZE) {
           const chunk = await api.messageAction(
@@ -527,7 +526,8 @@ function App() {
             emailIds.slice(start, start + ACTION_BATCH_SIZE),
             current.csrfToken,
           )
-          applySnapshot(chunk.snapshot, ticket)
+          // The ticket is taken after the response so a poll that started meanwhile cannot win.
+          applySnapshot(chunk.snapshot, takeSnapshotTicket())
           failed.push(...chunk.failed)
         }
         if (failed.length > 0) {
@@ -655,7 +655,7 @@ function App() {
         setStatus('Der Thread konnte nicht aktualisiert werden; der letzte Stand bleibt sichtbar.')
       }
     } finally {
-      if (viewEpochRef.current === epoch) setReplyLoading(false)
+      setReplyLoading(false)
     }
   }, [summary, threadContexts])
 
@@ -761,7 +761,7 @@ function App() {
     } catch (cause) {
       if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      if (viewEpochRef.current === epoch) setReplyLoading(false)
+      setReplyLoading(false)
     }
   }
 
@@ -809,7 +809,7 @@ function App() {
     } catch (cause) {
       if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      if (viewEpochRef.current === epoch) setSubmitting(false)
+      setSubmitting(false)
     }
   }
 
