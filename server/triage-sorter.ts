@@ -200,7 +200,13 @@ function stripElements(html: string, tag: string) {
     }
     const end = lower.indexOf(close, start)
     output += html.slice(cursor, start)
-    cursor = end < 0 ? html.length : end + close.length
+    if (end < 0) {
+      // Unclosed block in malformed mail: drop only the tag, keep the text after it.
+      const tagEnd = html.indexOf('>', start)
+      cursor = tagEnd < 0 ? html.length : tagEnd + 1
+      continue
+    }
+    cursor = end + close.length
   }
   return output + html.slice(cursor)
 }
