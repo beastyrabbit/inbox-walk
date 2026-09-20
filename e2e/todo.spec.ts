@@ -132,6 +132,23 @@ test('drafts a reply into Fastmail and keeps the notes across a reload', async (
   )
 })
 
+test('refetches the thread every time the reply panel opens', async ({ page }) => {
+  let threadRequests = 0
+  page.on('request', (request) => {
+    if (/\/api\/todo\/threads\//.test(request.url())) threadRequests += 1
+  })
+  await openBucket(page, /Re: Essen nächste Woche\?/)
+  const panel = page.getByRole('heading', { name: 'Antwortentwurf' })
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(panel).toBeVisible()
+  await expect.poll(() => threadRequests).toBe(1)
+  await page.getByRole('button', { name: 'Antwort schließen' }).click()
+  await expect(panel).toHaveCount(0)
+  await page.getByRole('button', { name: /Antwort entwerfen/ }).click()
+  await expect(panel).toBeVisible()
+  await expect.poll(() => threadRequests).toBe(2)
+})
+
 test('keeps a bucket URL across reload and returns to the list when it closes', async ({
   page,
 }) => {

@@ -478,22 +478,20 @@ function App() {
       setBusy(true)
       setError(null)
       try {
-        let result: TriageActionResult | undefined
+        const failed: TriageActionResult['failed'] = []
+        // Each chunk's snapshot is applied at once so a later failure never hides earlier changes.
         for (let start = 0; start < emailIds.length; start += ACTION_BATCH_SIZE) {
           const chunk = await api.messageAction(
             action,
             emailIds.slice(start, start + ACTION_BATCH_SIZE),
             current.csrfToken,
           )
-          result = result
-            ? { failed: [...result.failed, ...chunk.failed], snapshot: chunk.snapshot }
-            : chunk
+          applySnapshot(chunk.snapshot)
+          failed.push(...chunk.failed)
         }
-        if (!result) return false
-        applySnapshot(result.snapshot)
-        if (result.failed.length > 0) {
+        if (failed.length > 0) {
           setError(
-            `${result.failed.length} ${result.failed.length === 1 ? 'Änderung ist' : 'Änderungen sind'} fehlgeschlagen: ${result.failed.map((item) => item.reason).join(' ')}`,
+            `${failed.length} ${failed.length === 1 ? 'Änderung ist' : 'Änderungen sind'} fehlgeschlagen: ${failed.map((item) => item.reason).join(' ')}`,
           )
           return false
         }
@@ -587,13 +585,16 @@ function App() {
     if (!summary) return
     setReplyOpen(true)
     setHelpOpen(false)
-    if (threadContexts[summary.id]) return
-    setReplyLoading(true)
+    // The thread is fetched on every open so mail that arrived since is included.
+    const firstOpen = !threadContexts[summary.id]
+    if (firstOpen) setReplyLoading(true)
     setError(null)
     try {
       const [context, saved] = await Promise.all([
         api.thread(summary.threadId, summary.id),
-        api.replyEditor(summary.id).catch(() => ({ editor: null })),
+        firstOpen
+          ? api.replyEditor(summary.id).catch(() => ({ editor: null }))
+          : Promise.resolve({ editor: null }),
       ])
       setThreadContexts((current) => ({ ...current, [summary.id]: context }))
       setReplyDrafts((current) => ({
@@ -602,8 +603,12 @@ function App() {
       }))
       setStatus('Antwortkontext geladen.')
     } catch (cause) {
-      setError(errorMessage(cause))
-      setReplyOpen(false)
+      if (firstOpen) {
+        setError(errorMessage(cause))
+        setReplyOpen(false)
+      } else {
+        setStatus('Der Thread konnte nicht aktualisiert werden; der letzte Stand bleibt sichtbar.')
+      }
     } finally {
       setReplyLoading(false)
     }
