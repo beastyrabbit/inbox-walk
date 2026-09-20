@@ -201,14 +201,29 @@ function stripElements(html: string, tag: string) {
 /** Tags whose boundary should become a line break in the flattened text. */
 const BLOCK_TAG = /^<\/?(?:br|p|div|tr|li|h[1-6])(?:[\s/>]|$)/i
 
+/** Replaces every tag with a space or line break in one linear pass. */
+function stripTags(html: string) {
+  let output = ''
+  let cursor = 0
+  while (cursor < html.length) {
+    const start = html.indexOf('<', cursor)
+    if (start < 0) break
+    const end = html.indexOf('>', start)
+    if (end < 0) break
+    output += html.slice(cursor, start)
+    output += BLOCK_TAG.test(html.slice(start, end + 1)) ? '\n' : ' '
+    cursor = end + 1
+  }
+  return output + html.slice(cursor)
+}
+
 /** Reduces an HTML body to readable text for the model. */
 export function htmlToText(html: string) {
   const withoutBlocks = ['style', 'script', 'head'].reduce(
     (text, tag) => stripElements(text, tag),
     html,
   )
-  return withoutBlocks
-    .replace(/<[^>]*>/g, (tag) => (BLOCK_TAG.test(tag) ? '\n' : ' '))
+  return stripTags(withoutBlocks)
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')
