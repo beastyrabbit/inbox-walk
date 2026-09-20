@@ -120,7 +120,7 @@ function isTypingTarget(target: EventTarget | null) {
 }
 
 function bucketIdFromPath() {
-  const match = window.location.pathname.match(/^\/buckets\/([^/]+)\/?$/)
+  const match = /^\/buckets\/([^/]+)\/?$/.exec(window.location.pathname)
   return match?.[1] ? decodeURIComponent(match[1]) : null
 }
 
@@ -170,12 +170,25 @@ function statusLine(status: TriageStatus, mode: 'demo' | 'live') {
   if (status.lastSortError) return `${status.lastSortError} Wird automatisch erneut versucht.`
   if (status.queuedCount > 0)
     return `${status.queuedCount} neue Nachrichten warten auf die Sortierung.`
-  const origin =
-    mode === 'demo'
-      ? 'Lokale Sortierung'
-      : `Codex${status.model ? ` · ${codexModelLabel(status.model)}` : ''}`
-  const push = status.pushConnected ? ' · Push aktiv' : ''
-  return `${origin}${push} · Postfach zuletzt geprüft ${relativeTime(status.lastPollAt)}`
+  const parts = [mode === 'demo' ? 'Lokale Sortierung' : 'Codex']
+  if (mode === 'live' && status.model) parts.push(codexModelLabel(status.model) ?? status.model)
+  if (status.pushConnected) parts.push('Push aktiv')
+  parts.push(`Postfach zuletzt geprüft ${relativeTime(status.lastPollAt)}`)
+  return parts.join(' · ')
+}
+
+function count(value: number, singular: string, plural: string) {
+  return `${value} ${value === 1 ? singular : plural}`
+}
+
+function openSummary(openCount: number, bucketCount: number) {
+  if (openCount === 0) return 'Keine ungelesenen Nachrichten.'
+  return `${count(openCount, 'Nachricht', 'Nachrichten')} in ${count(bucketCount, 'Bucket', 'Buckets')}`
+}
+
+function bucketRowState(bucket: TriageBucket, stuck: boolean) {
+  if (!bucket.unsorted) return bucket.currentState
+  return stuck ? 'Sortierung fehlgeschlagen' : 'Wird einsortiert …'
 }
 
 function parkedBucket(message: TriageMessage): TriageBucket {
@@ -257,7 +270,7 @@ function App() {
   const [draftResults, setDraftResults] = useState<Record<string, DraftResult>>({})
   const [replyLoading, setReplyLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
-  const [mailColorMode, setMailColorModeState] = useState<MailColorMode>(storedMailColorMode)
+  const [mailColorMode, setMailColorMode] = useState<MailColorMode>(storedMailColorMode)
   const detailRequestsRef = useRef(new Map<string, Promise<ReviewEmail>>())
   /** Bumped whenever the shown bucket changes so late responses for the old one are ignored. */
   const viewEpochRef = useRef(0)
@@ -266,8 +279,8 @@ function App() {
   const snapshotRef = useRef<TriageSnapshot | null>(null)
   snapshotRef.current = snapshot
 
-  const setMailColorMode = useCallback((mode: MailColorMode) => {
-    setMailColorModeState(mode)
+  const chooseMailColorMode = useCallback((mode: MailColorMode) => {
+    setMailColorMode(mode)
     try {
       window.localStorage.setItem(MAIL_COLOR_STORAGE_KEY, mode)
     } catch {
@@ -680,23 +693,18 @@ function App() {
         return
       }
       if (!bucket) return
-      const key = event.key.toLowerCase()
-      if (key === 'r') {
-        event.preventDefault()
-        void openReply()
-      } else if (key === 'e' || event.key === 'ArrowRight') {
-        event.preventDefault()
-        void completeBucket()
-      } else if (event.key === 'ArrowLeft') {
-        event.preventDefault()
-        backToList()
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault()
-        void parkSelected()
-      } else if (event.key === 'ArrowDown') {
-        event.preventDefault()
-        void tagNewsletter()
+      const shortcuts: Record<string, () => unknown> = {
+        ArrowDown: tagNewsletter,
+        ArrowLeft: backToList,
+        ArrowRight: completeBucket,
+        ArrowUp: parkSelected,
+        e: completeBucket,
+        r: openReply,
       }
+      const action = shortcuts[event.key] ?? shortcuts[event.key.toLowerCase()]
+      if (!action) return
+      event.preventDefault()
+      void action()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
@@ -1045,7 +1053,7 @@ function App() {
                   <button
                     type="button"
                     aria-pressed={mailColorMode === 'dark'}
-                    onClick={() => setMailColorMode('dark')}
+                    onClick={() => chooseMailColorMode('dark')}
                     title="Farben an die dunkle Oberfläche anpassen"
                   >
                     Dunkel
@@ -1053,7 +1061,7 @@ function App() {
                   <button
                     type="button"
                     aria-pressed={mailColorMode === 'original'}
-                    onClick={() => setMailColorMode('original')}
+                    onClick={() => chooseMailColorMode('original')}
                     title="Nachricht in ihren Originalfarben zeigen"
                   >
                     Original
@@ -1147,23 +1155,13 @@ function App() {
                       </span>
                     </button>
                     <div className="pane-body" aria-busy={pending}>
-                      {body ? (
-                        <iframe
-                          className="message-body"
-                          title={`Inhalt von ${body.subject}`}
-                          sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                          srcDoc={emailDocument(body, true, snapshot.imageToken, mailColorMode)}
-                        />
-                      ) : pending ? (
-                        <div className="body-loading">
-                          <div className="spinner" />
-                          <span>Nachricht wird geladen …</span>
-                        </div>
-                      ) : (
-                        <div className="body-loading error-copy">
-                          Der Nachrichteninhalt ist nicht verfügbar.
-                        </div>
-                      )}
+                      <MessageBody
+                        colorMode={mailColorMode}
+                        email={body}
+                        imageToken={snapshot.imageToken}
+                        pending={pending}
+                        subject={member.subject}
+                      />
                     </div>
                     {body && body.attachments.length > 0 && (
                       <div className="attachments pane-attachments">
@@ -1177,23 +1175,13 @@ function App() {
           ) : (
             <>
               <div className="message-content" aria-busy={pendingDetails.has(summary.id)}>
-                {pendingDetails.has(summary.id) && !email ? (
-                  <div className="body-loading">
-                    <div className="spinner" />
-                    <span>Nachricht wird geladen …</span>
-                  </div>
-                ) : email ? (
-                  <iframe
-                    className="message-body"
-                    title={`Inhalt von ${summary.subject}`}
-                    sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                    srcDoc={emailDocument(email, true, snapshot.imageToken, mailColorMode)}
-                  />
-                ) : (
-                  <div className="body-loading error-copy">
-                    Der Nachrichteninhalt ist nicht verfügbar.
-                  </div>
-                )}
+                <MessageBody
+                  colorMode={mailColorMode}
+                  email={email}
+                  imageToken={snapshot.imageToken}
+                  pending={pendingDetails.has(summary.id)}
+                  subject={summary.subject}
+                />
               </div>
               {email && email.attachments.length > 0 && (
                 <section className="attachments" aria-label="Anhänge">
@@ -1316,7 +1304,7 @@ function TodoPage({
   showParked,
   snapshot,
   status,
-}: {
+}: Readonly<{
   buckets: TriageBucket[]
   error: string | null
   onDismissError: () => void
@@ -1333,7 +1321,7 @@ function TodoPage({
   showParked: boolean
   snapshot: TriageSnapshot
   status: string
-}) {
+}>) {
   const failed = buckets.filter(
     (bucket) => bucket.unsorted && bucket.messages.some((message) => message.attempts >= 3),
   )
@@ -1365,7 +1353,7 @@ function TodoPage({
           </button>
         </div>
       </header>
-      <p className="todo-status" role="status">
+      <output className="todo-status">
         {statusLine(snapshot.status, snapshot.mode)}
         {snapshot.status.waitingForCodex && (
           <>
@@ -1375,7 +1363,7 @@ function TodoPage({
             </button>
           </>
         )}
-      </p>
+      </output>
       {error && (
         <div className="inline-error" role="alert">
           <span>{error}</span>
@@ -1398,11 +1386,7 @@ function TodoPage({
       <section className="todo-section" aria-labelledby="todo-title">
         <div className="runs-heading">
           <h2 id="todo-title">Offen</h2>
-          <p>
-            {openCount === 0
-              ? 'Keine ungelesenen Nachrichten.'
-              : `${openCount} ${openCount === 1 ? 'Nachricht' : 'Nachrichten'} in ${buckets.length} ${buckets.length === 1 ? 'Bucket' : 'Buckets'}`}
-          </p>
+          <p>{openSummary(openCount, buckets.length)}</p>
         </div>
         {buckets.length === 0 ? (
           <div className="todo-empty">
@@ -1430,13 +1414,7 @@ function TodoPage({
                   >
                     <span className="todo-row-main">
                       <strong>{bucket.title}</strong>
-                      <small>
-                        {bucket.unsorted
-                          ? stuck
-                            ? 'Sortierung fehlgeschlagen'
-                            : 'Wird einsortiert …'
-                          : bucket.currentState}
-                      </small>
+                      <small>{bucketRowState(bucket, stuck)}</small>
                     </span>
                     <span className="todo-row-meta">
                       <span className="tag">
@@ -1506,7 +1484,41 @@ function TodoPage({
   )
 }
 
-function AttachmentChips({ email, mode }: { email: ReviewEmail; mode: 'demo' | 'live' }) {
+function MessageBody({
+  colorMode,
+  email,
+  imageToken,
+  pending,
+  subject,
+}: Readonly<{
+  colorMode: MailColorMode
+  email: ReviewEmail | undefined
+  imageToken: string
+  pending: boolean
+  subject: string
+}>) {
+  if (email) {
+    return (
+      <iframe
+        className="message-body"
+        title={`Inhalt von ${subject}`}
+        sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+        srcDoc={emailDocument(email, true, imageToken, colorMode)}
+      />
+    )
+  }
+  if (pending) {
+    return (
+      <div className="body-loading">
+        <div className="spinner" />
+        <span>Nachricht wird geladen …</span>
+      </div>
+    )
+  }
+  return <div className="body-loading error-copy">Der Nachrichteninhalt ist nicht verfügbar.</div>
+}
+
+function AttachmentChips({ email, mode }: Readonly<{ email: ReviewEmail; mode: 'demo' | 'live' }>) {
   return (
     <div className="attachment-list">
       {email.attachments.map((attachment) =>
@@ -1577,7 +1589,7 @@ function RefreshIcon() {
   )
 }
 
-function HelpDialog({ onClose }: { onClose: () => void }) {
+function HelpDialog({ onClose }: Readonly<{ onClose: () => void }>) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
   return (
     <div className="dialog-backdrop">
@@ -1680,7 +1692,7 @@ function SettingsDialog({
   onDecideProposal,
   onSaveMemory,
   onStartLogin,
-}: {
+}: Readonly<{
   authBusy: boolean
   codex: CodexSettings
   demo: boolean
@@ -1692,7 +1704,7 @@ function SettingsDialog({
   onDecideProposal: (id: string, accept: boolean) => void
   onSaveMemory: (notes: string) => void
   onStartLogin: () => void
-}) {
+}>) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
   const [notes, setNotes] = useState(memory.notes)
   useEffect(() => setNotes(memory.notes), [memory.notes])
@@ -1871,7 +1883,7 @@ function ReplyPanel({
   onGenerate,
   onSave,
   onUpdate,
-}: {
+}: Readonly<{
   context?: ThreadContext
   draftResult?: DraftResult
   editor?: ReplyEditorState
@@ -1882,7 +1894,7 @@ function ReplyPanel({
   onGenerate: () => void
   onSave: () => void
   onUpdate: (patch: Partial<ReplyEditorState>) => void
-}) {
+}>) {
   const panelRef = useFocusRegion<HTMLElement>(false)
   const identity = context?.identities.find((item) => item.id === editor?.identityId)
   return (

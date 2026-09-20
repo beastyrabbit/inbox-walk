@@ -223,15 +223,12 @@ export function bundleGroupsConflict(
  * such as a thread, order, tracking, pull request or commit key, unless a
  * conflicting repository or order key keeps them apart. No provider is called.
  */
-export function heuristicBundlePartition(
+/** Joins messages that share an exact identifier unless a conflicting key keeps them apart. */
+function joinByExactKeys(
   emails: readonly ReviewEmailSummary[],
-): BundlePartitionDecision {
-  const byId = new Map<string, ReviewEmailSummary>()
-  const signals = new Map<string, BundleSignals>()
-  for (const email of emails) {
-    byId.set(email.id, email)
-    signals.set(email.id, extractBundleSignals(email))
-  }
+  signals: Map<string, BundleSignals>,
+) {
+  const byId = new Map(emails.map((email) => [email.id, email]))
   const union = new UnionFind()
   const keyOwners = new Map<string, string>()
   for (const email of emails) {
@@ -251,11 +248,18 @@ export function heuristicBundlePartition(
     members.push(email)
     membersByRoot.set(root, members)
   }
+  return [...membersByRoot.values()]
+}
+
+export function heuristicBundlePartition(
+  emails: readonly ReviewEmailSummary[],
+): BundlePartitionDecision {
+  const signals = new Map(emails.map((email) => [email.id, extractBundleSignals(email)]))
   const standaloneEmailIds: string[] = []
   const stories: BundlePartitionStory[] = []
-  for (const members of membersByRoot.values()) {
+  for (const members of joinByExactKeys(emails, signals)) {
     if (members.length < 2) {
-      for (const member of members) standaloneEmailIds.push(member.id)
+      standaloneEmailIds.push(...members.map((member) => member.id))
       continue
     }
     stories.push({

@@ -89,7 +89,7 @@ describe('triage engine', () => {
     })
     await engine.refresh()
     expect(store.message('demo-train')?.status).toBe('gone')
-    expect(store.todo().flatMap((bucket) => bucket.messages).length).toBe(8)
+    expect(store.todo().flatMap((bucket) => bucket.messages)).toHaveLength(8)
     await engine.stop()
     store.close()
   })

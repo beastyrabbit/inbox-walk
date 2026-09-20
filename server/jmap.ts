@@ -498,6 +498,50 @@ function sleep(ms: number, signal: AbortSignal) {
  * signal aborts. A connection that stays silent past three ping intervals is
  * treated as stalled and reopened.
  */
+/** The Email state carried by a push event, or the raw payload when it is not JSON. */
+function emailStateOf(event: ServerSentEvent) {
+  try {
+    const changed = (JSON.parse(event.data) as { changed?: Record<string, { Email?: string }> })
+      .changed
+    return Object.values(changed ?? {})
+      .map((types) => types.Email ?? '')
+      .join('|')
+  } catch {
+    return event.data
+  }
+}
+
+/** Opens the push stream once and reads it until it ends or the signal aborts. */
+async function readPushStream(
+  token: string,
+  connection: AbortController,
+  onEvent: (event: ServerSentEvent) => void,
+  onOpen: () => void,
+) {
+  const session = await getSession(token, connection.signal)
+  const template = session.eventSourceUrl
+  if (!template) {
+    throw new JmapError('Fastmail offers no JMAP push endpoint.', 'PUSH_UNSUPPORTED')
+  }
+  const url = template
+    .replace('{types}', 'Email')
+    .replace('{closeafter}', 'no')
+    .replace('{ping}', String(PUSH_PING_SECONDS))
+  const response = await fetch(url, {
+    headers: { Accept: 'text/event-stream', Authorization: `Bearer ${token}` },
+    signal: connection.signal,
+  })
+  if (!response.ok || !response.body) {
+    throw new JmapError(
+      `Fastmail push connection failed (${response.status})`,
+      response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'PUSH_FAILED',
+      response.status,
+    )
+  }
+  onOpen()
+  await readEventStream(response.body, onEvent, connection.signal)
+}
+
 export async function watchMailChanges(
   token: string,
   onChange: () => void,
@@ -518,52 +562,20 @@ export async function watchMailChanges(
         PUSH_STALL_MS,
       )
     }
-    try {
-      const session = await getSession(token, connection.signal)
-      const template = session.eventSourceUrl
-      if (!template) {
-        throw new JmapError('Fastmail offers no JMAP push endpoint.', 'PUSH_UNSUPPORTED')
-      }
-      const url = template
-        .replace('{types}', 'Email')
-        .replace('{closeafter}', 'no')
-        .replace('{ping}', String(PUSH_PING_SECONDS))
-      const response = await fetch(url, {
-        headers: { Accept: 'text/event-stream', Authorization: `Bearer ${token}` },
-        signal: connection.signal,
-      })
-      if (!response.ok || !response.body) {
-        throw new JmapError(
-          `Fastmail push connection failed (${response.status})`,
-          response.status === 401 ? 'FASTMAIL_AUTH_EXPIRED' : 'PUSH_FAILED',
-          response.status,
-        )
-      }
-      onStatus?.(true)
-      backoff = 1_000
+    const onEvent = (event: ServerSentEvent) => {
       resetStall()
-      await readEventStream(
-        response.body,
-        (event) => {
-          resetStall()
-          if (event.type !== 'state') return
-          let emailState: string | undefined
-          try {
-            const changed = (
-              JSON.parse(event.data) as { changed?: Record<string, { Email?: string }> }
-            ).changed
-            emailState = Object.values(changed ?? {})
-              .map((types) => types.Email ?? '')
-              .join('|')
-          } catch {
-            emailState = event.data
-          }
-          if (emailState === lastState) return
-          lastState = emailState
-          onChange()
-        },
-        connection.signal,
-      )
+      if (event.type !== 'state') return
+      const emailState = emailStateOf(event)
+      if (emailState === lastState) return
+      lastState = emailState
+      onChange()
+    }
+    try {
+      await readPushStream(token, connection, onEvent, () => {
+        onStatus?.(true)
+        backoff = 1_000
+        resetStall()
+      })
     } catch (error) {
       if (signal.aborted) return
       process.stderr.write(

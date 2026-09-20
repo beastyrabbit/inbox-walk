@@ -123,7 +123,10 @@ test('drafts a reply into Fastmail and keeps the notes across a reload', async (
   await expect(page.getByRole('textbox', { name: 'Antwort', exact: true })).toHaveValue(/Dienstag/)
   await page.getByRole('button', { name: 'In Fastmail als Draft speichern' }).click()
   await expect(page.getByText(/Draft gespeichert und verifiziert/)).toBeVisible()
-  await page.waitForTimeout(900)
+  // The editor is saved shortly after the last edit; wait for that write before reloading.
+  await page.waitForResponse(
+    (response) => response.request().method() === 'PUT' && /\/editor$/.test(response.url()),
+  )
   await page.reload()
   await expect(page.getByRole('heading', { level: 1 })).toHaveText(/Re: Essen nächste Woche\?/)
   await page.keyboard.press('r')

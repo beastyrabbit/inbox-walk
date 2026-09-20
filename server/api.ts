@@ -819,38 +819,152 @@ function logApiError(error: unknown) {
   )
 }
 
+interface ErrorResponse {
+  code: string
+  details?: unknown
+  message: string
+  retryable: boolean
+  status: number
+}
+
+const TIMEOUT_MESSAGE =
+  'Der externe Abruf konnte nicht innerhalb der sicheren Grenzen abgeschlossen werden.'
+
+function errorResponse(error: unknown): ErrorResponse {
+  if (error instanceof ApiHttpError || error instanceof ReplyError) return error
+  if (error instanceof JmapError) {
+    const status = error.status === 401 || error.status === 404 ? error.status : 502
+    return { ...error, message: error.message, retryable: status >= 500, status }
+  }
+  if (error instanceof TriageStoreError) {
+    const status = error.code === 'INVALID_BUCKET' ? 400 : 404
+    return { code: error.code, message: error.message, retryable: false, status }
+  }
+  if (error instanceof IoError) {
+    return { code: error.code, message: TIMEOUT_MESSAGE, retryable: true, status: 504 }
+  }
+  if (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name)) {
+    return { code: 'IO_TIMEOUT', message: TIMEOUT_MESSAGE, retryable: true, status: 504 }
+  }
+  return {
+    code: 'INTERNAL_ERROR',
+    message: 'Ein interner Fehler ist aufgetreten.',
+    retryable: true,
+    status: 500,
+  }
+}
+
 function handleError(res: ServerResponse, error: unknown) {
   logApiError(error)
   if (res.headersSent || res.destroyed) {
     if (!res.destroyed) res.destroy()
     return
   }
-  if (error instanceof ApiHttpError) {
-    return apiError(res, error.status, error.code, error.message, error.retryable, error.details)
+  const response = errorResponse(error)
+  return apiError(
+    res,
+    response.status,
+    response.code,
+    response.message,
+    response.retryable,
+    response.details,
+  )
+}
+
+type Route = (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<unknown> | unknown
+
+const MESSAGE_ACTIONS = new Set(['done', 'park', 'unpark', 'newsletter', 'retry'])
+
+function authRoute(method: string | undefined, parts: string[], options: ApiOptions): Route | null {
+  if (parts[1] !== 'auth' || parts[2] !== 'codex') return null
+  if (method === 'GET' && parts[3] === 'status' && !parts[4]) {
+    return (_req, res) =>
+      json(
+        res,
+        200,
+        options.mailbox.mode === 'demo'
+          ? { configured: false, ...selectedCodexSettings() }
+          : (options.codexAuthStatus ?? codexAuthStatus)(),
+      )
   }
-  if (error instanceof JmapError) {
-    const status = error.status === 401 ? 401 : error.status === 404 ? 404 : 502
-    return apiError(res, status, error.code, error.message, status >= 500, error.details)
+  if (method === 'POST' && parts[3] === 'start' && !parts[4]) {
+    return (req, res) => {
+      validateOrigin(req)
+      return startCodexLogin(res, options)
+    }
   }
-  if (error instanceof TriageStoreError) {
-    return apiError(res, error.code === 'INVALID_BUCKET' ? 400 : 404, error.code, error.message)
+  if (method === 'GET' && parts[3] && !parts[4]) {
+    return (_req, res) => codexLoginState(res, parts[3] ?? '')
   }
-  if (error instanceof ReplyError) {
-    return apiError(res, error.status, error.code, error.message, error.retryable, error.details)
+  return null
+}
+
+function todoRoute(method: string | undefined, parts: string[], options: ApiOptions): Route | null {
+  const [, , section, key, sub] = parts
+  if (method === 'GET' && !section) {
+    return (req, res) => {
+      validateOrigin(req)
+      return todo(res, options)
+    }
   }
-  if (
-    error instanceof IoError ||
-    (error instanceof Error && ['TimeoutError', 'AbortError'].includes(error.name))
-  ) {
-    return apiError(
-      res,
-      504,
-      error instanceof IoError ? error.code : 'IO_TIMEOUT',
-      'Der externe Abruf konnte nicht innerhalb der sicheren Grenzen abgeschlossen werden.',
-      true,
-    )
+  if (method === 'POST' && section === 'refresh' && !key) {
+    return (req, res) => refresh(req, res, options)
   }
-  return apiError(res, 500, 'INTERNAL_ERROR', 'Ein interner Fehler ist aufgetreten.', true)
+  if (method === 'POST' && section === 'demo-reset' && !key) {
+    return (req, res) => demoReset(req, res, options)
+  }
+  if (method === 'POST' && section === 'messages' && key && !sub && MESSAGE_ACTIONS.has(key)) {
+    return (req, res) => messageAction(req, res, key as never, options)
+  }
+  if (method === 'PUT' && section === 'memory' && !key) {
+    return (req, res) => saveMemory(req, res, options)
+  }
+  if (method === 'POST' && section === 'memory' && key === 'proposals' && sub) {
+    const decision = parts[5]
+    if (decision === 'accept' || decision === 'reject') {
+      return (req, res) => decideProposal(req, res, sub, decision === 'accept', options)
+    }
+  }
+  return null
+}
+
+function mailRoute(
+  method: string | undefined,
+  parts: string[],
+  cache: MailCache,
+  options: ApiOptions,
+): Route | null {
+  const [, , section, key, sub, extra] = parts
+  if (section === 'emails' && key) {
+    const emailId = key
+    if (method === 'GET' && !sub) {
+      return (_req, res) => emailDetail(res, cache, emailId, options)
+    }
+    if (method === 'GET' && sub === 'images' && extra) {
+      return (_req, res, url) => remoteImage(res, url, cache, emailId, extra, options)
+    }
+    if (method === 'GET' && sub === 'editor') {
+      return (_req, res) => replyEditor(res, emailId, options)
+    }
+    if (method === 'PUT' && sub === 'editor') {
+      return (req, res) => saveReplyEditor(req, res, emailId, options)
+    }
+    if (method === 'POST' && sub === 'replies') {
+      return (req, res) => reply(req, res, cache, emailId, options)
+    }
+    if (method === 'POST' && sub === 'drafts') {
+      return (req, res) => draft(req, res, cache, emailId, options)
+    }
+    return null
+  }
+  if (method === 'GET' && section === 'threads' && key) {
+    return (_req, res, url) =>
+      threadContext(res, cache, key, url.searchParams.get('emailId') ?? '', options)
+  }
+  if (method === 'GET' && section === 'blobs' && key) {
+    return (_req, res, url) => blob(res, url, cache, key, options)
+  }
+  return null
 }
 
 export function createApiMiddleware(apiOptions: ApiOptions) {
@@ -861,85 +975,14 @@ export function createApiMiddleware(apiOptions: ApiOptions) {
       const url = new URL(req.url, 'http://localhost')
       const parts = url.pathname.split('/').filter(Boolean)
       try {
-        if (req.method === 'GET' && url.pathname === '/api/auth/codex/status') {
-          return json(
-            res,
-            200,
-            apiOptions.mailbox.mode === 'demo'
-              ? { configured: false, ...selectedCodexSettings() }
-              : (apiOptions.codexAuthStatus ?? codexAuthStatus)(),
-          )
-        }
-        if (req.method === 'POST' && url.pathname === '/api/auth/codex/start') {
-          validateOrigin(req)
-          return await startCodexLogin(res, apiOptions)
-        }
-        if (req.method === 'GET' && parts[1] === 'auth' && parts[2] === 'codex' && parts[3]) {
-          return codexLoginState(res, parts[3])
-        }
-        if (parts[1] !== 'todo') return apiError(res, 404, 'NOT_FOUND', 'Not found')
-        if (req.method === 'GET' && !parts[2]) {
-          validateOrigin(req)
-          return await todo(res, apiOptions)
-        }
-        if (req.method === 'POST' && parts[2] === 'refresh' && !parts[3]) {
-          return await refresh(req, res, apiOptions)
-        }
-        if (req.method === 'POST' && parts[2] === 'demo-reset' && !parts[3]) {
-          return await demoReset(req, res, apiOptions)
-        }
-        if (req.method === 'POST' && parts[2] === 'messages' && parts[3] && !parts[4]) {
-          const action = parts[3]
-          if (['done', 'park', 'unpark', 'newsletter', 'retry'].includes(action)) {
-            return await messageAction(req, res, action as never, apiOptions)
-          }
-        }
-        if (req.method === 'PUT' && parts[2] === 'memory' && !parts[3]) {
-          return await saveMemory(req, res, apiOptions)
-        }
-        if (
-          req.method === 'POST' &&
-          parts[2] === 'memory' &&
-          parts[3] === 'proposals' &&
-          parts[4]
-        ) {
-          if (parts[5] === 'accept') return decideProposal(req, res, parts[4], true, apiOptions)
-          if (parts[5] === 'reject') return decideProposal(req, res, parts[4], false, apiOptions)
-        }
-        if (parts[2] === 'emails' && parts[3]) {
-          const emailId = parts[3]
-          if (req.method === 'GET' && !parts[4]) {
-            return await emailDetail(res, cache, emailId, apiOptions)
-          }
-          if (req.method === 'GET' && parts[4] === 'images' && parts[5]) {
-            return await remoteImage(res, url, cache, emailId, parts[5], apiOptions)
-          }
-          if (req.method === 'GET' && parts[4] === 'editor') {
-            return replyEditor(res, emailId, apiOptions)
-          }
-          if (req.method === 'PUT' && parts[4] === 'editor') {
-            return await saveReplyEditor(req, res, emailId, apiOptions)
-          }
-          if (req.method === 'POST' && parts[4] === 'replies') {
-            return await reply(req, res, cache, emailId, apiOptions)
-          }
-          if (req.method === 'POST' && parts[4] === 'drafts') {
-            return await draft(req, res, cache, emailId, apiOptions)
-          }
-        }
-        if (req.method === 'GET' && parts[2] === 'threads' && parts[3]) {
-          return await threadContext(
-            res,
-            cache,
-            parts[3],
-            url.searchParams.get('emailId') ?? '',
-            apiOptions,
-          )
-        }
-        if (req.method === 'GET' && parts[2] === 'blobs' && parts[3]) {
-          return await blob(res, url, cache, parts[3], apiOptions)
-        }
-        return apiError(res, 404, 'NOT_FOUND', 'Not found')
+        const route =
+          authRoute(req.method, parts, apiOptions) ??
+          (parts[1] === 'todo'
+            ? (todoRoute(req.method, parts, apiOptions) ??
+              mailRoute(req.method, parts, cache, apiOptions))
+            : null)
+        if (!route) return apiError(res, 404, 'NOT_FOUND', 'Not found')
+        return await route(req, res, url)
       } catch (error) {
         return handleError(res, error)
       }

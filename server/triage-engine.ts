@@ -139,26 +139,35 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       try {
         await sorter({ batch, mailbox, signal, store })
         signal.throwIfAborted()
-        const unsorted = ids.filter((id) => store.message(id)?.status === 'queued')
-        if (unsorted.length > 0) {
-          store.recordAttempt(unsorted, 'Die Nachricht wurde nicht einsortiert.')
-        }
-        store.recordSort(new Date().toISOString(), null)
+        recordSortOutcome(ids)
       } catch (error) {
-        if (signal.aborted) return
-        log('triage_sort_failed', { message: error instanceof Error ? error.message : 'unknown' })
-        const reason = publicSortError(error)
-        store.recordSort(new Date().toISOString(), reason)
-        if (error instanceof CodexAuthenticationError || isCodexAuthenticationFailure(error)) {
-          waitingForCodex = true
-          return
-        }
-        store.recordAttempt(
-          ids.filter((id) => store.message(id)?.status === 'queued'),
-          reason,
-        )
+        if (signal.aborted || !recordSortFailure(ids, error)) return
       }
     }
+  }
+
+  function recordSortOutcome(ids: readonly string[]) {
+    const unsorted = ids.filter((id) => store.message(id)?.status === 'queued')
+    if (unsorted.length > 0) {
+      store.recordAttempt(unsorted, 'Die Nachricht wurde nicht einsortiert.')
+    }
+    store.recordSort(new Date().toISOString(), null)
+  }
+
+  /** Returns false when sorting must pause instead of trying the next batch. */
+  function recordSortFailure(ids: readonly string[], error: unknown) {
+    log('triage_sort_failed', { message: error instanceof Error ? error.message : 'unknown' })
+    const reason = publicSortError(error)
+    store.recordSort(new Date().toISOString(), reason)
+    if (error instanceof CodexAuthenticationError || isCodexAuthenticationFailure(error)) {
+      waitingForCodex = true
+      return false
+    }
+    store.recordAttempt(
+      ids.filter((id) => store.message(id)?.status === 'queued'),
+      reason,
+    )
+    return true
   }
 
   function sort() {
@@ -229,7 +238,9 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       timer = undefined
       if (pushTimer) clearTimeout(pushTimer)
       controller.abort(new DOMException('Triage engine stopped.', 'AbortError'))
-      await Promise.allSettled([running, sorting, watching].filter(Boolean))
+      await Promise.allSettled(
+        [running, sorting, watching].filter((work): work is Promise<void> => work !== null),
+      )
     },
   }
 }

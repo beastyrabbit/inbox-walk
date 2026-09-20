@@ -15,10 +15,18 @@ function escapeHtml(value: string) {
   return value.replace(/[&<>'"]/g, (character) => entities[character])
 }
 
+const TRAILING_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?', ')', ']'])
+
+/** Splits punctuation that ends a sentence from the URL it follows, without regex backtracking. */
+function splitTrailingPunctuation(match: string) {
+  let end = match.length
+  while (end > 0 && TRAILING_PUNCTUATION.has(match[end - 1] ?? '')) end -= 1
+  return { trailing: match.slice(end), url: match.slice(0, end) }
+}
+
 function linkify(escaped: string) {
   return escaped.replace(/\bhttps?:\/\/[^\s<>"']+/g, (match) => {
-    const trailing = match.match(/[.,;:!?)\]]+$/)?.[0] ?? ''
-    const url = trailing ? match.slice(0, -trailing.length) : match
+    const { trailing, url } = splitTrailingPunctuation(match)
     return `<a href="${url}">${url}</a>${trailing}`
   })
 }
@@ -27,8 +35,8 @@ function linkify(escaped: string) {
 export function plainTextHtml(text: string) {
   const lines = text
     .replace(/\r\n?/g, '\n')
-    .replace(/[ \t]+$/gm, '')
     .split('\n')
+    .map((line) => line.trimEnd())
   let html = ''
   let quoted = false
   for (const line of lines) {
@@ -70,7 +78,7 @@ export function stripDarkSchemeRules(css: string) {
 
 function pixelValue(value: string | null | undefined) {
   if (!value) return undefined
-  const match = value.trim().match(/^(\d+(?:\.\d+)?)(?:px)?$/i)
+  const match = /^(\d+(?:\.\d+)?)(?:px)?$/i.exec(value.trim())
   return match ? Number(match[1]) : undefined
 }
 
@@ -109,36 +117,38 @@ const plainTextStyles = `
     body { min-height: 100vh; filter: none; }
     a { color: #e28a67; }`
 
-export function emailDocument(
-  email: ReviewEmail,
-  loadRemoteImages: boolean,
-  imageToken = '',
-  colorMode: MailColorMode = 'dark',
-) {
-  const isPlainText = !email.html
-  const source = email.html || plainTextHtml(email.text)
+const FORBIDDEN_TAGS = [
+  'script',
+  'iframe',
+  'object',
+  'embed',
+  'form',
+  'input',
+  'button',
+  'link',
+  'meta',
+  'video',
+  'audio',
+  'source',
+]
+
+/**
+ * Sanitizes the complete document. WHOLE_DOCUMENT keeps the sender's head
+ * stylesheet, which the reader moves into the body below; everything still
+ * renders inside a script-free sandboxed iframe with a strict CSP.
+ */
+function sanitizedDocument(source: string) {
   const clean = DOMPurify.sanitize(source, {
     WHOLE_DOCUMENT: true,
     USE_PROFILES: { html: true, svg: true, svgFilters: false },
-    FORBID_TAGS: [
-      'script',
-      'iframe',
-      'object',
-      'embed',
-      'form',
-      'input',
-      'button',
-      'link',
-      'meta',
-      'video',
-      'audio',
-      'source',
-    ],
+    FORBID_TAGS: FORBIDDEN_TAGS,
     FORBID_ATTR: ['srcset', 'onerror', 'onload', 'background'],
   })
-  const parsed = new DOMParser().parseFromString(clean, 'text/html')
-  // Mail authors put their stylesheets in <head> and canvas colours on <body>. Keep both:
-  // styles move into the body, and the body's own presentation moves onto a wrapper.
+  return new DOMParser().parseFromString(clean, 'text/html')
+}
+
+/** Mail authors put stylesheets in <head> and canvas colours on <body>; keep both inside a wrapper. */
+function hoistHeadStyles(parsed: Document) {
   const mailRoot = parsed.createElement('div')
   mailRoot.className = 'mail-root'
   const bodyStyle = parsed.body.getAttribute('style')
@@ -148,45 +158,59 @@ export function emailDocument(
     mailRoot.setAttribute('style', `${mailRoot.getAttribute('style') ?? ''}${bodyStyle}`)
   mailRoot.append(...parsed.body.childNodes)
   parsed.body.replaceChildren(...parsed.head.querySelectorAll('style'), mailRoot)
-  const remoteImageIds = email.remoteImageIds ?? {}
+}
+
+function blockImage(image: HTMLImageElement) {
+  image.removeAttribute('src')
+  image.setAttribute('data-remote-image', 'blocked')
+  image.setAttribute('alt', image.getAttribute('alt') || 'Bild nicht verfügbar')
+}
+
+function proxiedRemoteImage(src: string, email: ReviewEmail, imageToken: string) {
+  try {
+    const normalized = new URL(src.startsWith('//') ? `https:${src}` : src).toString()
+    const imageId = (email.remoteImageIds ?? {})[normalized]
+    return imageId ? remoteImageUrl(email.id, imageId, imageToken) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Points every image at an inline blob, the backend proxy, or blocks it. */
+function rewriteImages(
+  parsed: Document,
+  email: ReviewEmail,
+  loadRemoteImages: boolean,
+  imageToken: string,
+) {
   const cids = new Map(
     email.inlineResources
       .filter((resource) => resource.cid)
       .map((resource) => [resource.cid?.toLowerCase(), blobUrl(resource.blobId, true)]),
   )
-  const blockImage = (image: HTMLImageElement) => {
-    image.removeAttribute('src')
-    image.setAttribute('data-remote-image', 'blocked')
-    image.setAttribute('alt', image.getAttribute('alt') || 'Bild nicht verfügbar')
-  }
   for (const image of parsed.querySelectorAll('img')) {
-    const src = image.getAttribute('src') || ''
-    if (!src.trim() || src.trim() === '#') {
+    const src = (image.getAttribute('src') || '').trim()
+    if (!src || src === '#') {
       image.remove()
       continue
     }
-    if (src.toLowerCase().startsWith('cid:')) {
-      const replacement = cids.get(src.slice(4).replace(/^<|>$/g, '').toLowerCase())
-      if (replacement) image.setAttribute('src', replacement)
-      else blockImage(image)
-    } else if (/^(https?:)?\/\//i.test(src)) {
-      let imageId: string | undefined
-      try {
-        const normalized = new URL(src.startsWith('//') ? `https:${src}` : src).toString()
-        imageId = remoteImageIds[normalized]
-      } catch {
-        // Malformed remote URLs stay blocked.
-      }
-      if (loadRemoteImages && imageId) {
-        image.setAttribute('src', remoteImageUrl(email.id, imageId, imageToken))
-      } else {
-        blockImage(image)
-      }
-    } else if (!src.toLowerCase().startsWith('data:image/')) {
-      blockImage(image)
+    const lower = src.toLowerCase()
+    let replacement: string | undefined
+    if (lower.startsWith('cid:')) {
+      replacement = cids.get(src.slice(4).replace(/^<|>$/g, '').toLowerCase())
+    } else if (lower.startsWith('data:image/')) {
+      replacement = src
+    } else if (loadRemoteImages && /^(https?:)?\/\//i.test(src)) {
+      replacement = proxiedRemoteImage(src, email, imageToken)
     }
+    if (replacement) image.setAttribute('src', replacement)
+    else blockImage(image)
     constrainImage(image)
   }
+}
+
+/** Removes every remaining way for the document to reach a remote host. */
+function stripRemoteReferences(parsed: Document) {
   for (const element of parsed.querySelectorAll('[srcset], [background], [poster]')) {
     element.removeAttribute('srcset')
     element.removeAttribute('background')
@@ -216,6 +240,19 @@ export function emailDocument(
     link.setAttribute('target', '_blank')
     link.setAttribute('rel', 'noopener noreferrer')
   }
+}
+
+export function emailDocument(
+  email: ReviewEmail,
+  loadRemoteImages: boolean,
+  imageToken = '',
+  colorMode: MailColorMode = 'dark',
+) {
+  const isPlainText = !email.html
+  const parsed = sanitizedDocument(email.html || plainTextHtml(email.text))
+  hoistHeadStyles(parsed)
+  rewriteImages(parsed, email, loadRemoteImages, imageToken)
+  stripRemoteReferences(parsed)
   const appOrigin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
   const modeStyles = isPlainText ? plainTextStyles : readerStyles[colorMode]
   return `<!doctype html><html lang="de"><head><base target="_blank"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${appOrigin} data: blob:; style-src 'unsafe-inline';"><style>

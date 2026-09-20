@@ -98,7 +98,7 @@ describe('triage tools', () => {
     const empty = await call('search_mail', { limit: 5 })
     expect(empty.value).toMatchObject({ error: expect.stringContaining('at least one') })
     const thread = await call('get_thread', { threadId: 'thread-github-184' })
-    expect((thread.value.messages as unknown[]).length).toBe(2)
+    expect(thread.value.messages as unknown[]).toHaveLength(2)
     const text = await call('get_email_text', { emailId: 'demo-shop' })
     expect(text.value).toMatchObject({ id: 'demo-shop', truncated: false })
     expect(String(text.value.text)).not.toContain('<')

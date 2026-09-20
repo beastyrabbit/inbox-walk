@@ -508,10 +508,8 @@ export function createTriageStore(databasePath = triageStorePath()): TriageStore
         const proposal = selectProposal.get(id) as { note: string } | undefined
         if (!proposal) return null
         const current = (selectState.get() as { memory_notes: string }).memory_notes.trimEnd()
-        const next = `${current ? `${current}\n` : ''}${proposal.note}`.slice(
-          0,
-          TRIAGE_MEMORY_MAX_LENGTH,
-        )
+        const separator = current ? '\n' : ''
+        const next = `${current}${separator}${proposal.note}`.slice(0, TRIAGE_MEMORY_MAX_LENGTH)
         updateNotes.run(next)
         deleteProposal.run(id)
         return memory()
