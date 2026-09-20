@@ -224,7 +224,7 @@ function responseFor<T>(responses: ResponseTuple<T>[], callId: string): MethodRe
   return found[1]
 }
 
-/** Unread, non-draft mail outside Spam, Trash, Sent and Drafts. */
+/** Unread, non-draft mail outside Spam and Trash; Sent-only mail is dropped after the fetch. */
 export function unreadFilter(excludedMailboxIds: readonly string[] = []) {
   const conditions: Array<Record<string, unknown>> = [
     { notKeyword: '$seen' },
@@ -236,9 +236,10 @@ export function unreadFilter(excludedMailboxIds: readonly string[] = []) {
   return { operator: 'AND', conditions }
 }
 
+/** Only roles that end a message's life in the todo; Inbox+Sent mail must still be queued. */
 function excludedMailboxIds(mailboxes: readonly MailboxOption[]) {
   return mailboxes
-    .filter((mailbox) => mailbox.role === 'junk' || EXCLUDED_MAILBOX_ROLES.has(mailbox.role ?? ''))
+    .filter((mailbox) => mailbox.role === 'junk' || mailbox.role === 'trash')
     .map((mailbox) => mailbox.id)
 }
 
@@ -335,6 +336,7 @@ const DETAIL_PROPERTIES = [
   'bodyValues',
   'bodyStructure',
   'attachments',
+  'keywords',
 ]
 
 async function getEmails(
@@ -805,7 +807,9 @@ export async function fetchThread(
       'THREAD_INCOMPLETE',
     )
   }
+  // A saved draft is never reply context; otherwise it would become the reply target.
   return fetched.list
+    .filter((email) => email.keywords?.$draft !== true)
     .map((email) => ({ ...detail(email, mailboxes), sentAt: email.sentAt ?? null }))
     .sort((a, b) => Date.parse(a.sentAt ?? a.receivedAt) - Date.parse(b.sentAt ?? b.receivedAt))
 }

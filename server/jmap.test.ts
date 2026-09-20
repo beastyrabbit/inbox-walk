@@ -4,6 +4,7 @@ import {
   fetchEmailDetail,
   fetchEmailSummaries,
   fetchMailAccount,
+  fetchThread,
   fetchUnreadEmailIds,
   markEmailsRead,
   moveEmailsOutOfSpam,
@@ -451,6 +452,16 @@ describe('Fastmail JMAP adapter', () => {
                   subject: 'Sent',
                   bodyValues: {},
                 },
+                {
+                  id: 'both',
+                  threadId: 'thread-3',
+                  mailboxIds: { inbox: true, sent: true },
+                  receivedAt: '2026-08-01T08:00:00Z',
+                  from: [{ name: 'Me', email: 'alex@example.com' }],
+                  to: [],
+                  subject: 'Inbox and Sent',
+                  bodyValues: {},
+                },
               ],
             },
             'emails',
@@ -460,8 +471,12 @@ describe('Fastmail JMAP adapter', () => {
     vi.stubGlobal('fetch', fetchMock)
 
     const account = await fetchMailAccount('secret-token')
-    const result = await fetchEmailSummaries(account, 'secret-token', ['incoming', 'outgoing'])
-    expect(result.emails).toHaveLength(1)
+    const result = await fetchEmailSummaries(account, 'secret-token', [
+      'incoming',
+      'outgoing',
+      'both',
+    ])
+    expect(result.emails.map((email) => email.id)).toEqual(['incoming', 'both'])
     expect(result.emails[0]).toMatchObject({
       id: 'incoming',
       subject: 'Hallo',
@@ -492,10 +507,21 @@ describe('Fastmail JMAP adapter', () => {
       const [method, arguments_, callId] = request.methodCalls[0] ?? []
       if (method === 'Mailbox/get') {
         return jmapResponse([
-          ['Mailbox/get', { list: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }] }, callId],
+          [
+            'Mailbox/get',
+            {
+              list: [
+                { id: 'inbox', name: 'Inbox', role: 'inbox' },
+                { id: 'sent', name: 'Sent', role: 'sent' },
+                { id: 'trash', name: 'Trash', role: 'trash' },
+              ],
+            },
+            callId,
+          ],
         ])
       }
       if (method === 'Email/query') {
+        expect(arguments_?.filter).toEqual(unreadFilter(['trash']))
         const position = Number(arguments_?.position ?? 0)
         const requestedLimit = Number(arguments_?.limit ?? 250)
         const limit = Math.min(requestedLimit, 100)
@@ -899,5 +925,65 @@ describe('Fastmail JMAP adapter', () => {
     controller.abort()
     await watching
     expect(status.slice(0, 4)).toEqual([true, false, true, false])
+  })
+
+  it('drops saved drafts from thread context so they never become the reply target', async () => {
+    const message = (id: string, extra: Record<string, unknown>) => ({
+      id,
+      threadId: 'thread-1',
+      mailboxIds: { inbox: true },
+      receivedAt: '2026-08-01T10:00:00Z',
+      from: [{ name: 'Mara', email: 'mara@example.com' }],
+      to: [{ name: 'Alex', email: 'alex@example.com' }],
+      subject: 'Hallo',
+      bodyValues: {},
+      ...extra,
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async (input, init) => {
+        if (String(input).endsWith('/jmap/session')) {
+          return new Response(
+            JSON.stringify({
+              apiUrl: draftContext.apiUrl,
+              downloadUrl: draftContext.downloadUrl,
+              primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acc-1' },
+              capabilities: {},
+            }),
+          )
+        }
+        const [method, arguments_, callId] = JSON.parse(String(init?.body)).methodCalls[0]
+        if (method === 'Thread/get') {
+          return jmapResponse([
+            [method, { list: [{ id: 'thread-1', emailIds: ['a', 'd'] }] }, callId],
+          ])
+        }
+        if (method === 'Mailbox/get') {
+          return jmapResponse([
+            [method, { list: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }] }, callId],
+          ])
+        }
+        expect(arguments_.properties).toContain('keywords')
+        return jmapResponse([
+          [
+            method,
+            {
+              list: [
+                message('a', {}),
+                message('d', {
+                  keywords: { $draft: true },
+                  mailboxIds: { drafts: true },
+                  receivedAt: '2026-08-01T11:00:00Z',
+                }),
+              ],
+            },
+            callId,
+          ],
+        ])
+      }),
+    )
+    const account = await fetchMailAccount('token')
+    const thread = await fetchThread(account.context, 'token', 'thread-1', account.mailboxes)
+    expect(thread.map((email) => email.id)).toEqual(['a'])
   })
 })
