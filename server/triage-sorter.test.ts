@@ -144,5 +144,7 @@ describe('triage tools', () => {
     expect(htmlToText('<style>a{}</style><p>Hallo &amp; <b>Welt</b></p><br>Ende')).toBe(
       'Hallo & Welt\nEnde',
     )
+    expect(htmlToText('<header>Order 123</header><p>Delivery</p>')).toBe('Order 123\nDelivery')
+    expect(htmlToText('<head><title>x</title></head><body>Body</body>')).toBe('Body')
   })
 })

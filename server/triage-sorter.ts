@@ -191,6 +191,13 @@ function stripElements(html: string, tag: string) {
   while (cursor < html.length) {
     const start = lower.indexOf(open, cursor)
     if (start < 0) break
+    const next = lower[start + open.length]
+    // `<header>` must not be mistaken for `<head>`: the name has to end here.
+    if (next !== undefined && next !== '>' && next !== '/' && !/\s/.test(next)) {
+      output += html.slice(cursor, start + open.length)
+      cursor = start + open.length
+      continue
+    }
     const end = lower.indexOf(close, start)
     output += html.slice(cursor, start)
     cursor = end < 0 ? html.length : end + close.length
