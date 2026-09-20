@@ -368,6 +368,8 @@ function App() {
   const dropBucketState = useCallback(() => {
     viewEpochRef.current += 1
     detailRequestsRef.current.clear()
+    setReplyLoading(false)
+    setSubmitting(false)
     setDetails({})
     setPendingDetails(new Set())
     setFailedDetails(new Set())
@@ -655,7 +657,7 @@ function App() {
         setStatus('Der Thread konnte nicht aktualisiert werden; der letzte Stand bleibt sichtbar.')
       }
     } finally {
-      setReplyLoading(false)
+      if (viewEpochRef.current === epoch) setReplyLoading(false)
     }
   }, [summary, threadContexts])
 
@@ -761,7 +763,7 @@ function App() {
     } catch (cause) {
       if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      setReplyLoading(false)
+      if (viewEpochRef.current === epoch) setReplyLoading(false)
     }
   }
 
@@ -809,7 +811,7 @@ function App() {
     } catch (cause) {
       if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      setSubmitting(false)
+      if (viewEpochRef.current === epoch) setSubmitting(false)
     }
   }
 
