@@ -226,8 +226,9 @@ function stripElements(html: string, tag: string) {
       closeMissing = true
       // Unclosed block in malformed mail: drop only the tag, keep the text after it.
       const end = tagEnd(html, start)
-      cursor = end < 0 ? start + open.length : end
-      if (end < 0) output += html.slice(start, cursor)
+      // No `>` after this point means no later tag can end either: keep the rest as text.
+      if (end < 0) return output + html.slice(start)
+      cursor = end
       continue
     }
     cursor = end + close.length
