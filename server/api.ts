@@ -462,6 +462,24 @@ async function demoReset(req: IncomingMessage, res: ServerResponse, options: Api
   return json(res, 200, snapshot(options))
 }
 
+/** Only an explicit user action marks mail read, and only the named IDs. */
+async function markDone(store: TriageStore, mailbox: Mailbox, emailIds: readonly string[]) {
+  let marked: Awaited<ReturnType<Mailbox['markRead']>>
+  try {
+    marked = await mailbox.markRead(emailIds)
+  } catch (error) {
+    // Fastmail may have applied part of the batch before the failure; keep those done locally.
+    if (error instanceof JmapError && error.details?.confirmedIds.length) {
+      store.markDone(error.details.confirmedIds)
+      store.logEvent('user_done', { count: error.details.confirmedIds.length, partial: true })
+    }
+    throw error
+  }
+  store.markDone(marked.markedIds)
+  store.logEvent('user_done', { count: marked.markedIds.length })
+  return marked.failed
+}
+
 async function messageAction(
   req: IncomingMessage,
   res: ServerResponse,
@@ -476,21 +494,7 @@ async function messageAction(
   for (const emailId of emailIds) requireKnownEmail(store, emailId)
   let failed: TriageActionResult['failed'] = []
   if (action === 'done') {
-    // Only an explicit user action marks mail read, and only the named IDs.
-    let marked: Awaited<ReturnType<Mailbox['markRead']>>
-    try {
-      marked = await mailbox.markRead(emailIds)
-    } catch (error) {
-      // Fastmail may have applied part of the batch before the failure; keep those done locally.
-      if (error instanceof JmapError && error.details?.confirmedIds.length) {
-        store.markDone(error.details.confirmedIds)
-        store.logEvent('user_done', { count: error.details.confirmedIds.length, partial: true })
-      }
-      throw error
-    }
-    store.markDone(marked.markedIds)
-    failed = marked.failed
-    store.logEvent('user_done', { count: marked.markedIds.length })
+    failed = await markDone(store, mailbox, emailIds)
   } else if (action === 'park') {
     store.park(emailIds)
   } else if (action === 'unpark') {
