@@ -241,6 +241,11 @@ export function createTriageTools({ batch, mailbox, signal, store }: TriageSortC
   }
   const unassigned = () =>
     [...batchIds].filter((emailId) => store.message(emailId)?.status === 'queued')
+  /** Only this batch and already sorted members may be moved; other queued mail keeps its own turn. */
+  const outsideScope = (emailIds: readonly string[]) =>
+    emailIds.filter(
+      (emailId) => !batchIds.has(emailId) && store.message(emailId)?.status !== 'sorted',
+    )
   const log = (kind: string, detail: Record<string, unknown>) => store.logEvent(kind, detail)
 
   return [
@@ -367,6 +372,13 @@ export function createTriageTools({ batch, mailbox, signal, store }: TriageSortC
       async execute(_callId, args) {
         try {
           const { emailIds, ...metadata } = args
+          const blocked = outsideScope(emailIds)
+          if (blocked.length > 0) {
+            return toolText({
+              error: 'Only IDs from newEmails or bucket members may be assigned.',
+              rejectedEmailIds: blocked,
+            })
+          }
           const bucketId = store.createBucket(metadata, emailIds)
           log('create_bucket', { bucketId, emailIds })
           return toolText({ bucketId, unassignedNewEmailIds: unassigned() })
@@ -394,6 +406,13 @@ export function createTriageTools({ batch, mailbox, signal, store }: TriageSortC
       async execute(_callId, args) {
         try {
           const { bucketId, emailIds, ...patch } = args
+          const blocked = outsideScope(emailIds)
+          if (blocked.length > 0) {
+            return toolText({
+              error: 'Only IDs from newEmails or bucket members may be assigned.',
+              rejectedEmailIds: blocked,
+            })
+          }
           store.addToBucket(bucketId, emailIds, patch)
           log('add_to_bucket', { bucketId, emailIds })
           return toolText({ bucketId, unassignedNewEmailIds: unassigned() })

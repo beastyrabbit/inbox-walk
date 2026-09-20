@@ -61,12 +61,28 @@ describe('triage tools', () => {
     store.close()
   })
 
+  it('refuses to move queued mail that is not part of the batch', async () => {
+    const { call, store } = await setup(['demo-shop'])
+    const { emails } = await createDemoMailbox().summaries(['demo-dhl'])
+    store.enqueue(emails)
+    store.recordAttempt(['demo-dhl'], 'x')
+    store.recordAttempt(['demo-dhl'], 'x')
+    store.recordAttempt(['demo-dhl'], 'x')
+    const rejected = await call('create_bucket', {
+      ...metadata,
+      emailIds: ['demo-shop', 'demo-dhl'],
+    })
+    expect(rejected.value).toMatchObject({ rejectedEmailIds: ['demo-dhl'] })
+    expect(store.message('demo-dhl')).toMatchObject({ attempts: 3, status: 'queued' })
+    store.close()
+  })
+
   it('reports store errors as tool text instead of failing the session', async () => {
     const { call, store } = await setup()
     const unknown = await call('add_to_bucket', { bucketId: 'nope', emailIds: ['demo-shop'] })
     expect(unknown.value).toMatchObject({ error: expect.stringContaining('Unknown bucket') })
     const invented = await call('create_bucket', { ...metadata, emailIds: ['invented-id'] })
-    expect(invented.value).toMatchObject({ error: expect.stringContaining('Unknown email') })
+    expect(invented.value).toMatchObject({ rejectedEmailIds: ['invented-id'] })
     expect(store.todo().every((bucket) => bucket.unsorted)).toBe(true)
     store.close()
   })

@@ -12,7 +12,6 @@ import type {
   ReplyEditorState,
   ReplyProposal,
   ReviewEmail,
-  ThreadMessage,
   TriageActionResult,
   TriageSnapshot,
 } from '../src/shared.ts'
@@ -71,7 +70,6 @@ interface MailCache {
   remoteImageSources: Map<string, string>
   replyInFlight: Set<string>
   replyWork: Map<string, Promise<ReplyProposal>>
-  threads: Map<string, ThreadMessage[]>
 }
 
 type TriageSnapshotIdentities = Awaited<ReturnType<Mailbox['identities']>>
@@ -320,7 +318,6 @@ function createMailCache(): MailCache {
     remoteImageSources: new Map(),
     replyInFlight: new Set(),
     replyWork: new Map(),
-    threads: new Map(),
   }
 }
 
@@ -341,10 +338,7 @@ function registerResources(cache: MailCache, email: ReviewEmail) {
 function rememberDetail(cache: MailCache, email: ReviewEmail) {
   if (cache.details.size >= MAX_CACHED_DETAILS) {
     const oldest = cache.details.keys().next().value
-    if (oldest) {
-      cache.details.delete(oldest)
-      cache.threads.delete(oldest)
-    }
+    if (oldest) cache.details.delete(oldest)
   }
   cache.details.set(email.id, email)
   registerResources(cache, email)
@@ -396,12 +390,10 @@ async function loadDetail(cache: MailCache, mailbox: Mailbox, emailId: string) {
   return email
 }
 
+/** Threads are fetched fresh so a reply never misses mail that arrived later. */
 async function loadThread(cache: MailCache, mailbox: Mailbox, threadId: string) {
-  const cached = cache.threads.get(threadId)
-  if (cached) return cached
   const messages = await mailbox.thread(threadId)
   for (const email of messages) registerResources(cache, email)
-  cache.threads.set(threadId, messages)
   return messages
 }
 

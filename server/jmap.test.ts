@@ -378,13 +378,14 @@ describe('Fastmail JMAP adapter', () => {
     })
   })
 
-  it('excludes the Spam mailbox when the account has one', () => {
-    expect(unreadFilter('junk')).toEqual({
+  it('excludes Spam and Trash at query level so tracked mail moved there drops out', () => {
+    expect(unreadFilter(['junk', 'trash'])).toEqual({
       operator: 'AND',
       conditions: [
         { notKeyword: '$seen' },
         { notKeyword: '$draft' },
         { operator: 'NOT', conditions: [{ inMailbox: 'junk' }] },
+        { operator: 'NOT', conditions: [{ inMailbox: 'trash' }] },
       ],
     })
   })

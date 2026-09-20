@@ -21,6 +21,7 @@ import {
   type ReviewEmailSummary,
   type ThreadContext,
   TRIAGE_MEMORY_MAX_LENGTH,
+  type TriageActionResult,
   type TriageBucket,
   type TriageMemory,
   type TriageMessage,
@@ -33,6 +34,7 @@ export { emailDocument } from './email-document.ts'
 const LIST_POLL_INTERVAL_MS = 15_000
 const EDITOR_SAVE_DELAY_MS = 750
 const PARKED_PREFIX = 'parked:'
+const ACTION_BATCH_SIZE = 500
 
 function addressLine(addresses: MailAddress[]) {
   if (addresses.length === 0) return 'Unbekannter Absender'
@@ -265,7 +267,7 @@ function App() {
   const setMailColorMode = useCallback((mode: MailColorMode) => {
     setMailColorModeState(mode)
     try {
-      window.localStorage.setItem('inbox-walk.mail-color-mode', mode)
+      window.localStorage.setItem(MAIL_COLOR_STORAGE_KEY, mode)
     } catch {
       // The preference simply resets when storage is unavailable.
     }
@@ -476,7 +478,18 @@ function App() {
       setBusy(true)
       setError(null)
       try {
-        const result = await api.messageAction(action, emailIds, current.csrfToken)
+        let result: TriageActionResult | undefined
+        for (let start = 0; start < emailIds.length; start += ACTION_BATCH_SIZE) {
+          const chunk = await api.messageAction(
+            action,
+            emailIds.slice(start, start + ACTION_BATCH_SIZE),
+            current.csrfToken,
+          )
+          result = result
+            ? { failed: [...result.failed, ...chunk.failed], snapshot: chunk.snapshot }
+            : chunk
+        }
+        if (!result) return false
         applySnapshot(result.snapshot)
         if (result.failed.length > 0) {
           setError(
@@ -1531,7 +1544,7 @@ function HelpDialog({ onClose }: { onClose: () => void }) {
             <dt>
               <kbd>←</kbd> <kbd>→</kbd>
             </dt>
-            <dd>Zurück zur Liste / nächsten Bucket öffnen</dd>
+            <dd>← zurück zur Liste · → wie E: Bucket erledigt, nächsten öffnen</dd>
           </div>
           <div>
             <dt>

@@ -224,16 +224,22 @@ function responseFor<T>(responses: ResponseTuple<T>[], callId: string): MethodRe
   return found[1]
 }
 
-/** Unread, non-draft mail outside Spam. */
-export function unreadFilter(junkMailboxId?: string) {
+/** Unread, non-draft mail outside Spam, Trash, Sent and Drafts. */
+export function unreadFilter(excludedMailboxIds: readonly string[] = []) {
   const conditions: Array<Record<string, unknown>> = [
     { notKeyword: '$seen' },
     { notKeyword: '$draft' },
   ]
-  if (junkMailboxId) {
-    conditions.push({ operator: 'NOT', conditions: [{ inMailbox: junkMailboxId }] })
+  for (const mailboxId of excludedMailboxIds) {
+    conditions.push({ operator: 'NOT', conditions: [{ inMailbox: mailboxId }] })
   }
   return { operator: 'AND', conditions }
+}
+
+function excludedMailboxIds(mailboxes: readonly MailboxOption[]) {
+  return mailboxes
+    .filter((mailbox) => mailbox.role === 'junk' || EXCLUDED_MAILBOX_ROLES.has(mailbox.role ?? ''))
+    .map((mailbox) => mailbox.id)
 }
 
 async function fetchMailboxes(
@@ -585,11 +591,10 @@ export async function queryUnreadEmailIds(
   signal?: AbortSignal,
 ): Promise<string[]> {
   const { context } = account
-  const junkMailboxId = account.mailboxes.find((mailbox) => mailbox.role === 'junk')?.id
   const queryArguments = {
     accountId: context.accountId,
     calculateTotal: true,
-    filter: unreadFilter(junkMailboxId),
+    filter: unreadFilter(excludedMailboxIds(account.mailboxes)),
     sort: [{ property: 'receivedAt', isAscending: false }],
   }
   for (let attempt = 0; attempt < 3; attempt += 1) {

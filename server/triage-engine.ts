@@ -159,18 +159,21 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
     return sorting
   }
 
-  function refresh() {
+  /** One poll at a time; a refresh during a long sort still polls. */
+  function pollOnce() {
     if (running) return running
     running = withoutIoDeadline(async () => {
       await poll()
-      if (!controller.signal.aborted) {
-        store.prune()
-        await sort()
-      }
+      if (!controller.signal.aborted) store.prune()
     }).finally(() => {
       running = null
     })
     return running
+  }
+
+  async function refresh() {
+    await pollOnce()
+    if (!controller.signal.aborted) await sort()
   }
 
   return {

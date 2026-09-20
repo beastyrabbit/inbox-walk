@@ -1,5 +1,5 @@
 import { createServer, type Server } from 'node:http'
-import { afterAll, beforeAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import type {
   ReviewEmail,
   ThreadContext,
@@ -152,6 +152,19 @@ describe('todo API', () => {
     )
     expect(thread.body.messages).toHaveLength(2)
     expect(thread.body.recipients.identityId).toBe('demo-identity')
+  })
+
+  it('reloads a thread for every reply so later mail is never missed', async () => {
+    const before = await json<ThreadContext>('/api/todo/threads/thread-human?emailId=demo-human')
+    expect(before.body.messages).toHaveLength(1)
+    const original = mailbox.thread
+    vi.spyOn(mailbox, 'thread').mockImplementation(async (threadId) => [
+      ...(await original(threadId)),
+      { ...(await original(threadId))[0], id: 'demo-human-2', subject: 'Re: Re: Essen' } as never,
+    ])
+    const after = await json<ThreadContext>('/api/todo/threads/thread-human?emailId=demo-human')
+    expect(after.body.messages).toHaveLength(2)
+    vi.restoreAllMocks()
   })
 
   it('creates a reply proposal and a draft without any send path', async () => {

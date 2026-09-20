@@ -197,4 +197,28 @@ describe('triage engine', () => {
       vi.useRealTimers()
     }
   })
+
+  it('keeps polling while a long sort is running', async () => {
+    const store = createTriageStore(':memory:')
+    const mailbox = createDemoMailbox()
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    const sorter = vi.fn<TriageSorter>(async (context) => {
+      await gate
+      await heuristicSorter(context)
+    })
+    const engine = createTriageEngine({ engine: 'codex', mailbox, sorter, store })
+    const first = engine.refresh()
+    await expect.poll(() => sorter.mock.calls.length).toBe(1)
+    await mailbox.markRead(['demo-train'])
+    const second = engine.refresh()
+    await expect.poll(() => store.message('demo-train')?.status).toBe('gone')
+    release()
+    await Promise.all([first, second])
+    expect(store.queueCounts(3).queued).toBe(0)
+    await engine.stop()
+    store.close()
+  })
 })
