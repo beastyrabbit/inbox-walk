@@ -169,7 +169,7 @@ function blockImage(image: HTMLImageElement) {
 function proxiedRemoteImage(src: string, email: ReviewEmail, imageToken: string) {
   try {
     const normalized = new URL(src.startsWith('//') ? `https:${src}` : src).toString()
-    const imageId = (email.remoteImageIds ?? {})[normalized]
+    const imageId = email.remoteImageIds?.[normalized]
     return imageId ? remoteImageUrl(email.id, imageId, imageToken) : undefined
   } catch {
     return undefined
