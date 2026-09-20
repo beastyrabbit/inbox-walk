@@ -135,6 +135,22 @@ describe('todo API', () => {
     ).toBe(true)
   })
 
+  it('applies the newsletter label only to detected newsletters', async () => {
+    const snapshot = await todo()
+    const rejected = await json<{ error: { code: string } }>(
+      '/api/todo/messages/newsletter',
+      post({ emailIds: ['demo-train'] }, snapshot.csrfToken),
+    )
+    expect(rejected.response.status).toBe(400)
+    expect(rejected.body.error.code).toBe('NOT_A_NEWSLETTER')
+    const tagged = await json<TriageActionResult>(
+      '/api/todo/messages/newsletter',
+      post({ emailIds: ['demo-news'] }, snapshot.csrfToken),
+    )
+    expect(tagged.response.status).toBe(200)
+    expect(tagged.body.failed).toEqual([])
+  })
+
   it('serves mail bodies, threads and proxied image IDs for known messages only', async () => {
     const detail = await json<ReviewEmail>('/api/todo/emails/demo-shop')
     expect(detail.response.status).toBe(200)

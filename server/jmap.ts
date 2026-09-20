@@ -399,9 +399,11 @@ export async function fetchUnreadEmailIds(
   context: MailAccountContext,
   token: string,
   ids: readonly string[],
+  signal?: AbortSignal,
 ) {
   const unreadIds = new Set<string>()
   for (let start = 0; start < ids.length; start += context.maxObjectsInGet) {
+    signal?.throwIfAborted()
     const responses = await callJmap<{ id: string; keywords?: Record<string, boolean> }>(
       context.apiUrl,
       token,
@@ -416,6 +418,8 @@ export async function fetchUnreadEmailIds(
           'history-emails',
         ],
       ],
+      false,
+      signal,
     )
     for (const email of responseFor(responses, 'history-emails').list ?? []) {
       if (email.keywords?.$seen !== true) unreadIds.add(email.id)
@@ -711,7 +715,7 @@ export async function searchEmailSummaries(
   if (ids.length === 0) return []
   const mailboxes = new Map(account.mailboxes.map((mailbox) => [mailbox.id, mailbox as Mailbox]))
   const fetched = await getEmails(context, token, ids, false, signal)
-  const unreadIds = await fetchUnreadEmailIds(context, token, ids)
+  const unreadIds = await fetchUnreadEmailIds(context, token, ids, signal)
   const byId = new Map(fetched.list.map((email) => [email.id, email]))
   return ids
     .map((id) => byId.get(id))

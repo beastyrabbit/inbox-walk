@@ -350,14 +350,27 @@ function App() {
     }
   }, [load])
 
+  /** Mail bodies and thread context belong to the bucket on screen; nothing else is retained. */
+  const dropBucketState = useCallback(() => {
+    detailRequestsRef.current.clear()
+    setDetails({})
+    setPendingDetails(new Set())
+    setFailedDetails(new Set())
+    setThreadContexts({})
+    setReplyProposals({})
+    setDraftResults({})
+    setReplyDrafts({})
+  }, [])
+
   useEffect(() => {
     const onPopState = () => {
+      dropBucketState()
       setBucketId(bucketIdFromPath())
       setReplyOpen(false)
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [])
+  }, [dropBucketState])
 
   useEffect(() => {
     if (!bucket) return
@@ -453,19 +466,24 @@ function App() {
     for (const message of bucket.messages) loadDetail(message.summary.id)
   }, [bucket, loadDetail])
 
-  const openBucket = useCallback((id: string, replace = false) => {
-    setBucketUrl(id, replace)
-    setBucketId(id)
-    setSelectedMemberId(null)
-    setReplyOpen(false)
-    setError(null)
-  }, [])
+  const openBucket = useCallback(
+    (id: string, replace = false) => {
+      dropBucketState()
+      setBucketUrl(id, replace)
+      setBucketId(id)
+      setSelectedMemberId(null)
+      setReplyOpen(false)
+      setError(null)
+    },
+    [dropBucketState],
+  )
 
   const backToList = useCallback(() => {
+    dropBucketState()
     setBucketUrl(null)
     setBucketId(null)
     setReplyOpen(false)
-  }, [])
+  }, [dropBucketState])
 
   const runAction = useCallback(
     async (

@@ -28,6 +28,7 @@ import { type TriageStore, TriageStoreError } from './triage-store.ts'
 const MAX_JSON_BYTES = 256 * 1024
 const MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024
 const MAX_CACHED_DETAILS = 300
+const MAX_CACHED_RESULTS = 100
 const INLINE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp'])
 
 const addressSchema = z.object({ name: z.string().max(320), email: z.string().email().max(320) })
@@ -64,11 +65,14 @@ interface MailCache {
   blobMetadata: Map<string, MailResource>
   details: Map<string, ReviewEmail>
   draftResults: Map<string, DraftResult>
+  /** Emails whose resources are registered, oldest first, so eviction can drop them. */
+  resourceOwners: Map<string, { blobIds: string[]; imageIds: string[] }>
   draftWork: Map<string, Promise<DraftResult>>
   identities?: TriageSnapshotIdentities
   remoteImageIds: Map<string, Map<string, string>>
   remoteImageSources: Map<string, string>
   replyInFlight: Set<string>
+  replyResults: Map<string, ReplyProposal>
   replyWork: Map<string, Promise<ReplyProposal>>
 }
 
@@ -317,13 +321,40 @@ function createMailCache(): MailCache {
     remoteImageIds: new Map(),
     remoteImageSources: new Map(),
     replyInFlight: new Set(),
+    replyResults: new Map(),
     replyWork: new Map(),
+    resourceOwners: new Map(),
   }
 }
 
+/** Keeps an insertion-ordered map at its bound by dropping the oldest entries. */
+function bound<K, V>(map: Map<K, V>, maximum: number, onEvict?: (key: K) => void) {
+  while (map.size > maximum) {
+    const oldest = map.keys().next().value
+    if (oldest === undefined) return
+    map.delete(oldest)
+    onEvict?.(oldest)
+  }
+}
+
+function forgetResources(cache: MailCache, emailId: string) {
+  const owned = cache.resourceOwners.get(emailId)
+  if (!owned) return
+  cache.resourceOwners.delete(emailId)
+  cache.remoteImageIds.delete(emailId)
+  for (const imageId of owned.imageIds) cache.remoteImageSources.delete(`${emailId}/${imageId}`)
+  const stillOwned = new Set([...cache.resourceOwners.values()].flatMap((owner) => owner.blobIds))
+  for (const blobId of owned.blobIds) {
+    if (!stillOwned.has(blobId)) cache.blobMetadata.delete(blobId)
+  }
+}
+
+/** Registers blobs and proxied image IDs for one email, bounded to the newest emails. */
 function registerResources(cache: MailCache, email: ReviewEmail) {
+  const blobIds: string[] = []
   for (const resource of [...email.inlineResources, ...email.attachments]) {
     cache.blobMetadata.set(resource.blobId, resource)
+    blobIds.push(resource.blobId)
   }
   const registered = cache.remoteImageIds.get(email.id) ?? new Map<string, string>()
   for (const source of allowedRemoteImages(email)) {
@@ -333,15 +364,19 @@ function registerResources(cache: MailCache, email: ReviewEmail) {
     cache.remoteImageSources.set(`${email.id}/${imageId}`, source)
   }
   cache.remoteImageIds.set(email.id, registered)
+  cache.resourceOwners.delete(email.id)
+  cache.resourceOwners.set(email.id, { blobIds, imageIds: [...registered.values()] })
+  bound(cache.resourceOwners, MAX_CACHED_DETAILS, (evicted) => {
+    cache.details.delete(evicted)
+    forgetResources(cache, evicted)
+  })
 }
 
 function rememberDetail(cache: MailCache, email: ReviewEmail) {
-  if (cache.details.size >= MAX_CACHED_DETAILS) {
-    const oldest = cache.details.keys().next().value
-    if (oldest) cache.details.delete(oldest)
-  }
+  cache.details.delete(email.id)
   cache.details.set(email.id, email)
   registerResources(cache, email)
+  bound(cache.details, MAX_CACHED_DETAILS)
 }
 
 function emailPayload(cache: MailCache, email: ReviewEmail): ReviewEmail {
@@ -450,6 +485,17 @@ async function messageAction(
   } else if (action === 'unpark') {
     store.unpark(emailIds)
   } else if (action === 'newsletter') {
+    // The label is only for detected newsletters; the UI hides the action elsewhere.
+    const plain = emailIds.filter((emailId) => !store.message(emailId)?.summary.isNewsletter)
+    if (plain.length > 0) {
+      throw new ApiHttpError(
+        400,
+        'NOT_A_NEWSLETTER',
+        'Diese Nachricht wurde nicht als Newsletter erkannt.',
+        false,
+        { emailIds: plain },
+      )
+    }
     const tagged = await mailbox.tagNewsletter(emailIds)
     result.failed = tagged.failed
     store.logEvent('user_newsletter', { count: tagged.succeededIds.length })
@@ -606,6 +652,8 @@ async function reply(
     throw new ApiHttpError(400, 'INVALID_REPLY_REQUEST', 'Ungültige Entwurfsanfrage.')
   const { requestId } = parsed.data
   const { summary } = requireKnownEmail(store, emailId)
+  const finished = cache.replyResults.get(requestId)
+  if (finished) return json(res, 200, finished)
   const existing = cache.replyWork.get(requestId)
   if (existing) return json(res, 200, await existing)
   if (cache.replyInFlight.has(emailId)) {
@@ -632,11 +680,12 @@ async function reply(
   })()
   cache.replyWork.set(requestId, work)
   try {
-    return json(res, 200, await work)
-  } catch (error) {
-    cache.replyWork.delete(requestId)
-    throw error
+    const proposal = await work
+    cache.replyResults.set(requestId, proposal)
+    bound(cache.replyResults, MAX_CACHED_RESULTS)
+    return json(res, 200, proposal)
   } finally {
+    cache.replyWork.delete(requestId)
     cache.replyInFlight.delete(emailId)
   }
 }
@@ -705,6 +754,7 @@ async function draft(
   try {
     const result = await work
     cache.draftResults.set(key, result)
+    bound(cache.draftResults, MAX_CACHED_RESULTS)
     store.logEvent('user_draft', { threadId: summary.threadId })
     return json(res, 201, result)
   } finally {

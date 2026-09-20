@@ -1,3 +1,5 @@
+import { rmSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { createApiMiddleware } from './api.ts'
 import { codexAuthStatus, ensureCodexStorageReady, selectedCodexSettings } from './codex.ts'
 import { createDemoMailbox, createLiveMailbox, type Mailbox } from './mailbox.ts'
@@ -18,6 +20,7 @@ export function createRuntime(options: RuntimeOptions) {
     : createLiveMailbox(requireToken(options.fastmailToken))
   if (!options.forceDemo) ensureCodexStorageReady()
   const store = createTriageStore()
+  removeLegacyLearningStore()
   const live = mailbox.mode === 'live'
   const engine = createTriageEngine({
     canSort: live ? () => codexAuthStatus().configured : undefined,
@@ -39,6 +42,19 @@ export function createRuntime(options: RuntimeOptions) {
     start() {
       engine.start()
     },
+  }
+}
+
+/** Releases before 0.10 kept hashed learning signals in a second database; nothing reads it now. */
+function removeLegacyLearningStore(dataDir = process.env.DATA_DIR ?? resolve('data')) {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try {
+      rmSync(join(dataDir, `bundle-learning.sqlite${suffix}`), { force: true })
+    } catch (error) {
+      process.stderr.write(
+        `${JSON.stringify({ event: 'legacy_learning_store_cleanup_failed', message: error instanceof Error ? error.message : 'unknown' })}\n`,
+      )
+    }
   }
 }
 
