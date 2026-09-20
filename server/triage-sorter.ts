@@ -198,12 +198,17 @@ function stripElements(html: string, tag: string) {
   return output + html.slice(cursor)
 }
 
+/** Tags whose boundary should become a line break in the flattened text. */
+const BLOCK_TAG = /^<\/?(?:br|p|div|tr|li|h[1-6])(?:[\s/>]|$)/i
+
 /** Reduces an HTML body to readable text for the model. */
 export function htmlToText(html: string) {
-  const withoutBlocks = ['style', 'script', 'head'].reduce(stripElements, html)
+  const withoutBlocks = ['style', 'script', 'head'].reduce(
+    (text, tag) => stripElements(text, tag),
+    html,
+  )
   return withoutBlocks
-    .replace(/<(br|\/p|\/div|\/tr|\/li|\/h[1-6])\b[^>]*>/gi, '\n')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<[^>]*>/g, (tag) => (BLOCK_TAG.test(tag) ? '\n' : ' '))
     .replace(/&nbsp;/gi, ' ')
     .replace(/&amp;/gi, '&')
     .replace(/&lt;/gi, '<')

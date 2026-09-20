@@ -871,7 +871,7 @@ function handleError(res: ServerResponse, error: unknown) {
   )
 }
 
-type Route = (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<unknown> | unknown
+type Route = (req: IncomingMessage, res: ServerResponse, url: URL) => unknown
 
 const MESSAGE_ACTIONS = new Set(['done', 'park', 'unpark', 'newsletter', 'retry'])
 
@@ -928,6 +928,35 @@ function todoRoute(method: string | undefined, parts: string[], options: ApiOpti
   return null
 }
 
+function emailRoute(
+  method: string | undefined,
+  emailId: string,
+  sub: string | undefined,
+  extra: string | undefined,
+  cache: MailCache,
+  options: ApiOptions,
+): Route | null {
+  if (method === 'GET' && !sub) {
+    return (_req, res) => emailDetail(res, cache, emailId, options)
+  }
+  if (method === 'GET' && sub === 'images' && extra) {
+    return (_req, res, url) => remoteImage(res, url, cache, emailId, extra, options)
+  }
+  if (method === 'GET' && sub === 'editor') {
+    return (_req, res) => replyEditor(res, emailId, options)
+  }
+  if (method === 'PUT' && sub === 'editor') {
+    return (req, res) => saveReplyEditor(req, res, emailId, options)
+  }
+  if (method === 'POST' && sub === 'replies') {
+    return (req, res) => reply(req, res, cache, emailId, options)
+  }
+  if (method === 'POST' && sub === 'drafts') {
+    return (req, res) => draft(req, res, cache, emailId, options)
+  }
+  return null
+}
+
 function mailRoute(
   method: string | undefined,
   parts: string[],
@@ -935,28 +964,7 @@ function mailRoute(
   options: ApiOptions,
 ): Route | null {
   const [, , section, key, sub, extra] = parts
-  if (section === 'emails' && key) {
-    const emailId = key
-    if (method === 'GET' && !sub) {
-      return (_req, res) => emailDetail(res, cache, emailId, options)
-    }
-    if (method === 'GET' && sub === 'images' && extra) {
-      return (_req, res, url) => remoteImage(res, url, cache, emailId, extra, options)
-    }
-    if (method === 'GET' && sub === 'editor') {
-      return (_req, res) => replyEditor(res, emailId, options)
-    }
-    if (method === 'PUT' && sub === 'editor') {
-      return (req, res) => saveReplyEditor(req, res, emailId, options)
-    }
-    if (method === 'POST' && sub === 'replies') {
-      return (req, res) => reply(req, res, cache, emailId, options)
-    }
-    if (method === 'POST' && sub === 'drafts') {
-      return (req, res) => draft(req, res, cache, emailId, options)
-    }
-    return null
-  }
+  if (section === 'emails' && key) return emailRoute(method, key, sub, extra, cache, options)
   if (method === 'GET' && section === 'threads' && key) {
     return (_req, res, url) =>
       threadContext(res, cache, key, url.searchParams.get('emailId') ?? '', options)

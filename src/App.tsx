@@ -996,265 +996,42 @@ function App() {
 
       <main className="reader">
         <article className="message-card" aria-labelledby="bundle-title">
-          <header className="message-header">
-            <h1 id="bundle-title">{bucket.title}</h1>
-            {isStory ? (
-              <p className="message-subject">{bucket.summary}</p>
-            ) : (
-              summary.subject &&
-              summary.subject !== bucket.title && (
-                <p className="message-subject">{summary.subject}</p>
-              )
-            )}
-            {isStory ? (
-              <div className="message-meta">
-                <span className="tag">{bucket.messages.length} Nachrichten</span>
-                {bucket.handledCount > 0 && (
-                  <span className="tag">{bucket.handledCount} bereits erledigt</span>
-                )}
-                {Array.from(
-                  new Set(bucket.messages.map((item) => messageSource(item.summary))),
-                ).map((source) => (
-                  <span className="tag" key={source}>
-                    {source}
-                  </span>
-                ))}
-                <span className="meta-hint">
-                  Klick auf eine Kopfzeile wählt die Nachricht für ↑, ↓ und R
-                </span>
-              </div>
-            ) : (
-              <div className="message-meta">
-                <span className="avatar" aria-hidden="true">
-                  {initials(summary.from)}
-                </span>
-                <span className="sender" title={fullAddress(summary.from)}>
-                  {addressLine(summary.from)}
-                </span>
-                {summary.from[0]?.name && summary.from[0]?.email && (
-                  <span className="sender-email">{summary.from[0].email}</span>
-                )}
-                <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
-                <span className="meta-tags">
-                  {summary.mailboxNames.map((name) => (
-                    <span className="tag" key={name}>
-                      {name}
-                    </span>
-                  ))}
-                  {summary.isNewsletter && <span className="tag newsletter">Newsletter</span>}
-                  {summary.hasAttachment && <span className="tag">Anhang</span>}
-                </span>
-              </div>
-            )}
-            <div className="message-tools">
-              {email?.html && (
-                <fieldset className="segmented">
-                  <legend className="sr-only">Farben der Nachricht</legend>
-                  <button
-                    type="button"
-                    aria-pressed={mailColorMode === 'dark'}
-                    onClick={() => chooseMailColorMode('dark')}
-                    title="Farben an die dunkle Oberfläche anpassen"
-                  >
-                    Dunkel
-                  </button>
-                  <button
-                    type="button"
-                    aria-pressed={mailColorMode === 'original'}
-                    onClick={() => chooseMailColorMode('original')}
-                    title="Nachricht in ihren Originalfarben zeigen"
-                  >
-                    Original
-                  </button>
-                </fieldset>
-              )}
-              <details className="message-details" key={summary.id}>
-                <summary>Details</summary>
-                <dl className="message-details-content">
-                  <div>
-                    <dt>Bucket</dt>
-                    <dd className="bundle-summary">{bucket.summary}</dd>
-                  </div>
-                  <div>
-                    <dt>Stand</dt>
-                    <dd>{bucket.currentState}</dd>
-                  </div>
-                  {bucket.linkEvidence.length > 0 && (
-                    <div>
-                      <dt>Belege</dt>
-                      <dd>{bucket.linkEvidence.join(' · ')}</dd>
-                    </div>
-                  )}
-                  <div>
-                    <dt>Betreff</dt>
-                    <dd className="original-subject">{summary.subject || '(Kein Betreff)'}</dd>
-                  </div>
-                  <div>
-                    <dt>Von</dt>
-                    <dd>{fullAddress(summary.from) || 'Unbekannter Absender'}</dd>
-                  </div>
-                  <div>
-                    <dt>An</dt>
-                    <dd>{fullAddress(summary.to) || '–'}</dd>
-                  </div>
-                  <div>
-                    <dt>Postfach</dt>
-                    <dd>
-                      {summary.mailboxNames.join(', ') || '–'}
-                      {summary.isNewsletter && ' · Newsletter'}
-                    </dd>
-                  </div>
-                </dl>
-              </details>
-            </div>
-            {email?.bodyTruncated && (
-              <p className="warning-note">
-                Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
-              </p>
-            )}
-          </header>
-
-          {isStory ? (
-            <ol
-              className="story-grid"
-              aria-label="Verlauf der Story"
-              data-count={Math.min(bucket.messages.length, 6)}
-            >
-              {bucket.messages.map((item, index) => {
-                const member = item.summary
-                const body = details[member.id]
-                const selected = summary.id === member.id
-                const pending = pendingDetails.has(member.id)
-                const source = messageSource(member)
-                return (
-                  <li
-                    key={member.id}
-                    className={`story-pane ${selected ? 'selected' : ''}`}
-                    aria-current={selected ? 'true' : undefined}
-                  >
-                    <button
-                      type="button"
-                      className="pane-head"
-                      aria-pressed={selected}
-                      aria-label={`${source} · ${member.subject} · ${formatDate(member.receivedAt)}`}
-                      title="Diese Nachricht auswählen"
-                      onClick={() => {
-                        setSelectedMemberId(member.id)
-                        setReplyOpen(false)
-                      }}
-                    >
-                      <span className="timeline-step">{index + 1}</span>
-                      <span className="timeline-copy">
-                        <span className="timeline-source">
-                          {source}
-                          <time dateTime={member.receivedAt}>
-                            {formatShortDate(member.receivedAt)}
-                          </time>
-                        </span>
-                        <strong>{member.subject || '(Kein Betreff)'}</strong>
-                      </span>
-                    </button>
-                    <div className="pane-body" aria-busy={pending}>
-                      <MessageBody
-                        colorMode={mailColorMode}
-                        email={body}
-                        imageToken={snapshot.imageToken}
-                        pending={pending}
-                        subject={member.subject}
-                      />
-                    </div>
-                    {body && body.attachments.length > 0 && (
-                      <div className="attachments pane-attachments">
-                        <AttachmentChips email={body} mode={snapshot.mode} />
-                      </div>
-                    )}
-                  </li>
-                )
-              })}
-            </ol>
-          ) : (
-            <>
-              <div className="message-content" aria-busy={pendingDetails.has(summary.id)}>
-                <MessageBody
-                  colorMode={mailColorMode}
-                  email={email}
-                  imageToken={snapshot.imageToken}
-                  pending={pendingDetails.has(summary.id)}
-                  subject={summary.subject}
-                />
-              </div>
-              {email && email.attachments.length > 0 && (
-                <section className="attachments" aria-label="Anhänge">
-                  <h2>Anhänge</h2>
-                  <AttachmentChips email={email} mode={snapshot.mode} />
-                </section>
-              )}
-            </>
-          )}
+          <BucketHeader
+            bucket={bucket}
+            summary={summary}
+            email={email}
+            isStory={isStory}
+            mailColorMode={mailColorMode}
+            chooseMailColorMode={chooseMailColorMode}
+          />
+          <BucketMessages
+            bucket={bucket}
+            summary={summary}
+            email={email}
+            isStory={isStory}
+            details={details}
+            pendingDetails={pendingDetails}
+            mailColorMode={mailColorMode}
+            snapshot={snapshot}
+            onSelectMember={(emailId) => {
+              setSelectedMemberId(emailId)
+              setReplyOpen(false)
+            }}
+          />
         </article>
       </main>
 
-      <footer className="controls">
-        <button type="button" className="control-button" onClick={backToList}>
-          <kbd>←</kbd>
-          <span>Liste</span>
-        </button>
-        <div className="decision-actions">
-          <button
-            type="button"
-            className="control-button reply-trigger"
-            aria-label="Antwort entwerfen"
-            onClick={() => void openReply()}
-          >
-            <kbd>R</kbd>
-            <span>Antwort entwerfen</span>
-          </button>
-          <button
-            type="button"
-            className="control-button unsubscribe-button"
-            aria-label={
-              summary.isNewsletter ? 'Für spätere Abmeldung markieren' : 'Kein Newsletter erkannt'
-            }
-            disabled={busy || !summary.isNewsletter}
-            onClick={() => void tagNewsletter()}
-            title={
-              summary.isNewsletter
-                ? 'Mit dem Fastmail-Label „Newsletter abmelden“ kennzeichnen'
-                : 'Diese Nachricht wurde nicht als Newsletter erkannt'
-            }
-          >
-            <kbd>↓</kbd>
-            <span>Später abmelden</span>
-          </button>
-          <button
-            type="button"
-            className="control-button keep-button"
-            aria-label={isParkedView ? 'Zurück in die Liste' : 'Nachricht parken'}
-            disabled={busy}
-            onClick={() => void parkSelected()}
-            title={
-              isParkedView
-                ? 'Die Nachricht erscheint wieder in der Todo-Liste'
-                : 'Bleibt ungelesen und verlässt die Todo-Liste, bis du sie zurückholst'
-            }
-          >
-            <kbd>↑</kbd>
-            <span>{isParkedView ? 'Zurückholen' : 'Parken'}</span>
-          </button>
-        </div>
-        <div className="completion-actions">
-          <button
-            type="button"
-            className="control-button next"
-            onClick={() => void completeBucket()}
-            disabled={busy || isParkedView}
-            aria-label={`Bucket erledigt · ${bucket.messages.length} ${bucket.messages.length === 1 ? 'Nachricht' : 'Nachrichten'} als gelesen markieren`}
-          >
-            <span>{busy ? 'Wird gespeichert …' : 'Erledigt'}</span>
-            <kbd>E</kbd>
-          </button>
-        </div>
-      </footer>
+      <BucketControls
+        bucket={bucket}
+        summary={summary}
+        busy={busy}
+        isParkedView={isParkedView}
+        onBack={backToList}
+        onReply={() => void openReply()}
+        onNewsletter={() => void tagNewsletter()}
+        onPark={() => void parkSelected()}
+        onComplete={() => void completeBucket()}
+      />
 
       <p className="sr-only" aria-live="polite">
         {status}
@@ -1481,6 +1258,325 @@ function TodoPage({
         {status}
       </p>
     </main>
+  )
+}
+
+function BucketHeader({
+  bucket,
+  summary,
+  email,
+  isStory,
+  mailColorMode,
+  chooseMailColorMode,
+}: Readonly<{
+  bucket: TriageBucket
+  summary: ReviewEmailSummary
+  email: ReviewEmail | undefined
+  isStory: boolean
+  mailColorMode: MailColorMode
+  chooseMailColorMode: (mode: MailColorMode) => void
+}>) {
+  return (
+    <header className="message-header">
+      <h1 id="bundle-title">{bucket.title}</h1>
+      {isStory ? (
+        <p className="message-subject">{bucket.summary}</p>
+      ) : (
+        summary.subject &&
+        summary.subject !== bucket.title && <p className="message-subject">{summary.subject}</p>
+      )}
+      {isStory ? (
+        <div className="message-meta">
+          <span className="tag">{bucket.messages.length} Nachrichten</span>
+          {bucket.handledCount > 0 && (
+            <span className="tag">{bucket.handledCount} bereits erledigt</span>
+          )}
+          {Array.from(new Set(bucket.messages.map((item) => messageSource(item.summary)))).map(
+            (source) => (
+              <span className="tag" key={source}>
+                {source}
+              </span>
+            ),
+          )}
+          <span className="meta-hint">
+            Klick auf eine Kopfzeile wählt die Nachricht für ↑, ↓ und R
+          </span>
+        </div>
+      ) : (
+        <div className="message-meta">
+          <span className="avatar" aria-hidden="true">
+            {initials(summary.from)}
+          </span>
+          <span className="sender" title={fullAddress(summary.from)}>
+            {addressLine(summary.from)}
+          </span>
+          {summary.from[0]?.name && summary.from[0]?.email && (
+            <span className="sender-email">{summary.from[0].email}</span>
+          )}
+          <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
+          <span className="meta-tags">
+            {summary.mailboxNames.map((name) => (
+              <span className="tag" key={name}>
+                {name}
+              </span>
+            ))}
+            {summary.isNewsletter && <span className="tag newsletter">Newsletter</span>}
+            {summary.hasAttachment && <span className="tag">Anhang</span>}
+          </span>
+        </div>
+      )}
+      <div className="message-tools">
+        {email?.html && (
+          <fieldset className="segmented">
+            <legend className="sr-only">Farben der Nachricht</legend>
+            <button
+              type="button"
+              aria-pressed={mailColorMode === 'dark'}
+              onClick={() => chooseMailColorMode('dark')}
+              title="Farben an die dunkle Oberfläche anpassen"
+            >
+              Dunkel
+            </button>
+            <button
+              type="button"
+              aria-pressed={mailColorMode === 'original'}
+              onClick={() => chooseMailColorMode('original')}
+              title="Nachricht in ihren Originalfarben zeigen"
+            >
+              Original
+            </button>
+          </fieldset>
+        )}
+        <details className="message-details" key={summary.id}>
+          <summary>Details</summary>
+          <dl className="message-details-content">
+            <div>
+              <dt>Bucket</dt>
+              <dd className="bundle-summary">{bucket.summary}</dd>
+            </div>
+            <div>
+              <dt>Stand</dt>
+              <dd>{bucket.currentState}</dd>
+            </div>
+            {bucket.linkEvidence.length > 0 && (
+              <div>
+                <dt>Belege</dt>
+                <dd>{bucket.linkEvidence.join(' · ')}</dd>
+              </div>
+            )}
+            <div>
+              <dt>Betreff</dt>
+              <dd className="original-subject">{summary.subject || '(Kein Betreff)'}</dd>
+            </div>
+            <div>
+              <dt>Von</dt>
+              <dd>{fullAddress(summary.from) || 'Unbekannter Absender'}</dd>
+            </div>
+            <div>
+              <dt>An</dt>
+              <dd>{fullAddress(summary.to) || '–'}</dd>
+            </div>
+            <div>
+              <dt>Postfach</dt>
+              <dd>
+                {summary.mailboxNames.join(', ') || '–'}
+                {summary.isNewsletter && ' · Newsletter'}
+              </dd>
+            </div>
+          </dl>
+        </details>
+      </div>
+      {email?.bodyTruncated && (
+        <p className="warning-note">
+          Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
+        </p>
+      )}
+    </header>
+  )
+}
+
+function BucketMessages({
+  bucket,
+  summary,
+  email,
+  isStory,
+  details,
+  pendingDetails,
+  mailColorMode,
+  snapshot,
+  onSelectMember,
+}: Readonly<{
+  bucket: TriageBucket
+  summary: ReviewEmailSummary
+  email: ReviewEmail | undefined
+  isStory: boolean
+  details: Record<string, ReviewEmail>
+  pendingDetails: ReadonlySet<string>
+  mailColorMode: MailColorMode
+  snapshot: TriageSnapshot
+  onSelectMember: (emailId: string) => void
+}>) {
+  return (
+    <>
+      {isStory ? (
+        <ol
+          className="story-grid"
+          aria-label="Verlauf der Story"
+          data-count={Math.min(bucket.messages.length, 6)}
+        >
+          {bucket.messages.map((item, index) => {
+            const member = item.summary
+            const body = details[member.id]
+            const selected = summary.id === member.id
+            const pending = pendingDetails.has(member.id)
+            const source = messageSource(member)
+            return (
+              <li
+                key={member.id}
+                className={`story-pane ${selected ? 'selected' : ''}`}
+                aria-current={selected ? 'true' : undefined}
+              >
+                <button
+                  type="button"
+                  className="pane-head"
+                  aria-pressed={selected}
+                  aria-label={`${source} · ${member.subject} · ${formatDate(member.receivedAt)}`}
+                  title="Diese Nachricht auswählen"
+                  onClick={() => onSelectMember(member.id)}
+                >
+                  <span className="timeline-step">{index + 1}</span>
+                  <span className="timeline-copy">
+                    <span className="timeline-source">
+                      {source}
+                      <time dateTime={member.receivedAt}>{formatShortDate(member.receivedAt)}</time>
+                    </span>
+                    <strong>{member.subject || '(Kein Betreff)'}</strong>
+                  </span>
+                </button>
+                <div className="pane-body" aria-busy={pending}>
+                  <MessageBody
+                    colorMode={mailColorMode}
+                    email={body}
+                    imageToken={snapshot.imageToken}
+                    pending={pending}
+                    subject={member.subject}
+                  />
+                </div>
+                {body && body.attachments.length > 0 && (
+                  <div className="attachments pane-attachments">
+                    <AttachmentChips email={body} mode={snapshot.mode} />
+                  </div>
+                )}
+              </li>
+            )
+          })}
+        </ol>
+      ) : (
+        <>
+          <div className="message-content" aria-busy={pendingDetails.has(summary.id)}>
+            <MessageBody
+              colorMode={mailColorMode}
+              email={email}
+              imageToken={snapshot.imageToken}
+              pending={pendingDetails.has(summary.id)}
+              subject={summary.subject}
+            />
+          </div>
+          {email && email.attachments.length > 0 && (
+            <section className="attachments" aria-label="Anhänge">
+              <h2>Anhänge</h2>
+              <AttachmentChips email={email} mode={snapshot.mode} />
+            </section>
+          )}
+        </>
+      )}
+    </>
+  )
+}
+
+function BucketControls({
+  bucket,
+  summary,
+  busy,
+  isParkedView,
+  onBack,
+  onReply,
+  onNewsletter,
+  onPark,
+  onComplete,
+}: Readonly<{
+  bucket: TriageBucket
+  summary: ReviewEmailSummary
+  busy: boolean
+  isParkedView: boolean
+  onBack: () => void
+  onReply: () => void
+  onNewsletter: () => void
+  onPark: () => void
+  onComplete: () => void
+}>) {
+  return (
+    <footer className="controls">
+      <button type="button" className="control-button" onClick={onBack}>
+        <kbd>←</kbd>
+        <span>Liste</span>
+      </button>
+      <div className="decision-actions">
+        <button
+          type="button"
+          className="control-button reply-trigger"
+          aria-label="Antwort entwerfen"
+          onClick={onReply}
+        >
+          <kbd>R</kbd>
+          <span>Antwort entwerfen</span>
+        </button>
+        <button
+          type="button"
+          className="control-button unsubscribe-button"
+          aria-label={
+            summary.isNewsletter ? 'Für spätere Abmeldung markieren' : 'Kein Newsletter erkannt'
+          }
+          disabled={busy || !summary.isNewsletter}
+          onClick={onNewsletter}
+          title={
+            summary.isNewsletter
+              ? 'Mit dem Fastmail-Label „Newsletter abmelden“ kennzeichnen'
+              : 'Diese Nachricht wurde nicht als Newsletter erkannt'
+          }
+        >
+          <kbd>↓</kbd>
+          <span>Später abmelden</span>
+        </button>
+        <button
+          type="button"
+          className="control-button keep-button"
+          aria-label={isParkedView ? 'Zurück in die Liste' : 'Nachricht parken'}
+          disabled={busy}
+          onClick={onPark}
+          title={
+            isParkedView
+              ? 'Die Nachricht erscheint wieder in der Todo-Liste'
+              : 'Bleibt ungelesen und verlässt die Todo-Liste, bis du sie zurückholst'
+          }
+        >
+          <kbd>↑</kbd>
+          <span>{isParkedView ? 'Zurückholen' : 'Parken'}</span>
+        </button>
+      </div>
+      <div className="completion-actions">
+        <button
+          type="button"
+          className="control-button next"
+          onClick={onComplete}
+          disabled={busy || isParkedView}
+          aria-label={`Bucket erledigt · ${bucket.messages.length} ${bucket.messages.length === 1 ? 'Nachricht' : 'Nachrichten'} als gelesen markieren`}
+        >
+          <span>{busy ? 'Wird gespeichert …' : 'Erledigt'}</span>
+          <kbd>E</kbd>
+        </button>
+      </div>
+    </footer>
   )
 }
 
