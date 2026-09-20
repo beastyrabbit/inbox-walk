@@ -301,16 +301,28 @@ function App() {
   const codexLoginStatus = codexLogin?.status
   const openCount = buckets.reduce((count, item) => count + item.messages.length, 0)
 
-  const applySnapshot = useCallback((next: TriageSnapshot) => {
+  /**
+   * Snapshots are ordered by the request that started them. A background
+   * poll that began before a user action must not overwrite the action's
+   * newer result, so only the newest ticket may install its snapshot.
+   */
+  const snapshotTicketRef = useRef(0)
+  const takeSnapshotTicket = useCallback(() => {
+    snapshotTicketRef.current += 1
+    return snapshotTicketRef.current
+  }, [])
+  const applySnapshot = useCallback((next: TriageSnapshot, ticket: number) => {
+    if (ticket < snapshotTicketRef.current) return
     setSnapshot(next)
     setError(null)
   }, [])
 
   const load = useCallback(async () => {
+    const ticket = takeSnapshotTicket()
     const next = await api.todo()
-    applySnapshot(next)
+    applySnapshot(next, ticket)
     return next
-  }, [applySnapshot])
+  }, [applySnapshot, takeSnapshotTicket])
 
   useEffect(() => {
     let active = true
@@ -388,12 +400,13 @@ function App() {
   useEffect(() => {
     if (!snapshot || !bucketId || loading) return
     if (!bucket) {
+      dropBucketState()
       setBucketUrl(null, true)
       setBucketId(null)
       setReplyOpen(false)
       setStatus('Dieser Bucket ist nicht mehr offen.')
     }
-  }, [bucket, bucketId, loading, snapshot])
+  }, [bucket, bucketId, dropBucketState, loading, snapshot])
 
   useEffect(() => {
     if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
@@ -506,6 +519,7 @@ function App() {
       setError(null)
       try {
         const failed: TriageActionResult['failed'] = []
+        const ticket = takeSnapshotTicket()
         // Each chunk's snapshot is applied at once so a later failure never hides earlier changes.
         for (let start = 0; start < emailIds.length; start += ACTION_BATCH_SIZE) {
           const chunk = await api.messageAction(
@@ -513,7 +527,7 @@ function App() {
             emailIds.slice(start, start + ACTION_BATCH_SIZE),
             current.csrfToken,
           )
-          applySnapshot(chunk.snapshot)
+          applySnapshot(chunk.snapshot, ticket)
           failed.push(...chunk.failed)
         }
         if (failed.length > 0) {
@@ -531,7 +545,7 @@ function App() {
         setBusy(false)
       }
     },
-    [applySnapshot],
+    [applySnapshot, takeSnapshotTicket],
   )
 
   const nextBucketAfter = useCallback(
@@ -582,14 +596,15 @@ function App() {
     setRefreshing(true)
     setError(null)
     try {
-      applySnapshot(await api.refresh(current.csrfToken))
+      const ticket = takeSnapshotTicket()
+      applySnapshot(await api.refresh(current.csrfToken), ticket)
       setStatus('Postfach geprüft.')
     } catch (cause) {
       setError(errorMessage(cause))
     } finally {
       setRefreshing(false)
     }
-  }, [applySnapshot, refreshing])
+  }, [applySnapshot, refreshing, takeSnapshotTicket])
 
   const scheduleEditorSave = useCallback((emailId: string, next: ReplyEditorState) => {
     const timers = editorSaveTimersRef.current
