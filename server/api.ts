@@ -477,7 +477,17 @@ async function messageAction(
   let failed: TriageActionResult['failed'] = []
   if (action === 'done') {
     // Only an explicit user action marks mail read, and only the named IDs.
-    const marked = await mailbox.markRead(emailIds)
+    let marked: Awaited<ReturnType<Mailbox['markRead']>>
+    try {
+      marked = await mailbox.markRead(emailIds)
+    } catch (error) {
+      // Fastmail may have applied part of the batch before the failure; keep those done locally.
+      if (error instanceof JmapError && error.details?.confirmedIds.length) {
+        store.markDone(error.details.confirmedIds)
+        store.logEvent('user_done', { count: error.details.confirmedIds.length, partial: true })
+      }
+      throw error
+    }
     store.markDone(marked.markedIds)
     failed = marked.failed
     store.logEvent('user_done', { count: marked.markedIds.length })
@@ -651,8 +661,9 @@ async function reply(
     .safeParse(await readJson(req))
   if (!parsed.success)
     throw new ApiHttpError(400, 'INVALID_REPLY_REQUEST', 'Ungültige Entwurfsanfrage.')
-  const { requestId } = parsed.data
   const { summary } = requireKnownEmail(store, emailId)
+  // A request ID belongs to one message; reusing it elsewhere must not return this proposal.
+  const requestId = `${emailId}:${parsed.data.requestId}`
   const finished = cache.replyResults.get(requestId)
   if (finished) return json(res, 200, finished)
   const existing = cache.replyWork.get(requestId)
@@ -713,10 +724,12 @@ async function draft(
   if (!parsed.success) throw new ApiHttpError(400, 'INVALID_DRAFT', 'Ungültige Draft-Daten.')
   const { requestId, ...draftPayload } = parsed.data
   const fingerprint = createHash('sha256').update(JSON.stringify(draftPayload)).digest('hex')
-  const key = `${requestId}:${fingerprint}`
+  const key = `${emailId}:${requestId}:${fingerprint}`
   const cached = cache.draftResults.get(key)
   if (cached) return json(res, 200, cached)
-  if ([...cache.draftResults.keys()].some((entry) => entry.startsWith(`${requestId}:`))) {
+  if (
+    [...cache.draftResults.keys()].some((entry) => entry.startsWith(`${emailId}:${requestId}:`))
+  ) {
     throw new ApiHttpError(
       409,
       'DRAFT_REQUEST_CONFLICT',

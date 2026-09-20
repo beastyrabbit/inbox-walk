@@ -115,6 +115,45 @@ describe('todo API', () => {
     expect(unknown.response.status).toBe(404)
   })
 
+  it('keeps mail that Fastmail confirmed read when the rest of the batch fails', async () => {
+    const before = await todo()
+    const { JmapError } = await import('./jmap.ts')
+    const spy = vi.spyOn(mailbox, 'markRead').mockRejectedValueOnce(
+      new JmapError('partial', 'JMAP_MUTATION_UNCONFIRMED', undefined, {
+        confirmedIds: ['demo-news'],
+        unattemptedIds: ['demo-shop'],
+        unknownIds: [],
+      }),
+    )
+    try {
+      const failed = await json<{ error: { code: string } }>(
+        '/api/todo/messages/done',
+        post({ emailIds: ['demo-news', 'demo-shop'] }, before.csrfToken),
+      )
+      expect(failed.response.status).toBe(502)
+      expect(store.message('demo-news')?.status).toBe('done')
+      expect(store.message('demo-shop')?.status).toBe('sorted')
+    } finally {
+      spy.mockRestore()
+      store.unpark(['demo-news'])
+    }
+  })
+
+  it('scopes reply idempotency to the message the request was made for', async () => {
+    const snapshot = await todo()
+    const requestId = crypto.randomUUID()
+    const first = await json<{ bodyText: string }>(
+      '/api/todo/emails/demo-human/replies',
+      post({ requestId, roughNotes: 'Erste Nachricht.' }, snapshot.csrfToken),
+    )
+    const second = await json<{ bodyText: string }>(
+      '/api/todo/emails/demo-train/replies',
+      post({ requestId, roughNotes: 'Zweite Nachricht.' }, snapshot.csrfToken),
+    )
+    expect(first.body.bodyText).toContain('Erste Nachricht.')
+    expect(second.body.bodyText).toContain('Zweite Nachricht.')
+  })
+
   it('parks a message out of its bucket and brings it back unread', async () => {
     const before = await todo()
     const parked = await json<TriageActionResult>(

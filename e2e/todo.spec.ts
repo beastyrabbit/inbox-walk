@@ -171,18 +171,17 @@ test('keeps a bucket URL across reload and returns to the list when it closes', 
 })
 
 test('saves memory notes for Codex and keeps them after a reload', async ({ page }) => {
+  const notes = `Bahn-Buchungen gehören zur Reise. (${Date.now()})`
   await page.getByRole('button', { name: 'Einstellungen' }).click()
   const dialog = page.getByRole('dialog', { name: 'Einstellungen' })
   await expect(dialog.getByRole('heading', { name: 'Gedächtnis' })).toBeVisible()
-  await dialog.getByLabel('Notizen für Codex').fill('Bahn-Buchungen gehören zur Reise.')
+  await dialog.getByLabel('Notizen für Codex').fill(notes)
   await dialog.getByRole('button', { name: 'Notizen speichern' }).click()
   await expect(dialog.getByRole('button', { name: 'Notizen speichern' })).toBeDisabled()
   await page.reload()
   await page.getByRole('button', { name: 'Einstellungen' }).click()
-  await expect(page.getByLabel('Notizen für Codex')).toHaveValue(
-    'Bahn-Buchungen gehören zur Reise.',
-  )
-  expect((await todo(page)).memory.notes).toBe('Bahn-Buchungen gehören zur Reise.')
+  await expect(page.getByLabel('Notizen für Codex')).toHaveValue(notes)
+  expect((await todo(page)).memory.notes).toBe(notes)
 })
 
 test('shows the model, thinking level and speed configured in Codex', async ({ page }) => {

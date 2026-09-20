@@ -673,7 +673,7 @@ export function createTriageStore(databasePath = triageStorePath()): TriageStore
           DELETE FROM triage_bucket;
           DELETE FROM triage_memory_proposal;
           DELETE FROM triage_event;
-          UPDATE triage_state SET memory_notes = '', last_poll_at = NULL, last_poll_error = NULL,
+          UPDATE triage_state SET last_poll_at = NULL, last_poll_error = NULL,
             last_sort_at = NULL, last_sort_error = NULL WHERE singleton = 1;
         `)
       })

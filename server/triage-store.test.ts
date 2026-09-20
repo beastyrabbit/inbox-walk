@@ -167,6 +167,17 @@ describe('triage store', () => {
     store.close()
   })
 
+  it('keeps memory notes across a demo reset', () => {
+    const store = createTriageStore(':memory:')
+    store.enqueue([summary('a')])
+    store.setMemoryNotes('Bleibt erhalten.')
+    store.addProposal('Vorschlag')
+    store.reset()
+    expect(store.todo()).toEqual([])
+    expect(store.memory()).toEqual({ notes: 'Bleibt erhalten.', proposals: [] })
+    store.close()
+  })
+
   it('persists across reopening and replaces the old round tables', () => {
     const directory = mkdtempSync(join(tmpdir(), 'inbox-walk-triage-'))
     directories.push(directory)
