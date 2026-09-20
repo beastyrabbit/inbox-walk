@@ -2,6 +2,8 @@ import DOMPurify from 'dompurify'
 import { blobUrl, remoteImageUrl } from './api.ts'
 import type { ReviewEmail } from './shared.ts'
 
+export type MailColorMode = 'dark' | 'original'
+
 function escapeHtml(value: string) {
   const entities: Record<string, string> = {
     '&': '&amp;',
@@ -13,76 +15,202 @@ function escapeHtml(value: string) {
   return value.replace(/[&<>'"]/g, (character) => entities[character])
 }
 
-function releaseColorOverride(value: string) {
-  return value.replace(
-    /((?:background(?:-color)?|color|border(?:-(?:top|right|bottom|left))?-color)\s*:[^;{}]*?)\s*!\s*important/gi,
-    '$1',
-  )
+const TRAILING_PUNCTUATION = new Set(['.', ',', ';', ':', '!', '?', ')', ']'])
+
+/** Splits punctuation that ends a sentence from the URL it follows, without regex backtracking. */
+function splitTrailingPunctuation(match: string) {
+  let end = match.length
+  while (end > 0 && TRAILING_PUNCTUATION.has(match[end - 1] ?? '')) end -= 1
+  return { trailing: match.slice(end), url: match.slice(0, end) }
 }
 
-export function emailDocument(
-  email: ReviewEmail,
-  snapshotId: string,
-  loadRemoteImages: boolean,
-  imageToken = '',
-) {
-  const source =
-    email.html || `<div class="plain-text">${escapeHtml(email.text).replaceAll('\n', '<br>')}</div>`
+function linkify(escaped: string) {
+  return escaped.replace(/\bhttps?:\/\/[^\s<>"']+/g, (match) => {
+    const { trailing, url } = splitTrailingPunctuation(match)
+    return `<a href="${url}">${url}</a>${trailing}`
+  })
+}
+
+/** Turns a plain-text body into paragraphs with quoted passages and clickable links. */
+export function plainTextHtml(text: string) {
+  const lines = text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.trimEnd())
+  let html = ''
+  let quoted = false
+  for (const line of lines) {
+    const isQuote = /^\s*>/.test(line)
+    if (isQuote !== quoted) {
+      html += isQuote ? '<blockquote>' : '</blockquote>'
+      quoted = isQuote
+    }
+    const content = isQuote ? line.replace(/^\s*(?:>\s?)+/, '') : line
+    html += `${linkify(escapeHtml(content))}\n`
+  }
+  if (quoted) html += '</blockquote>'
+  return `<div class="plain-text">${html.replace(/\n(?=<\/blockquote>)/g, '')}</div>`
+}
+
+/**
+ * Removes `@media` blocks that target a dark colour scheme. The reader applies its own
+ * dark adaptation, so a mail must always render its light design first.
+ */
+export function stripDarkSchemeRules(css: string) {
+  let output = ''
+  let cursor = 0
+  const pattern = /@media[^{]*prefers-color-scheme\s*:\s*dark[^{]*\{/gi
+  for (const match of css.matchAll(pattern)) {
+    const start = match.index
+    if (start < cursor) continue
+    let depth = 1
+    let end = start + match[0].length
+    while (end < css.length && depth > 0) {
+      if (css[end] === '{') depth += 1
+      else if (css[end] === '}') depth -= 1
+      end += 1
+    }
+    output += css.slice(cursor, start)
+    cursor = end
+  }
+  return output + css.slice(cursor)
+}
+
+function pixelValue(value: string | null | undefined) {
+  if (!value) return undefined
+  const match = /^(\d+(?:\.\d+)?)(?:px)?$/i.exec(value.trim())
+  return match ? Number(match[1]) : undefined
+}
+
+/**
+ * Mails often fix image widths in pixels. Keep the author's size on wide screens, but never
+ * let an image overflow the reader on narrow ones.
+ */
+function constrainImage(image: HTMLImageElement) {
+  const declared =
+    pixelValue(image.style.maxWidth) ??
+    pixelValue(image.style.width) ??
+    pixelValue(image.getAttribute('width'))
+  if (declared !== undefined && declared > 0) {
+    image.style.setProperty('max-width', `min(${declared}px, 100%)`, 'important')
+  }
+}
+
+const readerStyles = {
+  dark: `
+    :root { color-scheme: light; }
+    html { background: #211f1b; }
+    body { min-height: 100vh; background: #e2e0dc; color: #1a150b; filter: invert(1) hue-rotate(180deg); }
+    img, picture, svg, video { filter: invert(1) hue-rotate(180deg); }
+    a { color: #ad5532; }
+    .plain-text { color: #1a150b; }`,
+  original: `
+    :root { color-scheme: light; }
+    html { background: #211f1b; }
+    body { min-height: 100vh; background: #ffffff; color: #1f1d1a; }
+    a { color: #9d4d32; }`,
+}
+
+const plainTextStyles = `
+    :root { color-scheme: dark; }
+    html, body { background: #211f1b; color: #eee9df; }
+    body { min-height: 100vh; filter: none; }
+    a { color: #e28a67; }`
+
+const FORBIDDEN_TAGS = [
+  'script',
+  'iframe',
+  'object',
+  'embed',
+  'form',
+  'input',
+  'button',
+  'link',
+  'meta',
+  'video',
+  'audio',
+  'source',
+]
+
+/**
+ * Sanitizes the complete document. WHOLE_DOCUMENT keeps the sender's head
+ * stylesheet, which the reader moves into the body below; everything still
+ * renders inside a script-free sandboxed iframe with a strict CSP.
+ */
+function sanitizedDocument(source: string) {
   const clean = DOMPurify.sanitize(source, {
+    WHOLE_DOCUMENT: true,
     USE_PROFILES: { html: true, svg: true, svgFilters: false },
-    FORBID_TAGS: [
-      'script',
-      'iframe',
-      'object',
-      'embed',
-      'form',
-      'input',
-      'button',
-      'link',
-      'meta',
-      'video',
-      'audio',
-      'source',
-    ],
+    FORBID_TAGS: FORBIDDEN_TAGS,
     FORBID_ATTR: ['srcset', 'onerror', 'onload', 'background'],
   })
-  const parsed = new DOMParser().parseFromString(clean, 'text/html')
-  const remoteImageIds = email.remoteImageIds ?? {}
+  return new DOMParser().parseFromString(clean, 'text/html')
+}
+
+/** Mail authors put stylesheets in <head> and canvas colours on <body>; keep both inside a wrapper. */
+function hoistHeadStyles(parsed: Document) {
+  const mailRoot = parsed.createElement('div')
+  mailRoot.className = 'mail-root'
+  const bodyStyle = parsed.body.getAttribute('style')
+  const bodyColor = parsed.body.getAttribute('bgcolor')
+  if (bodyColor) mailRoot.style.backgroundColor = bodyColor
+  if (bodyStyle)
+    mailRoot.setAttribute('style', `${mailRoot.getAttribute('style') ?? ''}${bodyStyle}`)
+  mailRoot.append(...parsed.body.childNodes)
+  parsed.body.replaceChildren(...parsed.head.querySelectorAll('style'), mailRoot)
+}
+
+function blockImage(image: HTMLImageElement) {
+  image.removeAttribute('src')
+  image.setAttribute('data-remote-image', 'blocked')
+  image.setAttribute('alt', image.getAttribute('alt') || 'Bild nicht verfügbar')
+}
+
+function proxiedRemoteImage(src: string, email: ReviewEmail, imageToken: string) {
+  try {
+    const normalized = new URL(src.startsWith('//') ? `https:${src}` : src).toString()
+    const imageId = email.remoteImageIds?.[normalized]
+    return imageId ? remoteImageUrl(email.id, imageId, imageToken) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Points every image at an inline blob, the backend proxy, or blocks it. */
+function rewriteImages(
+  parsed: Document,
+  email: ReviewEmail,
+  loadRemoteImages: boolean,
+  imageToken: string,
+) {
   const cids = new Map(
     email.inlineResources
       .filter((resource) => resource.cid)
-      .map((resource) => [resource.cid?.toLowerCase(), blobUrl(snapshotId, resource.blobId, true)]),
+      .map((resource) => [resource.cid?.toLowerCase(), blobUrl(resource.blobId, true)]),
   )
-  const blockImage = (image: HTMLImageElement) => {
-    image.removeAttribute('src')
-    image.setAttribute('data-remote-image', 'blocked')
-    image.setAttribute('alt', image.getAttribute('alt') || 'Bild nicht verfügbar')
-  }
   for (const image of parsed.querySelectorAll('img')) {
-    const src = image.getAttribute('src') || ''
-    if (!src.trim() || src.trim() === '#') {
+    const src = (image.getAttribute('src') || '').trim()
+    if (!src || src === '#') {
       image.remove()
-    } else if (src.toLowerCase().startsWith('cid:')) {
-      const replacement = cids.get(src.slice(4).replace(/^<|>$/g, '').toLowerCase())
-      if (replacement) image.setAttribute('src', replacement)
-      else blockImage(image)
-    } else if (/^(https?:)?\/\//i.test(src)) {
-      let imageId: string | undefined
-      try {
-        const normalized = new URL(src.startsWith('//') ? `https:${src}` : src).toString()
-        imageId = remoteImageIds[normalized]
-      } catch {
-        // Malformed remote URLs stay blocked.
-      }
-      if (loadRemoteImages && imageId) {
-        image.setAttribute('src', remoteImageUrl(snapshotId, email.id, imageId, imageToken))
-      } else {
-        blockImage(image)
-      }
-    } else if (!src.toLowerCase().startsWith('data:image/')) {
-      blockImage(image)
+      continue
     }
+    const lower = src.toLowerCase()
+    let replacement: string | undefined
+    if (lower.startsWith('cid:')) {
+      replacement = cids.get(src.slice(4).replace(/^<|>$/g, '').toLowerCase())
+    } else if (lower.startsWith('data:image/')) {
+      replacement = src
+    } else if (loadRemoteImages && /^(https?:)?\/\//i.test(src)) {
+      replacement = proxiedRemoteImage(src, email, imageToken)
+    }
+    if (replacement) image.setAttribute('src', replacement)
+    else blockImage(image)
+    constrainImage(image)
   }
+}
+
+/** Removes every remaining way for the document to reach a remote host. */
+function stripRemoteReferences(parsed: Document) {
   for (const element of parsed.querySelectorAll('[srcset], [background], [poster]')) {
     element.removeAttribute('srcset')
     element.removeAttribute('background')
@@ -101,13 +229,10 @@ export function emailDocument(
   const stripRemoteUrls = (value: string) =>
     value.replace(/url\(\s*(['"]?)(?:https?:)?\/\/.*?\1\s*\)/gi, 'none')
   for (const element of parsed.querySelectorAll<HTMLElement>('[style]')) {
-    element.setAttribute(
-      'style',
-      releaseColorOverride(stripRemoteUrls(element.getAttribute('style') || '')),
-    )
+    element.setAttribute('style', stripRemoteUrls(element.getAttribute('style') || ''))
   }
   for (const style of parsed.querySelectorAll('style')) {
-    style.textContent = releaseColorOverride(
+    style.textContent = stripDarkSchemeRules(
       stripRemoteUrls(style.textContent || '').replace(/@import[^;]+;/gi, ''),
     )
   }
@@ -115,18 +240,30 @@ export function emailDocument(
     link.setAttribute('target', '_blank')
     link.setAttribute('rel', 'noopener noreferrer')
   }
+}
+
+export function emailDocument(
+  email: ReviewEmail,
+  loadRemoteImages: boolean,
+  imageToken = '',
+  colorMode: MailColorMode = 'dark',
+) {
+  const isPlainText = !email.html
+  const parsed = sanitizedDocument(email.html || plainTextHtml(email.text))
+  hoistHeadStyles(parsed)
+  rewriteImages(parsed, email, loadRemoteImages, imageToken)
+  stripRemoteReferences(parsed)
   const appOrigin = typeof window === 'undefined' ? 'http://localhost' : window.location.origin
+  const modeStyles = isPlainText ? plainTextStyles : readerStyles[colorMode]
   return `<!doctype html><html lang="de"><head><base target="_blank"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${appOrigin} data: blob:; style-src 'unsafe-inline';"><style>
-    :root { color-scheme: dark; } * { box-sizing: border-box; }
-    html, body { background: #211f1b !important; color: #eee9df !important; }
-    body { margin: 0; padding: 28px 36px 52px; font: 16px/1.62 Arial, sans-serif; overflow-wrap: break-word; }
-    body *:not(img):not(picture) { border-color: #4b463e !important; color: inherit !important; }
-    body *:not(img):not(picture):not(svg):not(svg *) { background-color: transparent !important; }
-    body .email-bg > table.email-body { width: min(720px, 100%) !important; max-width: min(720px, 100%) !important; }
-    img { max-width: 100% !important; height: auto !important; } img[data-remote-image] { display: none !important; }
-    table { max-width: 100% !important; } th, td { overflow-wrap: normal !important; word-break: normal !important; } th { white-space: nowrap !important; } a { overflow-wrap: anywhere; } pre { white-space: pre-wrap; }
-    blockquote { margin-left: 0; padding-left: 18px; border-left: 2px solid #575047; color: #aaa297 !important; }
-    a, a * { color: #e28a67 !important; } .plain-text { white-space: normal; font: 17px/1.72 Georgia, serif; }
-    @media (max-width: 620px) { body { padding: 20px 18px 42px; } }
+    * { box-sizing: border-box; }
+    html { margin: 0; }
+    body { margin: 0; padding: 28px clamp(16px, 4vw, 40px) 56px; font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; overflow-wrap: break-word; }
+    img { max-width: 100%; height: auto !important; } img[data-remote-image] { display: none !important; }
+    table { max-width: 100% !important; } pre { white-space: pre-wrap; overflow-wrap: anywhere; } a { overflow-wrap: anywhere; }
+    blockquote { margin: 0.6em 0; padding-left: 14px; border-left: 2px solid #b6b0a6; color: #5f5a52; }
+    .plain-text { max-width: 72ch; margin: 0 auto; white-space: pre-wrap; font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+    .plain-text blockquote { margin: 0.8em 0; padding-left: 14px; border-left: 2px solid #5b554c; color: #aaa297; }
+    ${modeStyles}
   </style></head><body>${parsed.body.innerHTML}</body></html>`
 }

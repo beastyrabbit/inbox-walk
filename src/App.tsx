@@ -1,14 +1,7 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { api, blobUrl, ClientApiError, type CodexSettings } from './api.ts'
-import { restoreBundleGroups } from './bundle-groups.ts'
-import {
-  clearCheckpoint,
-  loadCheckpoint,
-  saveCheckpoint,
-  stageCheckpointMigration,
-} from './checkpoint.ts'
-import { emailDocument } from './email-document.ts'
+import { emailDocument, type MailColorMode } from './email-document.ts'
 import {
   addressesToText,
   applyReplyProposal,
@@ -16,50 +9,32 @@ import {
   patchReplyEditor,
 } from './reply-editor.ts'
 import {
-  clampIndex,
-  idsToMarkRead,
-  stableReviewStateJson,
-  toggleKeptUnread,
-} from './review-state.ts'
-import {
   type CodexLoginState,
   type CodexSpeed,
   type CodexThinkingLevel,
   codexModelLabel,
   type DraftResult,
-  defaultReviewFilters,
-  type FinalizeResult,
-  type LegacyReviewCheckpoint,
   type MailAddress,
   type ReplyEditorState,
   type ReplyProposal,
-  type ReviewBundle,
-  type ReviewBundleRun,
   type ReviewEmail,
-  type ReviewFilters,
-  type ReviewOptions,
-  type ReviewRoundUserState,
-  type ReviewRunSummary,
-  type ReviewSnapshot,
+  type ReviewEmailSummary,
   type ThreadContext,
+  TRIAGE_MEMORY_MAX_LENGTH,
+  type TriageActionResult,
+  type TriageBucket,
+  type TriageMemory,
+  type TriageMessage,
+  type TriageSnapshot,
+  type TriageStatus,
 } from './shared.ts'
 
 export { emailDocument } from './email-document.ts'
 
-type View = 'review' | 'confirm' | 'done'
-
-const DRAFT_STATE_SAVE_DELAY_MS = 750
-
-type ReviewStateUpdate = Omit<ReviewRoundUserState, 'revision'>
-
-function reviewStateCore(state: ReviewRoundUserState | ReviewStateUpdate) {
-  const { replyDrafts: _replyDrafts, ...withRevision } = state
-  if ('revision' in withRevision) {
-    const { revision: _revision, ...core } = withRevision
-    return core
-  }
-  return withRevision
-}
+const LIST_POLL_INTERVAL_MS = 15_000
+const EDITOR_SAVE_DELAY_MS = 750
+const PARKED_PREFIX = 'parked:'
+const ACTION_BATCH_SIZE = 500
 
 function addressLine(addresses: MailAddress[]) {
   if (addresses.length === 0) return 'Unbekannter Absender'
@@ -83,6 +58,38 @@ function formatBytes(bytes: number) {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function formatShortDate(value: string) {
+  return new Intl.DateTimeFormat('de-DE', {
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(new Date(value))
+}
+
+function initials(addresses: MailAddress[]) {
+  const source = addresses[0]?.name || addresses[0]?.email || '?'
+  const words = source
+    .replace(/[<>"]/g, '')
+    .trim()
+    .split(/[\s._@-]+/)
+    .filter(Boolean)
+  return words
+    .slice(0, 2)
+    .map((word) => word[0]?.toLocaleUpperCase('de-DE') ?? '')
+    .join('')
+}
+
+const MAIL_COLOR_STORAGE_KEY = 'inbox-walk.mail-colors'
+
+function storedMailColorMode(): MailColorMode {
+  try {
+    return window.localStorage.getItem(MAIL_COLOR_STORAGE_KEY) === 'original' ? 'original' : 'dark'
+  } catch {
+    return 'dark'
+  }
 }
 
 function errorMessage(error: unknown) {
@@ -112,115 +119,91 @@ function isTypingTarget(target: EventTarget | null) {
   )
 }
 
-function roundIdFromPath() {
-  const match = window.location.pathname.match(/^\/rounds\/([^/]+)\/?$/)
+function bucketIdFromPath() {
+  const match = /^\/buckets\/([^/]+)\/?$/.exec(window.location.pathname)
   return match?.[1] ? decodeURIComponent(match[1]) : null
 }
 
-function setRoundUrl(roundId: string | null, replace = false) {
-  const next = roundId ? `/rounds/${encodeURIComponent(roundId)}` : '/'
+function setBucketUrl(bucketId: string | null, replace = false) {
+  const next = bucketId ? `/buckets/${encodeURIComponent(bucketId)}` : '/'
+  if (window.location.pathname === next) return
   window.history[replace ? 'replaceState' : 'pushState']({}, '', next)
 }
 
-function clearCheckpointForRound(roundId: string) {
-  try {
-    const checkpoint = loadCheckpoint()
-    if (checkpoint?.version === 7 && checkpoint.roundId === roundId) clearCheckpoint()
-  } catch {
-    // Never discard a legacy checkpoint just because a URL points to an expired round.
+function messageSource(summary: ReviewEmailSummary) {
+  const name = summary.from[0]?.name?.trim()
+  if (name) return name
+  return summary.from[0]?.email?.split('@').at(-1) ?? 'E-Mail'
+}
+
+function kindLabel(kind: TriageBucket['kind']) {
+  switch (kind) {
+    case 'order_delivery':
+      return 'Bestellung'
+    case 'development_workstream':
+      return 'Entwicklung'
+    case 'incident':
+      return 'Störung'
+    case 'conversation':
+      return 'Gespräch'
+    default:
+      return 'Einzeln'
   }
 }
 
-function analysisStatus(analysis: ReviewSnapshot['analysis']) {
-  if (analysis.phase === 'waiting_for_codex') {
-    return 'Die angefangene Codex-Analyse wartet auf eine erneute Anmeldung.'
-  }
-  if (analysis.phase === 'indexing') return 'Nachrichten werden für die Analyse vorbereitet …'
-  if (analysis.phase === 'deciding') return 'Codex analysiert alle Nachrichten gemeinsam …'
-  if (analysis.phase === 'reconciling') return 'Vollständigkeit der Gruppierung wird geprüft …'
-  if (analysis.phase === 'finalizing') return 'Storys werden fertiggestellt …'
-  if (analysis.phase === 'fallback') return 'Sichere Einzelansicht wird vorbereitet …'
-  if (analysis.phase === 'grouping') return 'Zusammengehörige Nachrichten werden gebündelt …'
-  return 'Analyse wird gestartet …'
+function relativeTime(value: string | null) {
+  if (!value) return 'noch nie'
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(value)) / 1000))
+  if (seconds < 60) return 'gerade eben'
+  if (seconds < 3_600) return `vor ${Math.round(seconds / 60)} Min.`
+  if (seconds < 86_400) return `vor ${Math.round(seconds / 3_600)} Std.`
+  return formatDate(value)
 }
 
-function analysisOrigin(analysis: ReviewSnapshot['analysis']) {
-  const label = codexModelLabel(analysis.model)
-  if (analysis.engine === 'fallback') {
-    return analysis.callCount > 0 && label
-      ? `Sichere Einzelansicht · Codex-Versuch ${label}`
-      : 'Sichere Einzelansicht'
+function statusLine(status: TriageStatus, mode: 'demo' | 'live') {
+  if (status.waitingForCodex) return 'Sortierung wartet auf die Codex-Anmeldung.'
+  if (status.polling) return 'Postfach wird abgefragt …'
+  if (status.sorting) {
+    return `${status.queuedCount} ${status.queuedCount === 1 ? 'Nachricht wird' : 'Nachrichten werden'} sortiert …`
   }
-  if (analysis.engine === 'heuristic') return 'Lokale Analyse'
-  return label ? `Codex · ${label}` : 'Codex'
+  if (status.lastPollError) return status.lastPollError
+  if (status.lastSortError) return `${status.lastSortError} Wird automatisch erneut versucht.`
+  if (status.queuedCount > 0)
+    return `${status.queuedCount} neue Nachrichten warten auf die Sortierung.`
+  const parts = [mode === 'demo' ? 'Lokale Sortierung' : 'Codex']
+  if (mode === 'live' && status.model) parts.push(codexModelLabel(status.model) ?? status.model)
+  if (status.pushConnected) parts.push('Push aktiv')
+  parts.push(`Postfach zuletzt geprüft ${relativeTime(status.lastPollAt)}`)
+  return parts.join(' · ')
 }
 
-function newestRunsFirst(runs: ReviewRunSummary[]) {
-  return [...runs].sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))
+function count(value: number, singular: string, plural: string) {
+  return `${value} ${value === 1 ? singular : plural}`
 }
 
-function replaceRun(runs: ReviewRunSummary[], next: ReviewRunSummary) {
-  return newestRunsFirst([next, ...runs.filter((run) => run.id !== next.id)])
+function openSummary(openCount: number, bucketCount: number) {
+  if (openCount === 0) return 'Keine ungelesenen Nachrichten.'
+  return `${count(openCount, 'Nachricht', 'Nachrichten')} in ${count(bucketCount, 'Bucket', 'Buckets')}`
 }
 
-function legacyMigrationState(
-  checkpoint: LegacyReviewCheckpoint,
-  snapshot: ReviewSnapshot,
-): ReviewStateUpdate {
-  const available = new Set(snapshot.emails.map((email) => email.id))
-  if (available.size === 0) {
-    throw new Error(
-      'Keine Nachricht der alten Runde ist noch verfügbar. Der alte Rundenstand bleibt im Browser erhalten.',
-    )
-  }
+function bucketRowState(bucket: TriageBucket, stuck: boolean) {
+  if (!bucket.unsorted) return bucket.currentState
+  return stuck ? 'Sortierung fehlgeschlagen' : 'Wird einsortiert …'
+}
 
-  const statefulIds = [
-    ...checkpoint.keptUnreadIds,
-    ...checkpoint.processedIds,
-    ...checkpoint.secondaryActionIds,
-    ...Object.keys(checkpoint.replyDrafts),
-  ]
-  if (statefulIds.some((id) => !available.has(id))) {
-    throw new Error(
-      'Mindestens eine Nachricht mit einer Entscheidung oder einem Entwurf ist nicht mehr verfügbar. Der alte Rundenstand bleibt im Browser erhalten.',
-    )
-  }
-
-  const bundleGroups = checkpoint.bundleGroups
-    .map((group) => group.filter((id) => available.has(id)))
-    .filter((group) => group.length > 0)
-  if (checkpoint.bundleGroups.length > 0) {
-    const groupedIds = bundleGroups.flat()
-    if (groupedIds.length !== available.size || new Set(groupedIds).size !== available.size) {
-      throw new Error(
-        'Die gespeicherten Storys der alten Runde sind unvollständig. Der alte Rundenstand bleibt im Browser erhalten.',
-      )
-    }
-  }
-
-  const byId = new Map(snapshot.emails.map((email) => [email.id, email]))
-  if (
-    snapshot.filters.spam === 'exclude' &&
-    checkpoint.secondaryActionIds.some((id) => !byId.get(id)?.isNewsletter)
-  ) {
-    throw new Error(
-      'Eine gespeicherte Newsletter-Aktion kann nicht mehr sicher zugeordnet werden. Der alte Rundenstand bleibt im Browser erhalten.',
-    )
-  }
-
+function parkedBucket(message: TriageMessage): TriageBucket {
+  const { summary } = message
   return {
-    bundleGroups: checkpoint.bundleGroups.length > 0 ? bundleGroups : [],
-    index: clampIndex(
-      checkpoint.index,
-      checkpoint.bundleGroups.length ||
-        snapshot.bundleRun?.bundles.length ||
-        snapshot.emails.length,
-    ),
-    keptUnreadIds: checkpoint.keptUnreadIds,
-    processedIds: checkpoint.processedIds,
-    replyDrafts: checkpoint.replyDrafts,
-    secondaryActionIds: checkpoint.secondaryActionIds,
-    selectedMemberId: null,
+    activityAt: summary.receivedAt,
+    bucketId: `${PARKED_PREFIX}${summary.id}`,
+    currentState: 'Geparkt',
+    handledCount: 0,
+    kind: 'standalone',
+    linkEvidence: [],
+    messages: [message],
+    summary: summary.preview || summary.subject,
+    title: summary.subject || '(Kein Betreff)',
+    unsorted: false,
   }
 }
 
@@ -262,590 +245,183 @@ function useFocusRegion<T extends HTMLElement>(trap: boolean) {
 }
 
 function App() {
-  const [options, setOptions] = useState<ReviewOptions | null>(null)
-  const [codexSettings, setCodexSettings] = useState<CodexSettings | null>(null)
-  const [runs, setRuns] = useState<ReviewRunSummary[]>([])
-  const [filters, setFilters] = useState<ReviewFilters>(defaultReviewFilters)
-  const [snapshot, setSnapshot] = useState<ReviewSnapshot | null>(null)
-  const [bundleRun, setBundleRun] = useState<ReviewBundleRun | null>(null)
-  const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
-  const [index, setIndex] = useState(0)
+  const [snapshot, setSnapshot] = useState<TriageSnapshot | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [status, setStatus] = useState('')
+  const [bucketId, setBucketId] = useState<string | null>(bucketIdFromPath)
   const [selectedMemberId, setSelectedMemberId] = useState<string | null>(null)
-  const [keptUnread, setKeptUnread] = useState<Set<string>>(new Set())
-  const [processedIds, setProcessedIds] = useState<Set<string>>(new Set())
-  const [secondaryActionIds, setSecondaryActionIds] = useState<Set<string>>(new Set())
-  const [replyDrafts, setReplyDrafts] = useState<Record<string, ReplyEditorState>>({})
-  const [threadContexts, setThreadContexts] = useState<Record<string, ThreadContext>>({})
-  const [replyProposals, setReplyProposals] = useState<Record<string, ReplyProposal>>({})
-  const [draftResults, setDraftResults] = useState<Record<string, DraftResult>>({})
-  const [view, setView] = useState<View>('review')
-  const [overviewOpen, setOverviewOpen] = useState(false)
+  const [details, setDetails] = useState<Record<string, ReviewEmail>>({})
+  const [pendingDetails, setPendingDetails] = useState<Set<string>>(new Set())
+  const [failedDetails, setFailedDetails] = useState<Set<string>>(new Set())
+  const [busy, setBusy] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const [showParked, setShowParked] = useState(false)
   const [replyOpen, setReplyOpen] = useState(false)
   const [helpOpen, setHelpOpen] = useState(false)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [settingsError, setSettingsError] = useState<string | null>(null)
-  const [deleteRun, setDeleteRun] = useState<ReviewRunSummary | null>(null)
   const [codexLogin, setCodexLogin] = useState<CodexLoginState | null>(null)
   const [codexLoginBusy, setCodexLoginBusy] = useState(false)
-  const [runActionIds, setRunActionIds] = useState<Set<string>>(new Set())
-  const [deletingRunIds, setDeletingRunIds] = useState<Set<string>>(new Set())
-  const [migrationRoundId, setMigrationRoundId] = useState<string | null>(null)
-  const [creatingRun, setCreatingRun] = useState(false)
-  const [loading, setLoading] = useState(true)
-  const [detailLoading, setDetailLoading] = useState(false)
-  const [failedDetails, setFailedDetails] = useState<Set<string>>(new Set())
-  const [pendingDetails, setPendingDetails] = useState<Set<string>>(new Set())
-  const roundEpochRef = useRef(0)
-  const detailRequestsRef = useRef(new Map<string, Promise<ReviewEmail>>())
-  const replyBodyEditsRef = useRef(new Map<string, number>())
+  const [memoryBusy, setMemoryBusy] = useState(false)
+  const [threadContexts, setThreadContexts] = useState<Record<string, ThreadContext>>({})
+  const [replyDrafts, setReplyDrafts] = useState<Record<string, ReplyEditorState>>({})
+  const [replyProposals, setReplyProposals] = useState<Record<string, ReplyProposal>>({})
+  const [draftResults, setDraftResults] = useState<Record<string, DraftResult>>({})
   const [replyLoading, setReplyLoading] = useState(false)
   const [submitting, setSubmitting] = useState(false)
-  const [status, setStatus] = useState('')
-  const [stateConflict, setStateConflict] = useState(false)
-  const [statePersistenceFailed, setStatePersistenceFailed] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [runStatusError, setRunStatusError] = useState<string | null>(null)
-  const [result, setResult] = useState<FinalizeResult | null>(null)
-  const restoredRef = useRef(false)
-  const activeRoundIdRef = useRef<string | null>(null)
-  const activeSnapshotRef = useRef<ReviewSnapshot | null>(null)
-  const stateRevisionRef = useRef(0)
-  const persistedStateRef = useRef('')
-  const persistedCoreStateRef = useRef('')
-  const desiredStateRef = useRef('')
-  const desiredCoreStateRef = useRef('')
-  const stateSavePromiseRef = useRef<Promise<void> | null>(null)
-  const stateSaveTimerRef = useRef<number | null>(null)
-  const stateSaveFailedRef = useRef(false)
-  const creatingRunRef = useRef(false)
-  const autoFinalizeRoundRef = useRef<string | null>(null)
-  const legacyMigrationRef = useRef<LegacyReviewCheckpoint | null>(null)
+  const [mailColorMode, setMailColorMode] = useState<MailColorMode>(storedMailColorMode)
+  const detailRequestsRef = useRef(new Map<string, Promise<ReviewEmail>>())
+  /** Bumped whenever the shown bucket changes so late responses for the old one are ignored. */
+  const viewEpochRef = useRef(0)
+  const replyBodyEditsRef = useRef(new Map<string, number>())
+  const editorSaveTimersRef = useRef(new Map<string, number>())
+  const snapshotRef = useRef<TriageSnapshot | null>(null)
+  snapshotRef.current = snapshot
 
-  const emails = snapshot?.emails ?? []
-  const bundles = bundleRun?.bundles ?? []
-  const hasActiveRun = runs.some((run) => ['queued', 'fetching', 'analyzing'].includes(run.status))
-  const currentBundle = bundles[index]
-  const summary = currentBundle
-    ? (emails.find(
-        (item) => item.id === selectedMemberId && currentBundle.emailIds.includes(item.id),
-      ) ?? emails.find((item) => item.id === currentBundle.emailIds[0]))
-    : undefined
+  const chooseMailColorMode = useCallback((mode: MailColorMode) => {
+    setMailColorMode(mode)
+    try {
+      window.localStorage.setItem(MAIL_COLOR_STORAGE_KEY, mode)
+    } catch {
+      // The preference simply resets when storage is unavailable.
+    }
+  }, [])
+
+  const buckets = snapshot?.buckets ?? []
+  const parked = snapshot?.parked ?? []
+  const bucket = useMemo(() => {
+    if (!bucketId) return undefined
+    if (bucketId.startsWith(PARKED_PREFIX)) {
+      const message = parked.find(
+        (item) => item.summary.id === bucketId.slice(PARKED_PREFIX.length),
+      )
+      return message ? parkedBucket(message) : undefined
+    }
+    return buckets.find((item) => item.bucketId === bucketId)
+  }, [bucketId, buckets, parked])
+  const isParkedView = Boolean(bucketId?.startsWith(PARKED_PREFIX))
+  const messages = bucket?.messages ?? []
+  const summary =
+    messages.find((message) => message.summary.id === selectedMemberId)?.summary ??
+    messages[0]?.summary
   const email = summary ? details[summary.id] : undefined
   const editor = summary ? replyDrafts[summary.id] : undefined
   const thread = summary ? threadContexts[summary.id] : undefined
   const proposal = summary ? replyProposals[summary.id] : undefined
   const draftResult = summary ? draftResults[summary.id] : undefined
-  const isKept = summary ? keptUnread.has(summary.id) : false
-  const isSpamReview = snapshot?.filters.spam === 'only'
-  const isSecondaryActionMarked = summary ? secondaryActionIds.has(summary.id) : false
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
-  const finalizedEmailIds = useMemo(
-    () => emails.map((item) => item.id).filter((id) => processedIds.has(id)),
-    [emails, processedIds],
-  )
-  const finalizedKeptUnreadIds = useMemo(
-    () => finalizedEmailIds.filter((id) => keptUnread.has(id)),
-    [finalizedEmailIds, keptUnread],
-  )
-  const finalizedSecondaryActionIds = useMemo(
-    () => finalizedEmailIds.filter((id) => secondaryActionIds.has(id)),
-    [finalizedEmailIds, secondaryActionIds],
-  )
-  const readIds = useMemo(
-    () => idsToMarkRead(finalizedEmailIds, new Set(finalizedKeptUnreadIds)),
-    [finalizedEmailIds, finalizedKeptUnreadIds],
-  )
+  const openCount = buckets.reduce((count, item) => count + item.messages.length, 0)
 
-  const applySnapshot = useCallback((nextSnapshot: ReviewSnapshot) => {
-    autoFinalizeRoundRef.current = null
-    roundEpochRef.current += 1
-    detailRequestsRef.current.clear()
-    replyBodyEditsRef.current.clear()
-    setReplyLoading(false)
-    setSubmitting(false)
-    setFailedDetails(new Set())
-    setPendingDetails(new Set())
-    if (stateSaveTimerRef.current !== null) {
-      window.clearTimeout(stateSaveTimerRef.current)
-      stateSaveTimerRef.current = null
-    }
-    setStateConflict(false)
-    setStatePersistenceFailed(false)
-    stateSaveFailedRef.current = false
-    activeRoundIdRef.current = nextSnapshot.snapshotId
-    activeSnapshotRef.current = nextSnapshot
-    const state = nextSnapshot.userState
-    const nextBundleRun = nextSnapshot.bundleRun
-      ? restoreBundleGroups(nextSnapshot.bundleRun, state.bundleGroups, nextSnapshot.emails)
-      : null
-    const nextIndex = clampIndex(state.index, nextBundleRun?.bundles.length ?? 0)
-    setSnapshot(nextSnapshot)
-    setBundleRun(nextBundleRun)
-    setFilters(nextSnapshot.filters)
-    setIndex(nextIndex)
-    setSelectedMemberId(
-      state.selectedMemberId &&
-        nextBundleRun?.bundles[nextIndex]?.emailIds.includes(state.selectedMemberId)
-        ? state.selectedMemberId
-        : (nextBundleRun?.bundles[nextIndex]?.emailIds[0] ?? null),
-    )
-    setKeptUnread(new Set(state.keptUnreadIds))
-    setProcessedIds(new Set(state.processedIds))
-    setSecondaryActionIds(new Set(state.secondaryActionIds))
-    setReplyDrafts(state.replyDrafts)
-    setResult(nextSnapshot.finalization.result)
-    setView(
-      nextSnapshot.finalization.status === 'finalized' && nextSnapshot.finalization.result
-        ? 'done'
-        : nextSnapshot.finalization.selectionLocked
-          ? 'confirm'
-          : 'review',
-    )
-    stateRevisionRef.current = state.revision
-    const stateFingerprint = stableReviewStateJson({ ...state, revision: undefined })
-    const coreStateFingerprint = stableReviewStateJson(reviewStateCore(state))
-    persistedStateRef.current = stateFingerprint
-    persistedCoreStateRef.current = coreStateFingerprint
-    desiredStateRef.current = stateFingerprint
-    desiredCoreStateRef.current = coreStateFingerprint
-    saveCheckpoint({ version: 7, roundId: nextSnapshot.snapshotId })
-    restoredRef.current = true
-    if (nextBundleRun?.fallback) {
-      setStatus('Die Analyse nutzt eine sichere Einzelansicht.')
-    } else if (nextBundleRun) {
-      setStatus(
-        `${nextSnapshot.emails.length} Nachrichten in ${nextBundleRun.bundles.length} Storys gebündelt.`,
-      )
-    } else {
-      setStatus(analysisStatus(nextSnapshot.analysis))
-    }
+  /**
+   * Snapshots are ordered by the request that started them. A background
+   * poll that began before a user action must not overwrite the action's
+   * newer result, so only the newest ticket may install its snapshot.
+   */
+  const snapshotTicketRef = useRef(0)
+  const takeSnapshotTicket = useCallback(() => {
+    snapshotTicketRef.current += 1
+    return snapshotTicketRef.current
+  }, [])
+  const applySnapshot = useCallback((next: TriageSnapshot, ticket: number) => {
+    if (ticket < snapshotTicketRef.current) return
+    setSnapshot(next)
+    setError(null)
   }, [])
 
-  const clearStateSaveTimer = useCallback(() => {
-    if (stateSaveTimerRef.current === null) return
-    window.clearTimeout(stateSaveTimerRef.current)
-    stateSaveTimerRef.current = null
-  }, [])
-
-  const triggerStateSave = useCallback(
-    (immediate: boolean) => {
-      clearStateSaveTimer()
-      const roundId = activeRoundIdRef.current
-      const currentSnapshot = activeSnapshotRef.current
-      if (
-        !roundId ||
-        currentSnapshot?.snapshotId !== roundId ||
-        stateSaveFailedRef.current ||
-        desiredStateRef.current === persistedStateRef.current
-      ) {
-        return
-      }
-      if (!immediate) {
-        stateSaveTimerRef.current = window.setTimeout(() => {
-          stateSaveTimerRef.current = null
-          triggerStateSave(true)
-        }, DRAFT_STATE_SAVE_DELAY_MS)
-        return
-      }
-      if (stateSavePromiseRef.current) return
-
-      const submittedFingerprint = desiredStateRef.current
-      const submitted = JSON.parse(submittedFingerprint) as ReviewStateUpdate
-      const saving = api
-        .updateReviewState(currentSnapshot, stateRevisionRef.current, submitted)
-        .then((saved) => {
-          if (activeRoundIdRef.current !== roundId) return
-          const savedFingerprint = stableReviewStateJson({ ...saved, revision: undefined })
-          if (savedFingerprint !== submittedFingerprint) {
-            throw new Error(
-              'Der gespeicherte Rundenstand weicht von der Anfrage ab. Bitte lade die Runde neu.',
-            )
-          }
-          stateRevisionRef.current = saved.revision
-          persistedStateRef.current = savedFingerprint
-          persistedCoreStateRef.current = stableReviewStateJson(reviewStateCore(saved))
-        })
-        .catch((cause) => {
-          if (activeRoundIdRef.current !== roundId) return
-          stateSaveFailedRef.current = true
-          restoredRef.current = false
-          if (cause instanceof ClientApiError && cause.code === 'ROUND_REVISION_CONFLICT') {
-            setStateConflict(true)
-          } else {
-            setStatePersistenceFailed(true)
-            setError(errorMessage(cause))
-          }
-        })
-        .finally(() => {
-          if (stateSavePromiseRef.current === saving) stateSavePromiseRef.current = null
-          if (
-            !stateSaveFailedRef.current &&
-            activeRoundIdRef.current === roundId &&
-            desiredStateRef.current !== persistedStateRef.current
-          ) {
-            const coreChanged = desiredCoreStateRef.current !== persistedCoreStateRef.current
-            triggerStateSave(coreChanged)
-          }
-        })
-      stateSavePromiseRef.current = saving
-    },
-    [clearStateSaveTimer],
-  )
-
-  const flushState = useCallback(async () => {
-    clearStateSaveTimer()
-    while (
-      activeRoundIdRef.current &&
-      !stateSaveFailedRef.current &&
-      desiredStateRef.current !== persistedStateRef.current
-    ) {
-      triggerStateSave(true)
-      const saving = stateSavePromiseRef.current
-      if (!saving) break
-      await saving
-    }
-    return !stateSaveFailedRef.current && desiredStateRef.current === persistedStateRef.current
-  }, [clearStateSaveTimer, triggerStateSave])
-
-  const closeReply = useCallback(() => {
-    setReplyOpen(false)
-    void flushState()
-  }, [flushState])
-
-  const refreshRuns = useCallback(async () => {
-    const response = await api.reviewRuns()
-    setRunStatusError(null)
-    setRuns((current) => {
-      if (!creatingRunRef.current) return response.runs
-      const persistedIds = new Set(response.runs.map((run) => run.id))
-      const pending = current.filter((run) => !run.csrfToken && !persistedIds.has(run.id))
-      return newestRunsFirst([...response.runs, ...pending])
-    })
-    return response.runs
-  }, [])
-
-  const openReview = useCallback(
-    async (roundId: string, replaceUrl = false) => {
-      setLoading(true)
-      setError(null)
-      setStatus('Runde wird geöffnet …')
-      try {
-        const nextSnapshot = await api.review(roundId)
-        if (!nextSnapshot.bundleRun) {
-          setRoundUrl(null, true)
-          await refreshRuns()
-          return
-        }
-        setRoundUrl(nextSnapshot.snapshotId, replaceUrl)
-        setDetails({})
-        setThreadContexts({})
-        setReplyProposals({})
-        setDraftResults({})
-        setOverviewOpen(false)
-        setReplyOpen(false)
-        applySnapshot(nextSnapshot)
-      } catch (cause) {
-        if (cause instanceof ClientApiError) {
-          if (['REVIEW_EXPIRED', 'ROUND_NOT_FOUND'].includes(cause.code)) {
-            clearCheckpointForRound(roundId)
-          }
-          if (
-            [
-              'REVIEW_EXPIRED',
-              'ROUND_NOT_FOUND',
-              'ROUND_NOT_READY',
-              'ROUND_SNAPSHOT_INCOMPLETE',
-              'REVIEW_NOT_READY',
-            ].includes(cause.code)
-          ) {
-            setRoundUrl(null, true)
-          }
-        }
-        try {
-          await refreshRuns()
-        } catch {
-          setRunStatusError('Der aktuelle Rundenstatus konnte nicht geladen werden.')
-        }
-        setError(errorMessage(cause))
-        setStatus('Runde konnte nicht geladen werden.')
-      } finally {
-        setLoading(false)
-      }
-    },
-    [applySnapshot, refreshRuns],
-  )
-
-  const finishLegacyMigration = useCallback(
-    async (roundId: string) => {
-      const legacy = legacyMigrationRef.current
-      if (!legacy || legacy.migrationRoundId !== roundId) return
-      setRunActionIds((current) => new Set(current).add(roundId))
-      setError(null)
-      setStatus('Alter Rundenstand wird wiederhergestellt …')
-      try {
-        const resumed = await api.review(roundId)
-        const desired = legacyMigrationState(legacy, resumed)
-        const current = { ...resumed.userState, revision: undefined }
-        const migratedState =
-          stableReviewStateJson(current) === stableReviewStateJson(desired)
-            ? resumed.userState
-            : resumed.userState.revision === 0
-              ? await api.updateReviewState(resumed, 0, desired)
-              : (() => {
-                  throw new Error(
-                    'Die bereits gespeicherte Runde hat einen anderen Stand. Der alte Rundenstand bleibt im Browser erhalten.',
-                  )
-                })()
-        if (!saveCheckpoint({ version: 7, roundId })) {
-          throw new Error(
-            'Die neue Runden-ID konnte nicht im Browser gespeichert werden. Der alte Rundenstand bleibt erhalten.',
-          )
-        }
-        legacyMigrationRef.current = null
-        setRoundUrl(roundId, true)
-        applySnapshot({ ...resumed, userState: migratedState })
-      } catch (cause) {
-        setError(`Der alte Rundenstand konnte nicht übertragen werden. ${errorMessage(cause)}`)
-        setStatus('Alter Rundenstand konnte nicht wiederhergestellt werden.')
-      } finally {
-        setRunActionIds((current) => {
-          const next = new Set(current)
-          next.delete(roundId)
-          return next
-        })
-      }
-    },
-    [applySnapshot],
-  )
-
-  useEffect(() => {
-    if (!currentBundle) return
-    if (!selectedMemberId || !currentBundle.emailIds.includes(selectedMemberId)) {
-      setSelectedMemberId(currentBundle.emailIds[0] ?? null)
-    }
-  }, [currentBundle, selectedMemberId])
+  const load = useCallback(async () => {
+    const ticket = takeSnapshotTicket()
+    const next = await api.todo()
+    applySnapshot(next, ticket)
+    return next
+  }, [applySnapshot, takeSnapshotTicket])
 
   useEffect(() => {
     let active = true
     void (async () => {
-      const pathRoundId = roundIdFromPath()
-      let legacyCheckpoint: LegacyReviewCheckpoint | null = null
-      let checkpointError: string | null = null
-      if (!pathRoundId) {
-        try {
-          const saved = loadCheckpoint()
-          if (saved?.version === 6) legacyCheckpoint = saved
-        } catch (cause) {
-          checkpointError = errorMessage(cause)
-        }
+      try {
+        await load()
+      } catch (cause) {
+        if (active) setError(errorMessage(cause))
+      } finally {
+        if (active) setLoading(false)
       }
-      const [loadedOptions, loadedRuns, loadedRound, loadedCodexSettings] =
-        await Promise.allSettled([
-          api.options(),
-          api.reviewRuns(),
-          pathRoundId ? api.review(pathRoundId) : Promise.resolve(null),
-          api.codexSettings(),
-        ])
-      if (!active) return
-      if (loadedOptions.status === 'fulfilled') {
-        setOptions(loadedOptions.value)
-      } else setError(errorMessage(loadedOptions.reason))
-      if (loadedCodexSettings.status === 'fulfilled') {
-        setCodexSettings(loadedCodexSettings.value)
-      } else if (loadedOptions.status === 'fulfilled') {
-        setCodexSettings(loadedOptions.value.codex)
-      }
-      if (loadedRuns.status === 'fulfilled') setRuns(loadedRuns.value.runs)
-      else setError(errorMessage(loadedRuns.reason))
-      if (checkpointError) setError(checkpointError)
-      if (loadedRound.status === 'fulfilled' && loadedRound.value) {
-        if (loadedRound.value.bundleRun) {
-          applySnapshot(loadedRound.value)
-          setRoundUrl(loadedRound.value.snapshotId, true)
-        } else {
-          setRoundUrl(null, true)
-        }
-      } else if (loadedRound.status === 'rejected') {
-        if (
-          loadedRound.reason instanceof ClientApiError &&
-          ['REVIEW_EXPIRED', 'ROUND_NOT_FOUND'].includes(loadedRound.reason.code)
-        ) {
-          if (pathRoundId) clearCheckpointForRound(pathRoundId)
-          setRoundUrl(null, true)
-        } else if (
-          loadedRound.reason instanceof ClientApiError &&
-          ['ROUND_NOT_READY', 'ROUND_SNAPSHOT_INCOMPLETE', 'REVIEW_NOT_READY'].includes(
-            loadedRound.reason.code,
-          )
-        ) {
-          setRoundUrl(null, true)
-        } else {
-          setError(errorMessage(loadedRound.reason))
-        }
-      }
-      if (!pathRoundId && legacyCheckpoint) {
-        legacyMigrationRef.current = legacyCheckpoint
-        setFilters(legacyCheckpoint.filters)
-        setStatus('Alter Rundenstand wird einmalig sicher gespeichert …')
-        try {
-          if (legacyCheckpoint.emailIds.length === 0) {
-            throw new Error(
-              'Der alte Rundenstand enthält keine Snapshot-IDs und kann nicht sicher übertragen werden. Er bleibt im Browser erhalten.',
-            )
-          }
-          let stagedCheckpoint = legacyCheckpoint
-          let migrationId = legacyCheckpoint.migrationRoundId
-          if (!migrationId) {
-            migrationId = crypto.randomUUID()
-            const staged = stageCheckpointMigration(legacyCheckpoint, migrationId)
-            if (!staged) {
-              throw new Error(
-                'Die Übertragung konnte nicht im Browser vorgemerkt werden. Der alte Rundenstand bleibt erhalten.',
-              )
-            }
-            stagedCheckpoint = staged
-            legacyMigrationRef.current = staged
-          }
-          const listedMigration =
-            migrationId && loadedRuns.status === 'fulfilled'
-              ? loadedRuns.value.runs.some((run) => run.id === migrationId)
-              : false
-          if (!listedMigration) {
-            await api.resumeReview(migrationId, stagedCheckpoint.emailIds, stagedCheckpoint.filters)
-          }
-          if (!active) return
-          setMigrationRoundId(migrationId ?? null)
-          setStatus('Die alte Runde wird analysiert und danach wiederhergestellt …')
-          await refreshRuns().catch(() => undefined)
-        } catch (cause) {
-          if (active) {
-            setError(`Der alte Rundenstand konnte nicht übertragen werden. ${errorMessage(cause)}`)
-          }
-        }
-      }
-      setLoading(false)
     })()
     return () => {
       active = false
     }
-  }, [applySnapshot, refreshRuns])
+  }, [load])
 
   useEffect(() => {
-    if (snapshot || (!migrationRoundId && !hasActiveRun)) return
-    let active = true
     let polling = false
     const poll = async () => {
-      if (polling) return
+      if (polling || document.visibilityState === 'hidden') return
       polling = true
       try {
-        const response = await api.reviewRuns()
-        if (active) {
-          setRunStatusError(null)
-          setRuns((current) => {
-            if (!creatingRunRef.current) return response.runs
-            const persistedIds = new Set(response.runs.map((run) => run.id))
-            const pending = current.filter((run) => !run.csrfToken && !persistedIds.has(run.id))
-            return newestRunsFirst([...response.runs, ...pending])
-          })
-        }
+        await load()
       } catch {
-        if (active) {
-          setRunStatusError(
-            'Der Rundenstatus kann gerade nicht aktualisiert werden. Der letzte Stand bleibt sichtbar.',
-          )
-        }
+        // The last known list stays visible; a manual refresh reports the error.
       } finally {
         polling = false
       }
     }
-    const timer = window.setInterval(() => void poll(), 1_000)
+    const timer = window.setInterval(() => void poll(), LIST_POLL_INTERVAL_MS)
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void poll()
+    }
+    document.addEventListener('visibilitychange', onVisible)
     return () => {
-      active = false
       window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
     }
-  }, [hasActiveRun, migrationRoundId, snapshot])
+  }, [load])
+
+  /** Mail bodies and thread context belong to the bucket on screen; nothing else is retained. */
+  const dropBucketState = useCallback(() => {
+    viewEpochRef.current += 1
+    detailRequestsRef.current.clear()
+    setReplyLoading(false)
+    setSubmitting(false)
+    setDetails({})
+    setPendingDetails(new Set())
+    setFailedDetails(new Set())
+    setThreadContexts({})
+    setReplyProposals({})
+    setDraftResults({})
+    setReplyDrafts({})
+  }, [])
 
   useEffect(() => {
-    if (!migrationRoundId || snapshot) return
-    const migrated = runs.find((run) => run.id === migrationRoundId)
-    if (!migrated) return
-    if (migrated.status === 'failed') {
-      setMigrationRoundId(null)
-      setError(
-        migrated.analysis.error ||
-          'Der alte Rundenstand wurde gespeichert, aber seine Analyse ist fehlgeschlagen.',
-      )
-      return
-    }
-    if (migrated.status !== 'ready') return
-    setMigrationRoundId(null)
-    if (legacyMigrationRef.current?.migrationRoundId === migrated.id) {
-      void finishLegacyMigration(migrated.id)
-    } else {
-      void openReview(migrated.id, true)
-    }
-  }, [finishLegacyMigration, migrationRoundId, openReview, runs, snapshot])
-
-  useEffect(() => {
-    let generation = 0
     const onPopState = () => {
-      generation += 1
-      const currentGeneration = generation
-      const roundId = roundIdFromPath()
-      void (async () => {
-        const previousRoundId = activeRoundIdRef.current
-        if (restoredRef.current && !(await flushState())) {
-          if (previousRoundId) setRoundUrl(previousRoundId, true)
-          return
-        }
-        if (generation !== currentGeneration) return
-        restoredRef.current = false
-        roundEpochRef.current += 1
-        setSubmitting(false)
-        activeRoundIdRef.current = null
-        activeSnapshotRef.current = null
-        setError(null)
-        setSnapshot(null)
-        setBundleRun(null)
-        setDetails({})
-        setThreadContexts({})
-        setReplyProposals({})
-        setDraftResults({})
-        setResult(null)
-        setView('review')
-        setOverviewOpen(false)
-        setReplyOpen(false)
-        if (!roundId) {
-          void refreshRuns().catch(() => undefined)
-          return
-        }
-        setLoading(true)
-        try {
-          const round = await api.review(roundId)
-          if (generation === currentGeneration) applySnapshot(round)
-        } catch (cause) {
-          if (generation === currentGeneration) {
-            if (
-              cause instanceof ClientApiError &&
-              ['REVIEW_EXPIRED', 'ROUND_NOT_FOUND'].includes(cause.code)
-            ) {
-              clearCheckpointForRound(roundId)
-            }
-            setRoundUrl(null, true)
-            setError(errorMessage(cause))
-            await refreshRuns().catch(() =>
-              setRunStatusError('Der aktuelle Rundenstatus konnte nicht geladen werden.'),
-            )
-          }
-        } finally {
-          if (generation === currentGeneration) setLoading(false)
-        }
-      })()
+      dropBucketState()
+      setBucketId(bucketIdFromPath())
+      setReplyOpen(false)
     }
     window.addEventListener('popstate', onPopState)
     return () => window.removeEventListener('popstate', onPopState)
-  }, [applySnapshot, flushState, refreshRuns])
+  }, [dropBucketState])
+
+  useEffect(() => {
+    if (!bucket) return
+    if (
+      !selectedMemberId ||
+      !bucket.messages.some((item) => item.summary.id === selectedMemberId)
+    ) {
+      setSelectedMemberId(bucket.messages[0]?.summary.id ?? null)
+    }
+  }, [bucket, selectedMemberId])
+
+  useEffect(() => {
+    if (!snapshot || !bucketId || loading) return
+    if (!bucket) {
+      dropBucketState()
+      setBucketUrl(null, true)
+      setBucketId(null)
+      setReplyOpen(false)
+      setStatus('Dieser Bucket ist nicht mehr offen.')
+    }
+  }, [bucket, bucketId, dropBucketState, loading, snapshot])
 
   useEffect(() => {
     if (!codexLoginId || !codexLoginStatus || !['starting', 'waiting'].includes(codexLoginStatus))
@@ -861,12 +437,11 @@ function App() {
         if (next.status === 'completed') {
           const auth = await api.codexStatus()
           if (!active) return
-          setOptions((current) => (current ? { ...current, codex: auth } : current))
-          setCodexSettings(auth)
-          if (active) setCodexLogin(next)
+          setSnapshot((current) => (current ? { ...current, codex: auth } : current))
+          setCodexLogin(next)
           return
         }
-        if (active) setCodexLogin(next)
+        setCodexLogin(next)
       } catch (cause) {
         if (active) {
           setCodexLogin({
@@ -890,312 +465,319 @@ function App() {
     }
   }, [codexLoginId, codexLoginStatus])
 
-  useLayoutEffect(() => {
-    if (
-      !snapshot ||
-      !bundleRun ||
-      !restoredRef.current ||
-      stateConflict ||
-      statePersistenceFailed ||
-      snapshot.finalization.selectionLocked ||
-      emails.length === 0
-    )
-      return
-    const state: ReviewStateUpdate = {
-      bundleGroups: bundles.map((bundle) => bundle.emailIds),
-      index,
-      keptUnreadIds: [...keptUnread],
-      processedIds: [...processedIds],
-      replyDrafts,
-      secondaryActionIds: [...secondaryActionIds],
-      selectedMemberId,
-    }
-    const fingerprint = stableReviewStateJson(state)
-    const coreFingerprint = stableReviewStateJson(reviewStateCore(state))
-    desiredStateRef.current = fingerprint
-    desiredCoreStateRef.current = coreFingerprint
-    if (fingerprint === persistedStateRef.current) {
-      clearStateSaveTimer()
-      return
-    }
-    triggerStateSave(coreFingerprint !== persistedCoreStateRef.current)
-  }, [
-    bundleRun,
-    bundles,
-    clearStateSaveTimer,
-    emails.length,
-    index,
-    keptUnread,
-    processedIds,
-    replyDrafts,
-    secondaryActionIds,
-    selectedMemberId,
-    snapshot,
-    stateConflict,
-    statePersistenceFailed,
-    triggerStateSave,
-  ])
-
-  useEffect(() => {
-    const saveBeforeLeaving = () => {
-      if (desiredStateRef.current !== persistedStateRef.current) triggerStateSave(true)
-    }
-    const saveWhenHidden = () => {
-      if (document.visibilityState === 'hidden') saveBeforeLeaving()
-    }
-    window.addEventListener('pagehide', saveBeforeLeaving)
-    document.addEventListener('visibilitychange', saveWhenHidden)
-    return () => {
-      window.removeEventListener('pagehide', saveBeforeLeaving)
-      document.removeEventListener('visibilitychange', saveWhenHidden)
-      clearStateSaveTimer()
-    }
-  }, [clearStateSaveTimer, triggerStateSave])
-
-  useEffect(() => {
-    if (!snapshot || !summary || details[summary.id]) return
-    let active = true
-    const epoch = roundEpochRef.current
-    const belongsToRound = () =>
-      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
-    setPendingDetails((current) => new Set(current).add(summary.id))
-    setDetailLoading(true)
-    setError(null)
-    const requestKey = `${epoch}/${summary.id}`
-    let request = detailRequestsRef.current.get(requestKey)
-    if (!request) {
-      request = api.email(snapshot.snapshotId, summary.id)
-      detailRequestsRef.current.set(requestKey, request)
-    }
-    void request
-      .then((loaded) => {
-        if (belongsToRound()) setDetails((current) => ({ ...current, [loaded.id]: loaded }))
-      })
-      .catch((cause) => {
-        if (!belongsToRound()) return
-        if (detailRequestsRef.current.get(requestKey) === request)
-          detailRequestsRef.current.delete(requestKey)
-        setFailedDetails((current) => new Set(current).add(summary.id))
-        setKeptUnread((current) => new Set(current).add(summary.id))
-        setError(`${errorMessage(cause)} Die Nachricht bleibt vorsichtshalber ungelesen.`)
-        setStatus('Nachrichteninhalt nicht verfügbar; ungelesen geschützt.')
-      })
-      .finally(() => {
-        if (belongsToRound())
-          setPendingDetails((current) => {
-            const next = new Set(current)
-            next.delete(summary.id)
+  const loadDetail = useCallback(
+    (emailId: string) => {
+      if (details[emailId] || pendingDetails.has(emailId) || failedDetails.has(emailId)) return
+      let request = detailRequestsRef.current.get(emailId)
+      if (!request) {
+        request = api.email(emailId)
+        detailRequestsRef.current.set(emailId, request)
+      }
+      const epoch = viewEpochRef.current
+      const current = () => viewEpochRef.current === epoch
+      setPendingDetails((state) => new Set(state).add(emailId))
+      void request
+        .then((loaded) => {
+          if (current()) setDetails((state) => ({ ...state, [loaded.id]: loaded }))
+        })
+        .catch((cause) => {
+          if (!current()) return
+          detailRequestsRef.current.delete(emailId)
+          setFailedDetails((state) => new Set(state).add(emailId))
+          setError(errorMessage(cause))
+        })
+        .finally(() => {
+          if (!current()) return
+          setPendingDetails((state) => {
+            const next = new Set(state)
+            next.delete(emailId)
             return next
           })
-        if (active) setDetailLoading(false)
-      })
-    return () => {
-      active = false
-    }
-  }, [details, snapshot, summary])
+        })
+    },
+    [details, failedDetails, pendingDetails],
+  )
 
-  const previous = useCallback(() => {
-    if (view !== 'review') {
-      if (snapshot?.finalization.selectionLocked) return
-      setView('review')
+  useEffect(() => {
+    if (!bucket) return
+    for (const message of bucket.messages) loadDetail(message.summary.id)
+  }, [bucket, loadDetail])
+
+  const openBucket = useCallback(
+    (id: string, replace = false) => {
+      dropBucketState()
+      setBucketUrl(id, replace)
+      setBucketId(id)
+      setSelectedMemberId(null)
+      setReplyOpen(false)
+      setError(null)
+    },
+    [dropBucketState],
+  )
+
+  const backToList = useCallback(() => {
+    dropBucketState()
+    setBucketUrl(null)
+    setBucketId(null)
+    setReplyOpen(false)
+  }, [dropBucketState])
+
+  const runAction = useCallback(
+    async (
+      action: 'done' | 'park' | 'unpark' | 'newsletter' | 'retry',
+      emailIds: string[],
+      successStatus: string,
+    ) => {
+      const current = snapshotRef.current
+      if (!current || emailIds.length === 0) return false
+      setBusy(true)
+      setError(null)
+      try {
+        const failed: TriageActionResult['failed'] = []
+        // Each chunk's snapshot is applied at once so a later failure never hides earlier changes.
+        for (let start = 0; start < emailIds.length; start += ACTION_BATCH_SIZE) {
+          const chunk = await api.messageAction(
+            action,
+            emailIds.slice(start, start + ACTION_BATCH_SIZE),
+            current.csrfToken,
+          )
+          // The ticket is taken after the response so a poll that started meanwhile cannot win.
+          applySnapshot(chunk.snapshot, takeSnapshotTicket())
+          failed.push(...chunk.failed)
+        }
+        if (failed.length > 0) {
+          setError(
+            `${failed.length} ${failed.length === 1 ? 'Änderung ist' : 'Änderungen sind'} fehlgeschlagen: ${failed.map((item) => item.reason).join(' ')}`,
+          )
+          return false
+        }
+        setStatus(successStatus)
+        return true
+      } catch (cause) {
+        setError(errorMessage(cause))
+        return false
+      } finally {
+        setBusy(false)
+      }
+    },
+    [applySnapshot, takeSnapshotTicket],
+  )
+
+  const nextBucketAfter = useCallback(
+    (currentId: string) => {
+      const index = buckets.findIndex((item) => item.bucketId === currentId)
+      return buckets[index + 1] ?? buckets[index - 1]
+    },
+    [buckets],
+  )
+
+  const completeBucket = useCallback(async () => {
+    if (!bucket || busy || isParkedView) return
+    const ids = bucket.messages.map((message) => message.summary.id)
+    const following = nextBucketAfter(bucket.bucketId)
+    const ok = await runAction(
+      'done',
+      ids,
+      `${ids.length} ${ids.length === 1 ? 'Nachricht' : 'Nachrichten'} als gelesen markiert.`,
+    )
+    if (!ok) return
+    if (following) openBucket(following.bucketId, true)
+    else backToList()
+  }, [backToList, bucket, busy, isParkedView, nextBucketAfter, openBucket, runAction])
+
+  const parkSelected = useCallback(async () => {
+    if (!bucket || !summary || busy) return
+    if (isParkedView) {
+      const ok = await runAction('unpark', [summary.id], 'Nachricht ist zurück in der Liste.')
+      if (ok) backToList()
       return
     }
-    setReplyOpen(false)
-    setIndex((current) => Math.max(0, current - 1))
-  }, [snapshot?.finalization.selectionLocked, view])
+    const last = bucket.messages.length === 1
+    const following = last ? nextBucketAfter(bucket.bucketId) : undefined
+    const ok = await runAction('park', [summary.id], 'Nachricht geparkt; sie bleibt ungelesen.')
+    if (!ok || !last) return
+    if (following) openBucket(following.bucketId, true)
+    else backToList()
+  }, [backToList, bucket, busy, isParkedView, nextBucketAfter, openBucket, runAction, summary])
 
-  const next = useCallback(() => {
-    if (view !== 'review' || !currentBundle) return
-    if (summary && !details[summary.id] && !failedDetails.has(summary.id)) return
-    setReplyOpen(false)
-    const nextProcessed = new Set(processedIds)
-    for (const id of currentBundle.emailIds) nextProcessed.add(id)
-    setProcessedIds(nextProcessed)
-    if (index >= bundles.length - 1 || emails.every((email) => nextProcessed.has(email.id)))
-      setView('confirm')
-    else setIndex((current) => current + 1)
-  }, [
-    bundles.length,
-    currentBundle,
-    index,
-    view,
-    summary,
-    details,
-    failedDetails,
-    processedIds,
-    emails,
-  ])
+  const tagNewsletter = useCallback(async () => {
+    if (!summary || busy || !summary.isNewsletter) return
+    await runAction('newsletter', [summary.id], 'Mit „Newsletter abmelden“ markiert.')
+  }, [busy, runAction, summary])
 
-  const finishProcessed = useCallback(() => {
-    if (view !== 'review' || processedIds.size === 0) return
-    setReplyOpen(false)
-    setResult(null)
-    setView('confirm')
-  }, [processedIds.size, view])
-
-  const toggleCurrent = useCallback(() => {
-    if (!summary || view !== 'review') return
-    setKeptUnread((current) => toggleKeptUnread(current, summary.id))
-    setStatus(isKept ? 'Wird beim Abschluss als gelesen markiert.' : 'Bleibt ungelesen.')
-  }, [isKept, summary, view])
-
-  const toggleSecondaryAction = useCallback(() => {
-    if (!summary || view !== 'review' || (!isSpamReview && !summary.isNewsletter)) return
-    setSecondaryActionIds((current) => toggleKeptUnread(current, summary.id))
-    setStatus(
-      isSecondaryActionMarked
-        ? isSpamReview
-          ? 'Nachricht bleibt im Spam-Ordner.'
-          : 'Abmelde-Label nicht mehr vorgemerkt.'
-        : isSpamReview
-          ? 'Wird beim Abschluss aus Spam in die Inbox verschoben.'
-          : 'Wird beim Abschluss mit „Newsletter abmelden“ markiert.',
-    )
-  }, [isSecondaryActionMarked, isSpamReview, summary, view])
-
-  const openReply = useCallback(async () => {
-    if (!snapshot || !summary) return
-    const epoch = roundEpochRef.current
-    const belongsToRound = () =>
-      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
-    setReplyOpen(true)
-    setHelpOpen(false)
-    if (threadContexts[summary.id]) return
-    setReplyLoading(true)
+  const refreshNow = useCallback(async () => {
+    const current = snapshotRef.current
+    if (!current || refreshing) return
+    setRefreshing(true)
     setError(null)
     try {
-      const context = await api.thread(snapshot.snapshotId, summary.threadId, summary.id)
-      if (!belongsToRound()) return
+      const ticket = takeSnapshotTicket()
+      applySnapshot(await api.refresh(current.csrfToken), ticket)
+      setStatus('Postfach geprüft.')
+    } catch (cause) {
+      setError(errorMessage(cause))
+    } finally {
+      setRefreshing(false)
+    }
+  }, [applySnapshot, refreshing, takeSnapshotTicket])
+
+  const scheduleEditorSave = useCallback((emailId: string, next: ReplyEditorState) => {
+    const timers = editorSaveTimersRef.current
+    const existing = timers.get(emailId)
+    if (existing) window.clearTimeout(existing)
+    timers.set(
+      emailId,
+      window.setTimeout(() => {
+        timers.delete(emailId)
+        const current = snapshotRef.current
+        if (!current) return
+        void api.saveReplyEditor(emailId, next, current.csrfToken).catch(() => {
+          setStatus('Der Entwurfsstand konnte nicht gespeichert werden.')
+        })
+      }, EDITOR_SAVE_DELAY_MS),
+    )
+  }, [])
+
+  const openReply = useCallback(async () => {
+    if (!summary) return
+    setReplyOpen(true)
+    setHelpOpen(false)
+    // The thread is fetched on every open so mail that arrived since is included.
+    const firstOpen = !threadContexts[summary.id]
+    const epoch = viewEpochRef.current
+    if (firstOpen) setReplyLoading(true)
+    setError(null)
+    try {
+      const [context, saved] = await Promise.all([
+        api.thread(summary.threadId, summary.id),
+        firstOpen
+          ? api.replyEditor(summary.id).catch(() => ({ editor: null }))
+          : Promise.resolve({ editor: null }),
+      ])
+      if (viewEpochRef.current !== epoch) return
       setThreadContexts((current) => ({ ...current, [summary.id]: context }))
       setReplyDrafts((current) => ({
         ...current,
-        [summary.id]: current[summary.id] ?? initialEditor(context),
+        [summary.id]: current[summary.id] ?? saved.editor ?? initialEditor(context),
       }))
       setStatus('Antwortkontext geladen.')
     } catch (cause) {
-      if (!belongsToRound()) return
-      setError(errorMessage(cause))
-      setReplyOpen(false)
+      if (viewEpochRef.current !== epoch) return
+      if (firstOpen) {
+        setError(errorMessage(cause))
+        setReplyOpen(false)
+      } else {
+        setStatus('Der Thread konnte nicht aktualisiert werden; der letzte Stand bleibt sichtbar.')
+      }
     } finally {
-      if (belongsToRound()) setReplyLoading(false)
+      if (viewEpochRef.current === epoch) setReplyLoading(false)
     }
-  }, [snapshot, summary, threadContexts])
+  }, [summary, threadContexts])
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return
-      if (submitting) return
+      if (submitting || busy) return
       if (event.key === 'Escape') {
-        if (settingsOpen || deleteRun) return
+        if (settingsOpen) return
         if (helpOpen) setHelpOpen(false)
-        else if (replyOpen) closeReply()
-        else if (overviewOpen) setOverviewOpen(false)
-        else if (view === 'confirm' && !snapshot?.finalization.selectionLocked) setView('review')
+        else if (replyOpen) setReplyOpen(false)
+        else if (bucket) backToList()
         return
       }
-      if (settingsOpen || deleteRun || helpOpen || replyOpen || overviewOpen) return
-      if (replyLoading) return
+      if (settingsOpen || helpOpen || replyOpen || replyLoading) return
       if (isTypingTarget(event.target)) return
       if (event.key === '?') {
         event.preventDefault()
         setHelpOpen(true)
-      } else if (event.key.toLowerCase() === 'r') {
-        event.preventDefault()
-        void openReply()
-      } else if (event.key === 'ArrowRight') {
-        event.preventDefault()
-        next()
-      } else if (event.key === 'ArrowLeft') {
-        event.preventDefault()
-        previous()
-      } else if (event.key === 'ArrowUp') {
-        event.preventDefault()
-        toggleCurrent()
-      } else if (event.key === 'ArrowDown') {
-        event.preventDefault()
-        toggleSecondaryAction()
+        return
       }
+      if (!bucket) return
+      const shortcuts: Record<string, () => unknown> = {
+        ArrowDown: tagNewsletter,
+        ArrowLeft: backToList,
+        ArrowRight: completeBucket,
+        ArrowUp: parkSelected,
+        e: completeBucket,
+        r: openReply,
+      }
+      const action = shortcuts[event.key] ?? shortcuts[event.key.toLowerCase()]
+      if (!action) return
+      event.preventDefault()
+      void action()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
   }, [
-    deleteRun,
+    backToList,
+    bucket,
+    busy,
+    completeBucket,
     helpOpen,
-    closeReply,
-    next,
     openReply,
-    overviewOpen,
-    previous,
+    parkSelected,
     replyLoading,
     replyOpen,
     settingsOpen,
-    snapshot?.finalization.selectionLocked,
     submitting,
-    toggleCurrent,
-    toggleSecondaryAction,
-    view,
+    tagNewsletter,
   ])
 
   function updateEditor(patch: Partial<ReplyEditorState>) {
     if (!summary || !editor) return
-    if ('bodyText' in patch)
+    if ('bodyText' in patch) {
       replyBodyEditsRef.current.set(
         summary.id,
         (replyBodyEditsRef.current.get(summary.id) ?? 0) + 1,
       )
-    setReplyDrafts((current) =>
-      current[summary.id]
-        ? {
-            ...current,
-            [summary.id]: patchReplyEditor(current[summary.id], patch),
-          }
-        : current,
-    )
+    }
+    const next = patchReplyEditor(editor, patch)
+    setReplyDrafts((current) => ({ ...current, [summary.id]: next }))
+    scheduleEditorSave(summary.id, next)
   }
 
   async function generateReply() {
-    if (!snapshot || !summary || !editor) return
+    const current = snapshotRef.current
+    if (!current || !summary || !editor) return
     const bodyEditRevision = replyBodyEditsRef.current.get(summary.id) ?? 0
-    const epoch = roundEpochRef.current
-    const belongsToRound = () =>
-      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
+    const epoch = viewEpochRef.current
     setReplyLoading(true)
     setError(null)
     try {
-      const nextProposal = await api.reply(snapshot, {
-        currentDraft: editor.bodyText || undefined,
-        emailId: summary.id,
-        requestId: crypto.randomUUID(),
-        revisionInstruction: editor.revisionInstruction || undefined,
-        roughNotes: editor.roughNotes,
-      })
-      if (!belongsToRound()) return
+      const nextProposal = await api.reply(
+        summary.id,
+        {
+          currentDraft: editor.bodyText || undefined,
+          requestId: crypto.randomUUID(),
+          revisionInstruction: editor.revisionInstruction || undefined,
+          roughNotes: editor.roughNotes,
+        },
+        current.csrfToken,
+      )
+      if (viewEpochRef.current !== epoch) return
       if ((replyBodyEditsRef.current.get(summary.id) ?? 0) !== bodyEditRevision) {
         setStatus('Vorschlag verworfen, weil der Antworttext zwischenzeitlich geändert wurde.')
         return
       }
-      setReplyProposals((current) => ({ ...current, [summary.id]: nextProposal }))
-      setReplyDrafts((current) =>
-        current[summary.id]
-          ? {
-              ...current,
-              [summary.id]: applyReplyProposal(current[summary.id], editor, nextProposal.bodyText),
-            }
-          : current,
-      )
+      setReplyProposals((state) => ({ ...state, [summary.id]: nextProposal }))
+      setReplyDrafts((state) => {
+        const existing = state[summary.id]
+        if (!existing) return state
+        const next = applyReplyProposal(existing, editor, nextProposal.bodyText)
+        scheduleEditorSave(summary.id, next)
+        return { ...state, [summary.id]: next }
+      })
       setStatus('Antwortentwurf erstellt. Bitte prüfen und bearbeiten.')
     } catch (cause) {
-      if (belongsToRound()) setError(errorMessage(cause))
+      if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      if (belongsToRound()) setReplyLoading(false)
+      if (viewEpochRef.current === epoch) setReplyLoading(false)
     }
   }
 
   async function saveDraft() {
-    if (!snapshot || !summary || !editor) return
-    const epoch = roundEpochRef.current
-    const belongsToRound = () =>
-      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
+    const current = snapshotRef.current
+    if (!current || !summary || !editor) return
     let to: MailAddress[]
     let cc: MailAddress[]
     try {
@@ -1209,297 +791,35 @@ function App() {
       setError('Empfänger, Betreff und Nachrichtentext werden für einen Draft benötigt.')
       return
     }
+    const epoch = viewEpochRef.current
     setSubmitting(true)
     setError(null)
     try {
-      const draftPayload = {
-        bodyText: editor.bodyText,
-        cc,
-        emailId: summary.id,
-        identityId: editor.identityId,
-        subject: editor.subject,
-        to,
-      }
       const requestId = editor.draftRequestId ?? crypto.randomUUID()
       if (!editor.draftRequestId) {
-        setReplyDrafts((current) => ({
-          ...current,
-          [summary.id]: {
-            ...current[summary.id],
-            draftRequestId: requestId,
-          } as ReplyEditorState,
-        }))
+        const next = { ...editor, draftRequestId: requestId }
+        setReplyDrafts((state) => ({ ...state, [summary.id]: next }))
+        scheduleEditorSave(summary.id, next)
       }
-      const saved = await api.draft(snapshot, {
-        ...draftPayload,
-        requestId,
-      })
-      if (!belongsToRound()) return
-      setDraftResults((current) => ({ ...current, [summary.id]: saved }))
-      setKeptUnread((current) => new Set(current).add(summary.id))
+      const saved = await api.draft(
+        summary.id,
+        {
+          bodyText: editor.bodyText,
+          cc,
+          identityId: editor.identityId,
+          requestId,
+          subject: editor.subject,
+          to,
+        },
+        current.csrfToken,
+      )
+      if (viewEpochRef.current !== epoch) return
+      setDraftResults((state) => ({ ...state, [summary.id]: saved }))
       setStatus('Draft in Fastmail gespeichert; die Nachricht bleibt ungelesen.')
     } catch (cause) {
-      if (belongsToRound()) setError(errorMessage(cause))
+      if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
-      if (belongsToRound()) setSubmitting(false)
-    }
-  }
-
-  const finalizeReview = useCallback(async () => {
-    if (!snapshot || pendingDetails.size > 0) return
-    const epoch = roundEpochRef.current
-    const belongsToRound = () =>
-      activeRoundIdRef.current === snapshot.snapshotId && roundEpochRef.current === epoch
-    setSubmitting(true)
-    setError(null)
-    try {
-      if (!(await flushState()) || !restoredRef.current || !belongsToRound()) return
-      const nextResult = await api.finalize(
-        snapshot,
-        stateRevisionRef.current,
-        finalizedEmailIds,
-        finalizedKeptUnreadIds,
-        finalizedSecondaryActionIds,
-      )
-      if (!belongsToRound()) return
-      setSubmitting(false)
-      setResult(nextResult)
-      setSnapshot((current) =>
-        current
-          ? {
-              ...current,
-              finalization: {
-                result: nextResult,
-                selectionLocked: true,
-                status: nextResult.finalized ? 'finalized' : 'active',
-              },
-            }
-          : current,
-      )
-      if (nextResult.finalized) {
-        clearCheckpoint()
-        restoredRef.current = false
-        activeRoundIdRef.current = null
-        setView('done')
-        setStatus('Review abgeschlossen.')
-      } else {
-        setView('confirm')
-        setError(
-          `${nextResult.remaining} Änderungen sind fehlgeschlagen. Du kannst sie erneut versuchen.`,
-        )
-        setStatus('Review teilweise gespeichert.')
-      }
-    } catch (cause) {
-      if (!belongsToRound()) return
-      try {
-        const latest = await api.review(snapshot.snapshotId)
-        if (!belongsToRound()) return
-        setError(errorMessage(cause))
-        if (latest.finalization.selectionLocked) applySnapshot(latest)
-      } catch {
-        // Keep the original finalization error. Reload remains available if recovery also fails.
-        if (belongsToRound()) setError(errorMessage(cause))
-      }
-    } finally {
-      if (belongsToRound()) setSubmitting(false)
-    }
-  }, [
-    snapshot,
-    pendingDetails.size,
-    flushState,
-    finalizedEmailIds,
-    finalizedKeptUnreadIds,
-    finalizedSecondaryActionIds,
-    applySnapshot,
-  ])
-
-  useEffect(() => {
-    if (
-      !snapshot ||
-      view !== 'confirm' ||
-      pendingDetails.size > 0 ||
-      submitting ||
-      stateConflict ||
-      statePersistenceFailed ||
-      snapshot.finalization.selectionLocked ||
-      emails.length === 0 ||
-      finalizedEmailIds.length !== emails.length ||
-      autoFinalizeRoundRef.current === snapshot.snapshotId
-    )
-      return
-    autoFinalizeRoundRef.current = snapshot.snapshotId
-    void finalizeReview()
-  }, [
-    emails.length,
-    finalizedEmailIds.length,
-    finalizeReview,
-    pendingDetails.size,
-    snapshot,
-    stateConflict,
-    statePersistenceFailed,
-    submitting,
-    view,
-  ])
-
-  async function startNewReview() {
-    if (creatingRunRef.current) return
-    creatingRunRef.current = true
-    setCreatingRun(true)
-    const id = crypto.randomUUID()
-    const now = new Date().toISOString()
-    const optimistic: ReviewRunSummary = {
-      analysis: {
-        callCount: 0,
-        engine: options?.mode === 'demo' ? 'heuristic' : 'codex',
-        model: codexSettings?.model ?? options?.codex.model,
-        phase: 'queued',
-        processedEmailCount: 0,
-        progress: 0,
-        status: 'pending',
-        thinkingLevel: codexSettings?.thinkingLevel ?? options?.codex.thinkingLevel,
-        totalEmailCount: 0,
-      },
-      createdAt: now,
-      csrfToken: '',
-      emailCount: 0,
-      filters,
-      generation: 0,
-      id,
-      mode: options?.mode ?? 'live',
-      reanalyzable: false,
-      reviewStatus: 'active',
-      status: 'queued',
-      updatedAt: now,
-    }
-    setRuns((current) => replaceRun(current, optimistic))
-    setRunActionIds((current) => new Set(current).add(id))
-    setError(null)
-    window.requestAnimationFrame(() => {
-      document.getElementById(`run-${id}`)?.scrollIntoView({ block: 'center' })
-    })
-    try {
-      const created = await api.createReview(id, filters)
-      setRuns((current) => replaceRun(current, created))
-    } catch (cause) {
-      const message = errorMessage(cause)
-      const recovered = await api
-        .reviewRuns()
-        .then((response) => {
-          setRuns(response.runs)
-          return response.runs.some((run) => run.id === id)
-        })
-        .catch(() => null)
-      if (recovered === false) {
-        setRuns((current) => current.filter((run) => run.id !== id))
-        setError(message)
-      } else if (recovered === null) {
-        setRuns((current) =>
-          current.map((run) =>
-            run.id === id
-              ? {
-                  ...run,
-                  analysis: {
-                    ...run.analysis,
-                    error: 'Verbindung unterbrochen. Der Rundenstatus wird erneut abgeglichen.',
-                  },
-                }
-              : run,
-          ),
-        )
-        setError(`${message} Der Rundenstatus wird automatisch erneut abgeglichen.`)
-      }
-    } finally {
-      creatingRunRef.current = false
-      setCreatingRun(false)
-      setRunActionIds((current) => {
-        const next = new Set(current)
-        next.delete(id)
-        return next
-      })
-    }
-  }
-
-  async function showSetup() {
-    if (snapshot && restoredRef.current && !(await flushState())) return
-    if (snapshot) saveCheckpoint({ version: 7, roundId: snapshot.snapshotId })
-    restoredRef.current = false
-    roundEpochRef.current += 1
-    setSubmitting(false)
-    activeRoundIdRef.current = null
-    activeSnapshotRef.current = null
-    setSnapshot(null)
-    setBundleRun(null)
-    setDetails({})
-    setThreadContexts({})
-    setReplyProposals({})
-    setDraftResults({})
-    setReplyDrafts({})
-    setResult(null)
-    setView('review')
-    setOverviewOpen(false)
-    setReplyOpen(false)
-    setError(null)
-    setRoundUrl(null)
-    try {
-      const [nextOptions] = await Promise.all([api.options(), refreshRuns()])
-      setOptions(nextOptions)
-      setCodexSettings(nextOptions.codex)
-    } catch (cause) {
-      setError(errorMessage(cause))
-    }
-  }
-
-  async function deleteReview(run: ReviewRunSummary) {
-    if (!run.csrfToken) return
-    setDeleteRun(null)
-    setRunActionIds((current) => new Set(current).add(run.id))
-    setDeletingRunIds((current) => new Set(current).add(run.id))
-    setError(null)
-    try {
-      await api.deleteReview(run)
-      setRuns((current) => current.filter((item) => item.id !== run.id))
-      if (legacyMigrationRef.current?.migrationRoundId === run.id) {
-        setMigrationRoundId(null)
-      }
-      try {
-        const checkpoint = loadCheckpoint()
-        if (checkpoint?.version === 7 && checkpoint.roundId === run.id) clearCheckpoint()
-      } catch {
-        // An invalid legacy checkpoint is intentionally retained for visible startup recovery.
-      }
-    } catch (cause) {
-      setError(errorMessage(cause))
-      await refreshRuns().catch(() => undefined)
-    } finally {
-      setRunActionIds((current) => {
-        const next = new Set(current)
-        next.delete(run.id)
-        return next
-      })
-      setDeletingRunIds((current) => {
-        const next = new Set(current)
-        next.delete(run.id)
-        return next
-      })
-    }
-  }
-
-  async function reanalyzeReview(run: ReviewRunSummary) {
-    setRunActionIds((current) => new Set(current).add(run.id))
-    setError(null)
-    try {
-      const nextRun = await api.reanalyzeReview(run)
-      setRuns((current) => replaceRun(current, nextRun))
-      if (legacyMigrationRef.current?.migrationRoundId === run.id) setMigrationRoundId(run.id)
-    } catch (cause) {
-      setError(errorMessage(cause))
-      await refreshRuns().catch(() => undefined)
-    } finally {
-      setRunActionIds((current) => {
-        const next = new Set(current)
-        next.delete(run.id)
-        return next
-      })
+      if (viewEpochRef.current === epoch) setSubmitting(false)
     }
   }
 
@@ -1516,57 +836,64 @@ function App() {
     }
   }
 
+  async function saveMemory(notes: string) {
+    const current = snapshotRef.current
+    if (!current) return
+    setMemoryBusy(true)
+    setSettingsError(null)
+    try {
+      const memory = await api.saveMemory(notes, current.csrfToken)
+      setSnapshot((state) => (state ? { ...state, memory } : state))
+    } catch (cause) {
+      setSettingsError(errorMessage(cause))
+    } finally {
+      setMemoryBusy(false)
+    }
+  }
+
+  async function decideProposal(id: string, accept: boolean) {
+    const current = snapshotRef.current
+    if (!current) return
+    setMemoryBusy(true)
+    setSettingsError(null)
+    try {
+      const memory = await api.decideProposal(id, accept, current.csrfToken)
+      setSnapshot((state) => (state ? { ...state, memory } : state))
+    } catch (cause) {
+      setSettingsError(errorMessage(cause))
+    } finally {
+      setMemoryBusy(false)
+    }
+  }
+
   const settingsDialog =
-    settingsOpen && codexSettings ? (
+    settingsOpen && snapshot ? (
       <SettingsDialog
         authBusy={codexLoginBusy}
-        codex={codexSettings}
-        demo={options?.mode === 'demo'}
+        codex={snapshot.codex}
+        demo={snapshot.mode === 'demo'}
         error={settingsError}
         login={codexLogin}
+        memory={snapshot.memory}
+        memoryBusy={memoryBusy}
         onClose={() => setSettingsOpen(false)}
+        onDecideProposal={(id, accept) => void decideProposal(id, accept)}
+        onSaveMemory={(notes) => void saveMemory(notes)}
         onStartLogin={() => void startCodexLogin()}
       />
     ) : null
-
-  const setupPage = (
-    <>
-      <ReviewSetup
-        actionIds={runActionIds}
-        deletingIds={deletingRunIds}
-        deleteRun={deleteRun}
-        error={error ?? runStatusError}
-        filters={filters}
-        options={options}
-        runs={runs}
-        creatingRun={creatingRun}
-        onCancelDelete={() => setDeleteRun(null)}
-        onChange={setFilters}
-        onConfirmDelete={(run) => void deleteReview(run)}
-        onDelete={setDeleteRun}
-        onOpen={(run) => void openReview(run.id)}
-        onReanalyze={(run) => void reanalyzeReview(run)}
-        onSettings={() => {
-          setSettingsError(null)
-          setSettingsOpen(true)
-        }}
-        onStart={() => void startNewReview()}
-      />
-      {settingsDialog}
-    </>
-  )
 
   if (loading) {
     return (
       <main className="state-page" aria-busy="true">
         <div className="spinner" aria-hidden="true" />
         <h1>Inbox Walk</h1>
-        <p>{status || 'Ungelesene Nachrichten werden geladen …'}</p>
+        <p>{status || 'Deine Todo-Liste wird geladen …'}</p>
       </main>
     )
   }
 
-  if (error && !options && !snapshot && runs.length === 0) {
+  if (!snapshot) {
     return (
       <main className="state-page">
         <h1>Postfach nicht erreichbar</h1>
@@ -1578,223 +905,71 @@ function App() {
     )
   }
 
-  if (!snapshot) {
-    return setupPage
-  }
-
-  if (emails.length === 0) {
+  if (!bucket || !summary) {
     return (
-      <main className="state-page">
-        <h1>Keine ungelesenen Nachrichten</h1>
-        <p>Für diese Auswahl ist dein Postfach bereits aufgeräumt.</p>
-        <button type="button" className="button secondary" onClick={() => void showSetup()}>
-          Auswahl ändern
-        </button>
-      </main>
+      <>
+        <TodoPage
+          buckets={buckets}
+          error={error}
+          onDismissError={() => setError(null)}
+          onHelp={() => setHelpOpen(true)}
+          onOpen={(id) => openBucket(id)}
+          onRefresh={() => void refreshNow()}
+          onRetry={(ids) => void runAction('retry', ids, 'Die Sortierung wird erneut versucht.')}
+          onSettings={() => {
+            setSettingsError(null)
+            setSettingsOpen(true)
+          }}
+          onToggleParked={() => setShowParked((current) => !current)}
+          onUnpark={(ids) => void runAction('unpark', ids, 'Nachricht ist zurück in der Liste.')}
+          openCount={openCount}
+          parked={parked}
+          refreshing={refreshing}
+          showParked={showParked}
+          snapshot={snapshot}
+          status={status}
+        />
+        {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
+        {settingsDialog}
+      </>
     )
   }
 
-  if (stateConflict) {
-    return (
-      <main className="state-page">
-        <h1>Runde wurde in einem anderen Tab geändert</h1>
-        <p>
-          Deine Ansicht ist veraltet. Lade die Runde neu, damit keine Entscheidung überschrieben
-          wird.
-        </p>
-        <button type="button" className="button primary" onClick={() => window.location.reload()}>
-          Runde neu laden
-        </button>
-      </main>
-    )
-  }
-
-  if (statePersistenceFailed) {
-    return (
-      <main className="state-page">
-        <h1>Rundenstand konnte nicht gespeichert werden</h1>
-        <p>
-          Die letzte Entscheidung wurde nicht bestätigt. Lade die Runde neu, bevor du
-          weiterarbeitest.
-        </p>
-        <button type="button" className="button primary" onClick={() => window.location.reload()}>
-          Runde neu laden
-        </button>
-      </main>
-    )
-  }
-
-  if (!bundleRun) {
-    return setupPage
-  }
-
-  if (view === 'done' && result) {
-    return (
-      <main className="state-page completion">
-        <span className="completion-mark" aria-hidden="true">
-          ✓
-        </span>
-        <h1>Review abgeschlossen</h1>
-        <p>
-          {result.markedRead} Nachrichten wurden als gelesen markiert. {result.keptUnread}{' '}
-          bearbeitete bleiben ungelesen. {result.untouched} noch nicht bearbeitete Nachrichten
-          warten auf die nächste Runde.
-          {result.taggedForUnsubscribe > 0 &&
-            ` ${result.taggedForUnsubscribe} Newsletter wurden mit „Newsletter abmelden“ markiert.`}
-          {result.rescuedFromSpam > 0 &&
-            ` ${result.rescuedFromSpam} Nachrichten wurden aus Spam in die Inbox verschoben.`}
-        </p>
-        {result.actionFailed.length > 0 && (
-          <div className="inline-error" role="alert">
-            <strong>{result.actionFailed.length} Zusatzaktionen sind fehlgeschlagen.</strong>
-            <ul>
-              {result.actionFailed.map((failure) => (
-                <li key={failure.id}>{failure.reason}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-        <button type="button" className="button primary" onClick={() => void showSetup()}>
-          Zur Rundenübersicht
-        </button>
-      </main>
-    )
-  }
-
-  if (view === 'confirm') {
-    return (
-      <main className="state-page confirm-page">
-        <h1>Review abschließen?</h1>
-        <p>
-          Nur die bereits mit Weiter bestätigten Nachrichten werden jetzt verarbeitet. Alle anderen
-          bleiben ungelesen.
-        </p>
-        <dl className="review-summary">
-          <div>
-            <dt>Bereits bearbeitet</dt>
-            <dd>{finalizedEmailIds.length}</dd>
-          </div>
-          <div>
-            <dt>Als gelesen markieren</dt>
-            <dd>{readIds.length}</dd>
-          </div>
-          <div>
-            <dt>Ungelesen behalten</dt>
-            <dd>{finalizedKeptUnreadIds.length}</dd>
-          </div>
-          <div>
-            <dt>{isSpamReview ? 'Aus Spam in die Inbox' : 'Für spätere Abmeldung markieren'}</dt>
-            <dd>{finalizedSecondaryActionIds.length}</dd>
-          </div>
-          <div>
-            <dt>Noch nicht bearbeitet</dt>
-            <dd>{emails.length - finalizedEmailIds.length} bleiben ungelesen</dd>
-          </div>
-          <div>
-            <dt>Neue Nachrichten seit dem Start</dt>
-            <dd>bleiben ebenfalls unberührt</dd>
-          </div>
-        </dl>
-        {result && result.failed.length > 0 && (
-          <div className="inline-error" role="alert">
-            <strong>{result.failed.length} Änderungen fehlgeschlagen.</strong>
-            <ul>
-              {result.failed.map((failure) => (
-                <li key={failure.id}>{failure.reason}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {result && result.actionFailed.length > 0 && (
-          <div className="inline-error" role="alert">
-            <strong>{result.actionFailed.length} Zusatzaktionen fehlgeschlagen.</strong>
-            <ul>
-              {result.actionFailed.map((failure) => (
-                <li key={failure.id}>{failure.reason}</li>
-              ))}
-            </ul>
-          </div>
-        )}
-        {snapshot.mode === 'demo' && (
-          <p className="mode-note">Demo-Modus: Fastmail wird nicht verändert.</p>
-        )}
-        {error && (
-          <p className="error-message" role="alert">
-            {error}
-          </p>
-        )}
-        <div className="button-row">
-          <button
-            type="button"
-            className="button secondary"
-            onClick={() => setView('review')}
-            disabled={submitting || Boolean(result) || snapshot.finalization.selectionLocked}
-          >
-            Zurück
-          </button>
-          <button
-            type="button"
-            className="button primary"
-            onClick={() => void finalizeReview()}
-            disabled={submitting || pendingDetails.size > 0}
-          >
-            {submitting
-              ? 'Wird gespeichert …'
-              : result?.remaining
-                ? 'Fehlgeschlagene erneut versuchen'
-                : 'Änderungen speichern'}
-          </button>
-        </div>
-      </main>
-    )
-  }
-
-  if (!summary || !currentBundle) {
-    return (
-      <main className="state-page">
-        <h1>Storys nicht verfügbar</h1>
-        <p>Die Runde ist gespeichert, aber das Analyseergebnis ist unvollständig.</p>
-        <button type="button" className="button secondary" onClick={() => window.location.reload()}>
-          Dieselbe Runde neu laden
-        </button>
-      </main>
-    )
-  }
-
-  const progress = ((index + 1) / bundles.length) * 100
+  const isStory = bucket.messages.length > 1
+  const position = buckets.findIndex((item) => item.bucketId === bucket.bucketId)
 
   return (
     <div className={`app-shell ${replyOpen ? 'with-reply' : ''}`}>
-      {snapshot.analysis.error && (
-        <p className="snapshot-warning" role="status">
-          {snapshot.analysis.error}
-        </p>
-      )}
       <header className="topbar">
         <button
           type="button"
           className="brand-button"
-          onClick={() => setOverviewOpen(true)}
-          aria-label={`Nachrichtenübersicht öffnen · Inbox Walk v${__APP_VERSION__}`}
+          onClick={backToList}
+          aria-label={`Zurück zur Todo-Liste · Inbox Walk v${__APP_VERSION__}`}
         >
           <span className="brand-name">
             <span>Inbox Walk</span>
             <span className="app-version">v{__APP_VERSION__}</span>
           </span>
-          <span className="counter">
-            Story {index + 1} / {bundles.length} · {emails.length} Nachrichten
+          <span className="story-position">
+            <span className="counter">
+              {isParkedView
+                ? 'Geparkt'
+                : `Bucket ${position + 1} / ${buckets.length} · ${openCount} offen`}
+            </span>
+            <span className="counter-compact">
+              {isParkedView ? 'P' : `${position + 1}/${buckets.length}`}
+            </span>
+            <ChevronIcon />
           </span>
         </button>
         <div className="top-actions">
           {snapshot.mode === 'demo' && <span className="mode-label">Demo</span>}
-          <span
-            className={`analysis-badge ${snapshot.analysis.engine}`}
-            title={analysisOrigin(snapshot.analysis)}
-          >
-            {analysisOrigin(snapshot.analysis)}
-            {snapshot.analysis.callCount > 0 &&
-              ` · ${snapshot.analysis.callCount} ${snapshot.analysis.callCount === 1 ? 'Aufruf' : 'Aufrufe'}`}
-          </span>
+          {bucket.unsorted ? (
+            <span className="analysis-badge heuristic">Noch nicht einsortiert</span>
+          ) : (
+            <span className="analysis-badge codex">{kindLabel(bucket.kind)}</span>
+          )}
           <button
             type="button"
             className="text-button"
@@ -1805,8 +980,8 @@ function App() {
           >
             Einstellungen
           </button>
-          <button type="button" className="text-button" onClick={() => void showSetup()}>
-            Runden
+          <button type="button" className="text-button" onClick={backToList}>
+            Liste
           </button>
           <button
             type="button"
@@ -1817,197 +992,46 @@ function App() {
             ?
           </button>
         </div>
-        <div className="progress" aria-hidden="true">
-          <span style={{ width: `${progress}%` }} />
-        </div>
       </header>
 
       <main className="reader">
         <article className="message-card" aria-labelledby="bundle-title">
-          <header className="message-header">
-            <h1 id="bundle-title">{currentBundle.title}</h1>
-            <div className="message-heading">
-              <p className="sender" title={fullAddress(summary.from)}>
-                {addressLine(summary.from)}
-              </p>
-              <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
-              <details className="message-details" key={summary.id}>
-                <summary>Details</summary>
-                <div className="message-details-content">
-                  <p className="bundle-summary">{currentBundle.summary}</p>
-                  <p>{currentBundle.currentState}</p>
-                  <p className="original-subject">{summary.subject || '(Kein Betreff)'}</p>
-                  <p title={fullAddress(summary.to)}>An {addressLine(summary.to)}</p>
-                  <p>
-                    {summary.mailboxNames.join(' · ')}
-                    {summary.isNewsletter && ' · Newsletter'}
-                  </p>
-                </div>
-              </details>
-            </div>
-            {currentBundle.emailIds.length > 1 && (
-              <ol className="bundle-timeline" aria-label="Verlauf der Story">
-                {currentBundle.timeline.map((item) => {
-                  return (
-                    <li key={item.emailId}>
-                      <button
-                        type="button"
-                        className={summary.id === item.emailId ? 'selected' : ''}
-                        aria-pressed={summary.id === item.emailId}
-                        title={`${formatDate(item.occurredAt)} · ${item.source} · ${item.event}`}
-                        onClick={() => {
-                          setSelectedMemberId(item.emailId)
-                          setReplyOpen(false)
-                        }}
-                      >
-                        <strong>
-                          {item.source} · {item.event}
-                        </strong>
-                        {keptUnread.has(item.emailId) && <span>Bleibt ungelesen</span>}
-                      </button>
-                    </li>
-                  )
-                })}
-              </ol>
-            )}
-            {email?.bodyTruncated && (
-              <p className="warning-note">
-                Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
-              </p>
-            )}
-          </header>
-
-          <div className="message-content" aria-busy={detailLoading}>
-            {detailLoading && !email ? (
-              <div className="body-loading">
-                <div className="spinner" />
-                <span>Nachricht wird geladen …</span>
-              </div>
-            ) : email ? (
-              <iframe
-                className="message-body"
-                title={`Inhalt von ${summary.subject}`}
-                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                srcDoc={emailDocument(email, snapshot.snapshotId, true, snapshot.imageToken)}
-              />
-            ) : (
-              <div className="body-loading error-copy">
-                Der Nachrichteninhalt ist nicht verfügbar.
-              </div>
-            )}
-          </div>
-
-          {email && email.attachments.length > 0 && (
-            <section className="attachments" aria-label="Anhänge">
-              <h2>Anhänge</h2>
-              <div className="attachment-list">
-                {email.attachments.map((attachment) =>
-                  snapshot.mode === 'live' ? (
-                    <a
-                      key={attachment.blobId}
-                      href={blobUrl(snapshot.snapshotId, attachment.blobId)}
-                    >
-                      <span>{attachment.name}</span>
-                      <small>{formatBytes(attachment.size)}</small>
-                    </a>
-                  ) : (
-                    <button type="button" key={attachment.blobId} disabled>
-                      <span>{attachment.name}</span>
-                      <small>{formatBytes(attachment.size)} · Demo</small>
-                    </button>
-                  ),
-                )}
-              </div>
-            </section>
-          )}
+          <BucketHeader
+            bucket={bucket}
+            summary={summary}
+            email={email}
+            isStory={isStory}
+            mailColorMode={mailColorMode}
+            chooseMailColorMode={chooseMailColorMode}
+          />
+          <BucketMessages
+            bucket={bucket}
+            summary={summary}
+            email={email}
+            isStory={isStory}
+            details={details}
+            pendingDetails={pendingDetails}
+            mailColorMode={mailColorMode}
+            snapshot={snapshot}
+            onSelectMember={(emailId) => {
+              setSelectedMemberId(emailId)
+              setReplyOpen(false)
+            }}
+          />
         </article>
       </main>
 
-      <footer className="controls">
-        <button type="button" className="control-button" onClick={previous} disabled={index === 0}>
-          <kbd>←</kbd>
-          <span>Zurück</span>
-        </button>
-        <div className="decision-actions">
-          <button
-            type="button"
-            className="control-button reply-trigger"
-            aria-label="Antwort entwerfen"
-            onClick={() => void openReply()}
-          >
-            <kbd>R</kbd>
-            <span>Antwort entwerfen</span>
-          </button>
-          <button
-            type="button"
-            className={`control-button unsubscribe-button ${isSecondaryActionMarked ? 'active' : ''}`}
-            aria-label={
-              isSpamReview
-                ? isSecondaryActionMarked
-                  ? 'Als kein Spam vorgemerkt'
-                  : 'Kein Spam'
-                : summary.isNewsletter
-                  ? isSecondaryActionMarked
-                    ? 'Abmelde-Label vorgemerkt'
-                    : 'Für spätere Abmeldung markieren'
-                  : 'Kein Newsletter erkannt'
-            }
-            aria-pressed={isSecondaryActionMarked}
-            disabled={!isSpamReview && !summary.isNewsletter}
-            onClick={toggleSecondaryAction}
-            title={
-              isSpamReview
-                ? 'Beim Abschluss aus Spam entfernen und in die Inbox verschieben'
-                : summary.isNewsletter
-                  ? 'Beim Abschluss mit dem Fastmail-Label „Newsletter abmelden“ kennzeichnen'
-                  : 'Diese Nachricht wurde nicht als Newsletter erkannt'
-            }
-          >
-            <kbd>↓</kbd>
-            <span>
-              {isSpamReview
-                ? isSecondaryActionMarked
-                  ? 'Kein Spam vorgemerkt'
-                  : 'Kein Spam'
-                : isSecondaryActionMarked
-                  ? 'Abmeldung markiert'
-                  : 'Später abmelden'}
-            </span>
-          </button>
-          <button
-            type="button"
-            className={`control-button keep-button ${isKept ? 'active' : ''}`}
-            aria-label={isKept ? 'Bleibt ungelesen' : 'Ungelesen behalten'}
-            aria-pressed={isKept}
-            onClick={toggleCurrent}
-          >
-            <kbd>↑</kbd>
-            <span>{isKept ? 'Bleibt ungelesen' : 'Ungelesen behalten'}</span>
-          </button>
-        </div>
-        <div className="completion-actions">
-          <button
-            type="button"
-            className="control-button partial-finish"
-            onClick={finishProcessed}
-            disabled={processedIds.size === 0}
-            aria-label={`${processedIds.size} bereits bearbeitete Nachrichten abschließen`}
-            title="Nur bereits mit Weiter bestätigte Nachrichten abschließen"
-          >
-            <span className="partial-finish-wide">Bisher abschließen · {processedIds.size}</span>
-            <span className="partial-finish-compact">{processedIds.size} fertig</span>
-          </button>
-          <button
-            type="button"
-            className="control-button next"
-            onClick={next}
-            disabled={Boolean(summary && !details[summary.id] && !failedDetails.has(summary.id))}
-          >
-            <span>{index === bundles.length - 1 ? 'Abschließen' : 'Story erledigt'}</span>
-            <kbd>→</kbd>
-          </button>
-        </div>
-      </footer>
+      <BucketControls
+        bucket={bucket}
+        summary={summary}
+        busy={busy}
+        isParkedView={isParkedView}
+        onBack={backToList}
+        onReply={() => void openReply()}
+        onNewsletter={() => void tagNewsletter()}
+        onPark={() => void parkSelected()}
+        onComplete={() => void completeBucket()}
+      />
 
       <p className="sr-only" aria-live="polite">
         {status}
@@ -2020,26 +1044,7 @@ function App() {
           </button>
         </div>
       )}
-
-      {overviewOpen && (
-        <OverviewDrawer
-          bundles={bundles}
-          currentIndex={index}
-          keptUnread={keptUnread}
-          processedIds={processedIds}
-          secondaryActionIds={secondaryActionIds}
-          isSpamReview={isSpamReview}
-          onClose={() => setOverviewOpen(false)}
-          onSelect={(nextIndex) => {
-            setIndex(nextIndex)
-            setSelectedMemberId(bundles[nextIndex]?.emailIds[0] ?? null)
-            setReplyOpen(false)
-            setOverviewOpen(false)
-          }}
-          onDiscard={() => void showSetup()}
-        />
-      )}
-      {helpOpen && <HelpDialog isSpamReview={isSpamReview} onClose={() => setHelpOpen(false)} />}
+      {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
       {settingsDialog}
       {replyOpen && (
         <ReplyPanel
@@ -2049,7 +1054,7 @@ function App() {
           loading={replyLoading}
           proposal={proposal}
           submitting={submitting}
-          onClose={closeReply}
+          onClose={() => setReplyOpen(false)}
           onGenerate={() => void generateReply()}
           onSave={() => void saveDraft()}
           onUpdate={updateEditor}
@@ -2059,58 +1064,617 @@ function App() {
   )
 }
 
-function runStatus(run: ReviewRunSummary) {
-  if (run.status === 'queued') return 'Wartet'
-  if (run.status === 'fetching') return 'Postfach wird geladen'
-  if (run.status === 'analyzing') return 'Wird analysiert'
-  if (run.status === 'ready') {
-    if (run.reviewStatus === 'finalizing') return 'Wird abgeschlossen'
-    return run.reviewStatus === 'finalized' ? 'Abgeschlossen' : 'Bereit'
-  }
-  return 'Fehlgeschlagen'
+function TodoPage({
+  buckets,
+  error,
+  onDismissError,
+  onHelp,
+  onOpen,
+  onRefresh,
+  onRetry,
+  onSettings,
+  onToggleParked,
+  onUnpark,
+  openCount,
+  parked,
+  refreshing,
+  showParked,
+  snapshot,
+  status,
+}: Readonly<{
+  buckets: TriageBucket[]
+  error: string | null
+  onDismissError: () => void
+  onHelp: () => void
+  onOpen: (bucketId: string) => void
+  onRefresh: () => void
+  onRetry: (emailIds: string[]) => void
+  onSettings: () => void
+  onToggleParked: () => void
+  onUnpark: (emailIds: string[]) => void
+  openCount: number
+  parked: TriageMessage[]
+  refreshing: boolean
+  showParked: boolean
+  snapshot: TriageSnapshot
+  status: string
+}>) {
+  const failed = buckets.filter(
+    (bucket) => bucket.unsorted && bucket.messages.some((message) => message.attempts >= 3),
+  )
+  const failedIds = failed.flatMap((bucket) => bucket.messages.map((message) => message.summary.id))
+  return (
+    <main className="todo-page">
+      <header className="todo-header">
+        <div className="setup-brand">
+          <h1>Inbox Walk</h1>
+          <span className="app-version">v{__APP_VERSION__}</span>
+          {snapshot.mode === 'demo' && <span className="mode-label">Demo</span>}
+        </div>
+        <div className="top-actions">
+          <button
+            type="button"
+            className="text-button"
+            onClick={onRefresh}
+            disabled={refreshing}
+            aria-label="Postfach jetzt prüfen"
+          >
+            <RefreshIcon />
+            <span>{refreshing ? 'Prüft …' : 'Jetzt prüfen'}</span>
+          </button>
+          <button type="button" className="text-button" onClick={onSettings}>
+            Einstellungen
+          </button>
+          <button type="button" className="icon-button" onClick={onHelp} aria-label="Tastaturhilfe">
+            ?
+          </button>
+        </div>
+      </header>
+      <output className="todo-status">
+        {statusLine(snapshot.status, snapshot.mode)}
+        {snapshot.status.waitingForCodex && (
+          <>
+            {' '}
+            <button type="button" className="text-button inline" onClick={onSettings}>
+              Codex verbinden
+            </button>
+          </>
+        )}
+      </output>
+      {error && (
+        <div className="inline-error" role="alert">
+          <span>{error}</span>
+          <button type="button" className="text-button" onClick={onDismissError}>
+            Ausblenden
+          </button>
+        </div>
+      )}
+      {failedIds.length > 0 && (
+        <div className="inline-error" role="alert">
+          <span>
+            {failedIds.length} {failedIds.length === 1 ? 'Nachricht konnte' : 'Nachrichten konnten'}{' '}
+            nach drei Versuchen nicht einsortiert werden. Sie bleiben oben in der Liste.
+          </span>
+          <button type="button" className="text-button" onClick={() => onRetry(failedIds)}>
+            Erneut sortieren
+          </button>
+        </div>
+      )}
+      <section className="todo-section" aria-labelledby="todo-title">
+        <div className="runs-heading">
+          <h2 id="todo-title">Offen</h2>
+          <p>{openSummary(openCount, buckets.length)}</p>
+        </div>
+        {buckets.length === 0 ? (
+          <div className="todo-empty">
+            <span className="completion-mark" aria-hidden="true">
+              ✓
+            </span>
+            <h3>Alles erledigt</h3>
+            <p>Neue Nachrichten erscheinen hier, sobald sie eintreffen und sortiert sind.</p>
+          </div>
+        ) : (
+          <ol className="todo-list">
+            {buckets.map((bucket) => {
+              const latest = bucket.messages.at(-1)?.summary
+              const sources = Array.from(
+                new Set(bucket.messages.map((message) => messageSource(message.summary))),
+              )
+              const stuck = bucket.unsorted && bucket.messages.some((item) => item.attempts >= 3)
+              return (
+                <li key={bucket.bucketId} className={bucket.unsorted ? 'unsorted' : ''}>
+                  <button
+                    type="button"
+                    className="todo-row"
+                    onClick={() => onOpen(bucket.bucketId)}
+                    aria-label={`${bucket.title} öffnen`}
+                  >
+                    <span className="todo-row-main">
+                      <strong>{bucket.title}</strong>
+                      <small>{bucketRowState(bucket, stuck)}</small>
+                    </span>
+                    <span className="todo-row-meta">
+                      <span className="tag">
+                        {bucket.unsorted ? 'Neu' : kindLabel(bucket.kind)}
+                      </span>
+                      <span className="tag">
+                        {bucket.messages.length}{' '}
+                        {bucket.messages.length === 1 ? 'Nachricht' : 'Nachrichten'}
+                      </span>
+                      <small className="todo-sources">{sources.slice(0, 3).join(', ')}</small>
+                      {latest && (
+                        <time dateTime={bucket.activityAt}>{relativeTime(bucket.activityAt)}</time>
+                      )}
+                    </span>
+                  </button>
+                </li>
+              )
+            })}
+          </ol>
+        )}
+      </section>
+      {parked.length > 0 && (
+        <section className="todo-section parked-section" aria-labelledby="parked-title">
+          <div className="runs-heading">
+            <h2 id="parked-title">Geparkt</h2>
+            <button type="button" className="text-button" onClick={onToggleParked}>
+              {showParked ? 'Ausblenden' : `${parked.length} anzeigen`}
+            </button>
+          </div>
+          {showParked && (
+            <ol className="todo-list">
+              {parked.map((message) => (
+                <li key={message.summary.id}>
+                  <button
+                    type="button"
+                    className="todo-row"
+                    onClick={() => onOpen(`${PARKED_PREFIX}${message.summary.id}`)}
+                    aria-label={`${message.summary.subject || '(Kein Betreff)'} öffnen`}
+                  >
+                    <span className="todo-row-main">
+                      <strong>{message.summary.subject || '(Kein Betreff)'}</strong>
+                      <small>{messageSource(message.summary)}</small>
+                    </span>
+                    <span className="todo-row-meta">
+                      <time dateTime={message.summary.receivedAt}>
+                        {relativeTime(message.summary.receivedAt)}
+                      </time>
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    className="text-button"
+                    onClick={() => onUnpark([message.summary.id])}
+                  >
+                    Zurückholen
+                  </button>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      )}
+      <p className="sr-only" aria-live="polite">
+        {status}
+      </p>
+    </main>
+  )
 }
 
-function runProgressText(run: ReviewRunSummary) {
-  if (run.status === 'ready') {
-    return `${run.emailCount} ${run.emailCount === 1 ? 'Nachricht' : 'Nachrichten'} analysiert`
-  }
-  if (run.status === 'failed') return 'Analyse nicht abgeschlossen'
-  if (run.status === 'queued') return 'Runde wird angelegt'
-  if (run.status === 'fetching') {
-    return run.analysis.totalEmailCount > 0
-      ? `${run.analysis.processedEmailCount} von ${run.analysis.totalEmailCount} Nachrichten geladen`
-      : 'Nachrichten werden von Fastmail geladen'
-  }
-  const phase = analysisStatus(run.analysis).replace(/ …$/, '')
-  const progress =
-    run.analysis.phase === 'deciding' && run.analysis.totalEmailCount > 0
-      ? `${phase} · ${run.analysis.totalEmailCount} Nachrichten`
-      : run.analysis.totalEmailCount > 0
-        ? `${phase} · ${run.analysis.processedEmailCount} von ${run.analysis.totalEmailCount}`
-        : phase
-  if (run.analysis.callCount === 0) return progress
-  return `${progress} · ${run.analysis.callCount} ${run.analysis.callCount === 1 ? 'Codex-Aufruf' : 'Codex-Aufrufe'}`
+function BucketHeader({
+  bucket,
+  summary,
+  email,
+  isStory,
+  mailColorMode,
+  chooseMailColorMode,
+}: Readonly<{
+  bucket: TriageBucket
+  summary: ReviewEmailSummary
+  email: ReviewEmail | undefined
+  isStory: boolean
+  mailColorMode: MailColorMode
+  chooseMailColorMode: (mode: MailColorMode) => void
+}>) {
+  return (
+    <header className="message-header">
+      <h1 id="bundle-title">{bucket.title}</h1>
+      {isStory ? (
+        <p className="message-subject">{bucket.summary}</p>
+      ) : (
+        summary.subject &&
+        summary.subject !== bucket.title && <p className="message-subject">{summary.subject}</p>
+      )}
+      {isStory ? (
+        <div className="message-meta">
+          <span className="tag">{bucket.messages.length} Nachrichten</span>
+          {bucket.handledCount > 0 && (
+            <span className="tag">{bucket.handledCount} bereits erledigt</span>
+          )}
+          {Array.from(new Set(bucket.messages.map((item) => messageSource(item.summary)))).map(
+            (source) => (
+              <span className="tag" key={source}>
+                {source}
+              </span>
+            ),
+          )}
+          <span className="meta-hint">
+            Klick auf eine Kopfzeile wählt die Nachricht für ↑, ↓ und R
+          </span>
+        </div>
+      ) : (
+        <div className="message-meta">
+          <span className="avatar" aria-hidden="true">
+            {initials(summary.from)}
+          </span>
+          <span className="sender" title={fullAddress(summary.from)}>
+            {addressLine(summary.from)}
+          </span>
+          {summary.from[0]?.name && summary.from[0]?.email && (
+            <span className="sender-email">{summary.from[0].email}</span>
+          )}
+          <time dateTime={summary.receivedAt}>{formatDate(summary.receivedAt)}</time>
+          <span className="meta-tags">
+            {summary.mailboxNames.map((name) => (
+              <span className="tag" key={name}>
+                {name}
+              </span>
+            ))}
+            {summary.isNewsletter && <span className="tag newsletter">Newsletter</span>}
+            {summary.hasAttachment && <span className="tag">Anhang</span>}
+          </span>
+        </div>
+      )}
+      <div className="message-tools">
+        {email?.html && (
+          <fieldset className="segmented">
+            <legend className="sr-only">Farben der Nachricht</legend>
+            <button
+              type="button"
+              aria-pressed={mailColorMode === 'dark'}
+              onClick={() => chooseMailColorMode('dark')}
+              title="Farben an die dunkle Oberfläche anpassen"
+            >
+              Dunkel
+            </button>
+            <button
+              type="button"
+              aria-pressed={mailColorMode === 'original'}
+              onClick={() => chooseMailColorMode('original')}
+              title="Nachricht in ihren Originalfarben zeigen"
+            >
+              Original
+            </button>
+          </fieldset>
+        )}
+        <details className="message-details" key={summary.id}>
+          <summary>Details</summary>
+          <dl className="message-details-content">
+            <div>
+              <dt>Bucket</dt>
+              <dd className="bundle-summary">{bucket.summary}</dd>
+            </div>
+            <div>
+              <dt>Stand</dt>
+              <dd>{bucket.currentState}</dd>
+            </div>
+            {bucket.linkEvidence.length > 0 && (
+              <div>
+                <dt>Belege</dt>
+                <dd>{bucket.linkEvidence.join(' · ')}</dd>
+              </div>
+            )}
+            <div>
+              <dt>Betreff</dt>
+              <dd className="original-subject">{summary.subject || '(Kein Betreff)'}</dd>
+            </div>
+            <div>
+              <dt>Von</dt>
+              <dd>{fullAddress(summary.from) || 'Unbekannter Absender'}</dd>
+            </div>
+            <div>
+              <dt>An</dt>
+              <dd>{fullAddress(summary.to) || '–'}</dd>
+            </div>
+            <div>
+              <dt>Postfach</dt>
+              <dd>
+                {summary.mailboxNames.join(', ') || '–'}
+                {summary.isNewsletter && ' · Newsletter'}
+              </dd>
+            </div>
+          </dl>
+        </details>
+      </div>
+      {email?.bodyTruncated && (
+        <p className="warning-note">
+          Fastmail hat nur einen gekürzten Nachrichteninhalt geliefert.
+        </p>
+      )}
+    </header>
+  )
 }
 
-function runScope(run: ReviewRunSummary, options: ReviewOptions | null) {
-  const mailbox = options?.mailboxes.find((item) => item.id === run.filters.mailboxId)?.name
-  const scope = run.filters.spam === 'only' ? 'Spam' : (mailbox ?? 'Ungelesene Nachrichten')
-  const range =
-    run.filters.timeRange === 'all'
-      ? 'alle Zeiträume'
-      : run.filters.timeRange === '24h'
-        ? '24 Stunden'
-        : run.filters.timeRange === '7d'
-          ? '7 Tage'
-          : '30 Tage'
-  return `${scope} · ${range}`
+function BucketMessages({
+  bucket,
+  summary,
+  email,
+  isStory,
+  details,
+  pendingDetails,
+  mailColorMode,
+  snapshot,
+  onSelectMember,
+}: Readonly<{
+  bucket: TriageBucket
+  summary: ReviewEmailSummary
+  email: ReviewEmail | undefined
+  isStory: boolean
+  details: Record<string, ReviewEmail>
+  pendingDetails: ReadonlySet<string>
+  mailColorMode: MailColorMode
+  snapshot: TriageSnapshot
+  onSelectMember: (emailId: string) => void
+}>) {
+  return (
+    <>
+      {isStory ? (
+        <ol
+          className="story-grid"
+          aria-label="Verlauf der Story"
+          data-count={Math.min(bucket.messages.length, 6)}
+        >
+          {bucket.messages.map((item, index) => {
+            const member = item.summary
+            const body = details[member.id]
+            const selected = summary.id === member.id
+            const pending = pendingDetails.has(member.id)
+            const source = messageSource(member)
+            return (
+              <li
+                key={member.id}
+                className={`story-pane ${selected ? 'selected' : ''}`}
+                aria-current={selected ? 'true' : undefined}
+              >
+                <button
+                  type="button"
+                  className="pane-head"
+                  aria-pressed={selected}
+                  aria-label={`${source} · ${member.subject} · ${formatDate(member.receivedAt)}`}
+                  title="Diese Nachricht auswählen"
+                  onClick={() => onSelectMember(member.id)}
+                >
+                  <span className="timeline-step">{index + 1}</span>
+                  <span className="timeline-copy">
+                    <span className="timeline-source">
+                      {source}
+                      <time dateTime={member.receivedAt}>{formatShortDate(member.receivedAt)}</time>
+                    </span>
+                    <strong>{member.subject || '(Kein Betreff)'}</strong>
+                  </span>
+                </button>
+                <div className="pane-body" aria-busy={pending}>
+                  <MessageBody
+                    colorMode={mailColorMode}
+                    email={body}
+                    imageToken={snapshot.imageToken}
+                    pending={pending}
+                    subject={member.subject}
+                  />
+                </div>
+                {body && body.attachments.length > 0 && (
+                  <div className="attachments pane-attachments">
+                    <AttachmentChips email={body} mode={snapshot.mode} />
+                  </div>
+                )}
+              </li>
+            )
+          })}
+        </ol>
+      ) : (
+        <>
+          <div className="message-content" aria-busy={pendingDetails.has(summary.id)}>
+            <MessageBody
+              colorMode={mailColorMode}
+              email={email}
+              imageToken={snapshot.imageToken}
+              pending={pendingDetails.has(summary.id)}
+              subject={summary.subject}
+            />
+          </div>
+          {email && email.attachments.length > 0 && (
+            <section className="attachments" aria-label="Anhänge">
+              <h2>Anhänge</h2>
+              <AttachmentChips email={email} mode={snapshot.mode} />
+            </section>
+          )}
+        </>
+      )}
+    </>
+  )
 }
 
-function TrashIcon() {
+function BucketControls({
+  bucket,
+  summary,
+  busy,
+  isParkedView,
+  onBack,
+  onReply,
+  onNewsletter,
+  onPark,
+  onComplete,
+}: Readonly<{
+  bucket: TriageBucket
+  summary: ReviewEmailSummary
+  busy: boolean
+  isParkedView: boolean
+  onBack: () => void
+  onReply: () => void
+  onNewsletter: () => void
+  onPark: () => void
+  onComplete: () => void
+}>) {
+  return (
+    <footer className="controls">
+      <button type="button" className="control-button" onClick={onBack}>
+        <kbd>←</kbd>
+        <span>Liste</span>
+      </button>
+      <div className="decision-actions">
+        <button
+          type="button"
+          className="control-button reply-trigger"
+          aria-label="Antwort entwerfen"
+          onClick={onReply}
+        >
+          <kbd>R</kbd>
+          <span>Antwort entwerfen</span>
+        </button>
+        <button
+          type="button"
+          className="control-button unsubscribe-button"
+          aria-label={
+            summary.isNewsletter ? 'Für spätere Abmeldung markieren' : 'Kein Newsletter erkannt'
+          }
+          disabled={busy || !summary.isNewsletter}
+          onClick={onNewsletter}
+          title={
+            summary.isNewsletter
+              ? 'Mit dem Fastmail-Label „Newsletter abmelden“ kennzeichnen'
+              : 'Diese Nachricht wurde nicht als Newsletter erkannt'
+          }
+        >
+          <kbd>↓</kbd>
+          <span>Später abmelden</span>
+        </button>
+        <button
+          type="button"
+          className="control-button keep-button"
+          aria-label={isParkedView ? 'Zurück in die Liste' : 'Nachricht parken'}
+          disabled={busy}
+          onClick={onPark}
+          title={
+            isParkedView
+              ? 'Die Nachricht erscheint wieder in der Todo-Liste'
+              : 'Bleibt ungelesen und verlässt die Todo-Liste, bis du sie zurückholst'
+          }
+        >
+          <kbd>↑</kbd>
+          <span>{isParkedView ? 'Zurückholen' : 'Parken'}</span>
+        </button>
+      </div>
+      <div className="completion-actions">
+        <button
+          type="button"
+          className="control-button next"
+          onClick={onComplete}
+          disabled={busy || isParkedView}
+          aria-label={`Bucket erledigt · ${bucket.messages.length} ${bucket.messages.length === 1 ? 'Nachricht' : 'Nachrichten'} als gelesen markieren`}
+        >
+          <span>{busy ? 'Wird gespeichert …' : 'Erledigt'}</span>
+          <kbd>E</kbd>
+        </button>
+      </div>
+    </footer>
+  )
+}
+
+function MessageBody({
+  colorMode,
+  email,
+  imageToken,
+  pending,
+  subject,
+}: Readonly<{
+  colorMode: MailColorMode
+  email: ReviewEmail | undefined
+  imageToken: string
+  pending: boolean
+  subject: string
+}>) {
+  if (email) {
+    return (
+      <iframe
+        className="message-body"
+        title={`Inhalt von ${subject}`}
+        sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+        srcDoc={emailDocument(email, true, imageToken, colorMode)}
+      />
+    )
+  }
+  if (pending) {
+    return (
+      <div className="body-loading">
+        <div className="spinner" />
+        <span>Nachricht wird geladen …</span>
+      </div>
+    )
+  }
+  return <div className="body-loading error-copy">Der Nachrichteninhalt ist nicht verfügbar.</div>
+}
+
+function AttachmentChips({ email, mode }: Readonly<{ email: ReviewEmail; mode: 'demo' | 'live' }>) {
+  return (
+    <div className="attachment-list">
+      {email.attachments.map((attachment) =>
+        mode === 'live' ? (
+          <a key={attachment.blobId} href={blobUrl(attachment.blobId)}>
+            <AttachmentIcon />
+            <span className="attachment-copy">
+              <span>{attachment.name}</span>
+              <small>{formatBytes(attachment.size)}</small>
+            </span>
+          </a>
+        ) : (
+          <button type="button" key={attachment.blobId} disabled>
+            <AttachmentIcon />
+            <span className="attachment-copy">
+              <span>{attachment.name}</span>
+              <small>{formatBytes(attachment.size)} · Demo</small>
+            </span>
+          </button>
+        ),
+      )}
+    </div>
+  )
+}
+
+function ChevronIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 16 16" width="14" height="14">
+      <path
+        d="m4 6 4 4 4-4"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.8"
+      />
+    </svg>
+  )
+}
+
+function AttachmentIcon() {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 20 20" width="16" height="16">
+      <path
+        d="m13.5 6.5-6 6a1.8 1.8 0 0 0 2.5 2.5l6.5-6.5a3.5 3.5 0 0 0-5-5L5 10a5.2 5.2 0 0 0 7.4 7.4l4.6-4.6"
+        fill="none"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.6"
+      />
+    </svg>
+  )
+}
+
+function RefreshIcon() {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24" width="17" height="17">
       <path
-        d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"
+        d="M20 12a8 8 0 1 1-2.6-5.9M20 4v5h-5"
         fill="none"
         stroke="currentColor"
         strokeLinecap="round"
@@ -2121,513 +1685,7 @@ function TrashIcon() {
   )
 }
 
-function DeleteRunDialog({
-  run,
-  onCancel,
-  onConfirm,
-}: {
-  run: ReviewRunSummary
-  onCancel: () => void
-  onConfirm: () => void
-}) {
-  const dialogRef = useFocusRegion<HTMLElement>(true)
-  const active = ['queued', 'fetching', 'analyzing'].includes(run.status)
-  return (
-    <div className="dialog-backdrop">
-      <section
-        ref={dialogRef}
-        className="dialog delete-run-dialog"
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="delete-run-title"
-        aria-describedby="delete-run-description"
-        onKeyDown={(event) => {
-          if (event.key === 'Escape') onCancel()
-        }}
-        tabIndex={-1}
-      >
-        <h2 id="delete-run-title">Runde löschen?</h2>
-        <p id="delete-run-description">
-          {active
-            ? 'Die laufende Verarbeitung wird abgebrochen. Danach wird die Runde dauerhaft gelöscht.'
-            : 'Die Runde und ihr gespeichertes Analyseergebnis werden dauerhaft gelöscht.'}
-        </p>
-        <div className="button-row">
-          <button type="button" className="button secondary" onClick={onCancel}>
-            Abbrechen
-          </button>
-          <button type="button" className="button danger" onClick={onConfirm}>
-            Runde löschen
-          </button>
-        </div>
-      </section>
-    </div>
-  )
-}
-
-function ReviewSetup({
-  actionIds,
-  creatingRun,
-  deletingIds,
-  deleteRun,
-  error,
-  filters,
-  options,
-  runs,
-  onCancelDelete,
-  onChange,
-  onConfirmDelete,
-  onDelete,
-  onOpen,
-  onReanalyze,
-  onSettings,
-  onStart,
-}: {
-  actionIds: ReadonlySet<string>
-  creatingRun: boolean
-  deletingIds: ReadonlySet<string>
-  deleteRun: ReviewRunSummary | null
-  error: string | null
-  filters: ReviewFilters
-  options: ReviewOptions | null
-  runs: ReviewRunSummary[]
-  onCancelDelete: () => void
-  onChange: (filters: ReviewFilters) => void
-  onConfirmDelete: (run: ReviewRunSummary) => void
-  onDelete: (run: ReviewRunSummary) => void
-  onOpen: (run: ReviewRunSummary) => void
-  onReanalyze: (run: ReviewRunSummary) => void
-  onSettings: () => void
-  onStart: () => void
-}) {
-  const [mailboxQuery, setMailboxQuery] = useState('')
-  const timeRanges: Array<{ label: string; value: ReviewFilters['timeRange'] }> = [
-    { label: 'Alle', value: 'all' },
-    { label: '24 Stunden', value: '24h' },
-    { label: '7 Tage', value: '7d' },
-    { label: '30 Tage', value: '30d' },
-  ]
-  const newsletterFilters: Array<{ label: string; value: ReviewFilters['newsletter'] }> = [
-    { label: 'Alle', value: 'all' },
-    { label: 'Ohne Newsletter', value: 'exclude' },
-    { label: 'Nur Newsletter', value: 'only' },
-  ]
-  const mailboxes =
-    options?.mailboxes.filter(
-      (mailbox) => !mailbox.role || !['drafts', 'junk', 'sent', 'trash'].includes(mailbox.role),
-    ) ?? []
-  const selectedMailbox = mailboxes.find((mailbox) => mailbox.id === filters.mailboxId)
-  const visibleMailboxes = mailboxes.filter((mailbox) =>
-    mailbox.name
-      .toLocaleLowerCase('de-DE')
-      .includes(mailboxQuery.trim().toLocaleLowerCase('de-DE')),
-  )
-  return (
-    <>
-      <main className="setup-page">
-        <header className="setup-header">
-          <h1 className="setup-brand" aria-label={`Inbox Walk v${__APP_VERSION__}`}>
-            <span>Inbox Walk</span>
-            <span className="app-version">v{__APP_VERSION__}</span>
-          </h1>
-          <button type="button" className="button secondary" onClick={onSettings}>
-            Einstellungen
-          </button>
-        </header>
-
-        <section className="runs-section" aria-labelledby="runs-title">
-          <div className="runs-heading">
-            <h2 id="runs-title">Runden</h2>
-            <p>Eine Runde lässt sich öffnen, sobald Codex alle Nachrichten analysiert hat.</p>
-          </div>
-          {runs.length === 0 ? (
-            <p className="runs-empty">Noch keine Runde. Lege unten die erste an.</p>
-          ) : (
-            <div className="runs-table-wrap">
-              <table className="runs-table">
-                <thead>
-                  <tr>
-                    <th scope="col">Runde</th>
-                    <th scope="col">Status</th>
-                    <th scope="col">Fortschritt</th>
-                    <th scope="col">Erstellt</th>
-                    <th scope="col">
-                      <span className="sr-only">Aktionen</span>
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {runs.map((run) => {
-                    const busy = actionIds.has(run.id)
-                    const deleting = deletingIds.has(run.id)
-                    const deletionBlocked = run.reviewStatus === 'finalizing'
-                    const percent =
-                      run.status === 'ready'
-                        ? 100
-                        : Math.min(100, Math.round(run.analysis.progress * 100))
-                    return (
-                      <tr
-                        key={run.id}
-                        id={`run-${run.id}`}
-                        data-status={run.status}
-                        aria-busy={busy}
-                      >
-                        <td data-label="Runde">
-                          <strong>Runde {run.id.slice(0, 8)}</strong>
-                          <small>{runScope(run, options)}</small>
-                        </td>
-                        <td data-label="Status">
-                          <span
-                            className={`run-status ${run.status}`}
-                            role="status"
-                            aria-live="polite"
-                            aria-atomic="true"
-                          >
-                            {deleting ? 'Wird gelöscht' : runStatus(run)}
-                          </span>
-                          {run.analysis.error && (
-                            <small className="run-error">{run.analysis.error}</small>
-                          )}
-                        </td>
-                        <td data-label="Fortschritt">
-                          <div
-                            className="run-progress"
-                            role="progressbar"
-                            aria-label={`Fortschritt der Runde ${run.id.slice(0, 8)}`}
-                            aria-valuemin={0}
-                            aria-valuemax={100}
-                            aria-valuenow={percent}
-                            aria-valuetext={runProgressText(run)}
-                          >
-                            <span style={{ width: `${percent}%` }} />
-                          </div>
-                          <small>
-                            {deleting ? 'Verarbeitung wird abgebrochen' : runProgressText(run)}
-                          </small>
-                        </td>
-                        <td data-label="Erstellt">
-                          <time dateTime={run.createdAt}>{formatDate(run.createdAt)}</time>
-                        </td>
-                        <td className="run-actions">
-                          <button
-                            type="button"
-                            className="button secondary run-open"
-                            disabled={run.status !== 'ready' || busy}
-                            onClick={() => onOpen(run)}
-                          >
-                            Runde öffnen
-                          </button>
-                          <button
-                            type="button"
-                            className="text-button"
-                            disabled={!run.csrfToken || !run.reanalyzable || busy}
-                            onClick={() => onReanalyze(run)}
-                          >
-                            Mit Codex neu analysieren
-                          </button>
-                          <button
-                            type="button"
-                            className="icon-button run-delete"
-                            disabled={!run.csrfToken || busy || deletionBlocked}
-                            onClick={() => onDelete(run)}
-                            aria-label={`Runde ${run.id.slice(0, 8)} löschen`}
-                            title={
-                              deletionBlocked
-                                ? 'Die Runde wird gerade abgeschlossen'
-                                : 'Runde löschen'
-                            }
-                          >
-                            <TrashIcon />
-                          </button>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </section>
-
-        <form
-          className="setup-form"
-          onSubmit={(event) => {
-            event.preventDefault()
-            onStart()
-          }}
-        >
-          <h2 className="new-run-title">Neue Runde</h2>
-          <section className="setup-section" aria-labelledby="scope-title">
-            <div className="setup-section-heading">
-              <h2 id="scope-title">Bereich</h2>
-              <p>Was soll in dieser Runde auftauchen?</p>
-            </div>
-            <div className="scope-choices">
-              <button
-                type="button"
-                className="setup-choice"
-                aria-pressed={filters.spam === 'exclude'}
-                onClick={() => onChange({ ...filters, spam: 'exclude' })}
-              >
-                <span className="choice-box" aria-hidden="true">
-                  {filters.spam === 'exclude' ? '✓' : ''}
-                </span>
-                <span>
-                  <strong>Alles außer Spam</strong>
-                  <small>Die normale ungelesene Post</small>
-                </span>
-              </button>
-              <button
-                type="button"
-                className="setup-choice"
-                aria-pressed={filters.spam === 'only'}
-                onClick={() => onChange({ ...filters, mailboxId: null, spam: 'only' })}
-              >
-                <span className="choice-box" aria-hidden="true">
-                  {filters.spam === 'only' ? '✓' : ''}
-                </span>
-                <span>
-                  <strong>Nur Spam</strong>
-                  <small>Mit ↓ falsch erkannte Mails zurückholen</small>
-                </span>
-              </button>
-            </div>
-          </section>
-
-          <section className="setup-section" aria-labelledby="time-title">
-            <div className="setup-section-heading">
-              <h2 id="time-title">Zeitraum</h2>
-              <p>Direkt wählen, ohne Menü.</p>
-            </div>
-            <div className="direct-choices">
-              {timeRanges.map((range) => (
-                <button
-                  type="button"
-                  key={range.value}
-                  aria-pressed={filters.timeRange === range.value}
-                  onClick={() => onChange({ ...filters, timeRange: range.value })}
-                >
-                  {range.label}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          <section className="setup-section" aria-labelledby="narrow-title">
-            <div className="setup-section-heading">
-              <h2 id="narrow-title">Eingrenzen</h2>
-              <p>Optional – nichts davon muss gewählt werden.</p>
-            </div>
-            <label className="setup-check history-check">
-              <input
-                type="checkbox"
-                checked={filters.hideReviewed}
-                onChange={(event) => onChange({ ...filters, hideReviewed: event.target.checked })}
-              />
-              <span className="choice-box" aria-hidden="true">
-                {filters.hideReviewed ? '✓' : ''}
-              </span>
-              <span>
-                <strong>Zurückgestellte Nachrichten ausblenden</strong>
-                <small>
-                  {options?.reviewedCount === 1
-                    ? '1 Nachricht wurde angesehen und bewusst ungelesen behalten'
-                    : `${options?.reviewedCount ?? 0} Nachrichten wurden angesehen und bewusst ungelesen behalten`}
-                </small>
-              </span>
-            </label>
-
-            <div className="setup-subsection">
-              <h3>Newsletter</h3>
-              <div className="direct-choices">
-                {newsletterFilters.map((filter) => (
-                  <button
-                    type="button"
-                    key={filter.value}
-                    aria-pressed={filters.newsletter === filter.value}
-                    onClick={() => onChange({ ...filters, newsletter: filter.value })}
-                  >
-                    {filter.label}
-                  </button>
-                ))}
-              </div>
-            </div>
-
-            {filters.spam === 'exclude' && mailboxes.length > 0 && (
-              <details className="mailbox-picker" open={selectedMailbox ? true : undefined}>
-                <summary>
-                  <span>Postfach einschränken</span>
-                  <small>{selectedMailbox?.name ?? 'Alle Postfächer'}</small>
-                </summary>
-                <div className="mailbox-picker-body">
-                  <input
-                    type="search"
-                    value={mailboxQuery}
-                    onChange={(event) => setMailboxQuery(event.target.value)}
-                    placeholder="Postfach suchen …"
-                    aria-label="Postfach suchen"
-                  />
-                  <div className="mailbox-choices">
-                    {selectedMailbox && (
-                      <button
-                        type="button"
-                        className="clear-mailbox"
-                        onClick={() => onChange({ ...filters, mailboxId: null })}
-                      >
-                        Auswahl aufheben
-                      </button>
-                    )}
-                    {visibleMailboxes.map((mailbox) => {
-                      const checked = filters.mailboxId === mailbox.id
-                      return (
-                        <label className="setup-check compact" key={mailbox.id}>
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() =>
-                              onChange({ ...filters, mailboxId: checked ? null : mailbox.id })
-                            }
-                          />
-                          <span className="choice-box" aria-hidden="true">
-                            {checked ? '✓' : ''}
-                          </span>
-                          <span>{mailbox.name}</span>
-                        </label>
-                      )
-                    })}
-                    {visibleMailboxes.length === 0 && (
-                      <p className="empty-mailboxes">Kein passendes Postfach.</p>
-                    )}
-                  </div>
-                </div>
-              </details>
-            )}
-          </section>
-
-          {error && (
-            <p className="setup-error" role="alert">
-              {error}
-            </p>
-          )}
-          <footer className="setup-footer">
-            <p>Beim Start wird sofort eine gespeicherte Runde angelegt.</p>
-            <button type="submit" className="button primary" disabled={creatingRun}>
-              {creatingRun ? 'Runde wird angelegt …' : 'Runde starten'}
-            </button>
-          </footer>
-        </form>
-      </main>
-      {deleteRun && (
-        <DeleteRunDialog
-          run={deleteRun}
-          onCancel={onCancelDelete}
-          onConfirm={() => onConfirmDelete(deleteRun)}
-        />
-      )}
-    </>
-  )
-}
-
-function OverviewDrawer({
-  bundles,
-  currentIndex,
-  keptUnread,
-  processedIds,
-  secondaryActionIds,
-  isSpamReview,
-  onClose,
-  onDiscard,
-  onSelect,
-}: {
-  bundles: ReviewBundle[]
-  currentIndex: number
-  keptUnread: ReadonlySet<string>
-  processedIds: ReadonlySet<string>
-  secondaryActionIds: ReadonlySet<string>
-  isSpamReview: boolean | undefined
-  onClose: () => void
-  onDiscard: () => void
-  onSelect: (index: number) => void
-}) {
-  const drawerRef = useFocusRegion<HTMLElement>(true)
-  return (
-    <div className="drawer-backdrop">
-      <aside
-        ref={drawerRef}
-        className="drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="Nachrichtenübersicht"
-        tabIndex={-1}
-      >
-        <div className="drawer-header">
-          <div>
-            <h2>Nachrichten</h2>
-            <p>
-              {processedIds.size} bearbeitet · {keptUnread.size} bleiben ungelesen ·{' '}
-              {secondaryActionIds.size} {isSpamReview ? 'kein Spam' : 'für Abmeldung markiert'}
-            </p>
-          </div>
-          <button type="button" className="icon-button" onClick={onClose} aria-label="Schließen">
-            ×
-          </button>
-        </div>
-        <ol className="overview-list">
-          {bundles.map((bundle, itemIndex) => (
-            <li key={bundle.bundleId}>
-              <button
-                type="button"
-                className={itemIndex === currentIndex ? 'current' : ''}
-                onClick={() => onSelect(itemIndex)}
-              >
-                <span className="overview-index">{String(itemIndex + 1).padStart(2, '0')}</span>
-                <span className="overview-copy">
-                  <strong>{bundle.title || '(Kein Betreff)'}</strong>
-                  <small>
-                    {bundle.emailIds.length}{' '}
-                    {bundle.emailIds.length === 1 ? 'Nachricht' : 'Nachrichten'} ·{' '}
-                    {bundle.timeline
-                      .map((item) => item.source)
-                      .filter(
-                        (source, sourceIndex, sources) => sources.indexOf(source) === sourceIndex,
-                      )
-                      .join(', ')}
-                  </small>
-                </span>
-                <span className="overview-marks">
-                  {bundle.emailIds.every((id) => processedIds.has(id)) && (
-                    <span className="processed-mark">bearbeitet</span>
-                  )}
-                  {bundle.emailIds.some((id) => keptUnread.has(id)) && (
-                    <span className="unread-mark">ungelesen</span>
-                  )}
-                  {bundle.emailIds.some((id) => secondaryActionIds.has(id)) && (
-                    <span className="unsubscribe-mark">
-                      {isSpamReview ? 'kein Spam' : 'abmelden'}
-                    </span>
-                  )}
-                </span>
-              </button>
-            </li>
-          ))}
-        </ol>
-        <div className="drawer-footer">
-          <button type="button" className="danger-link" onClick={onDiscard}>
-            Zur Rundenübersicht
-          </button>
-        </div>
-      </aside>
-    </div>
-  )
-}
-
-function HelpDialog({
-  isSpamReview,
-  onClose,
-}: {
-  isSpamReview: boolean | undefined
-  onClose: () => void
-}) {
+function HelpDialog({ onClose }: Readonly<{ onClose: () => void }>) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
   return (
     <div className="dialog-backdrop">
@@ -2650,23 +1708,25 @@ function HelpDialog({
             <dt>
               <kbd>←</kbd> <kbd>→</kbd>
             </dt>
-            <dd>Story wechseln</dd>
+            <dd>← zurück zur Liste · → wie E: Bucket erledigt, nächsten öffnen</dd>
           </div>
           <div>
             <dt>
               <kbd>↑</kbd>
             </dt>
-            <dd>Ausgewähltes Original ungelesen schützen</dd>
+            <dd>Ausgewählte Nachricht parken (bleibt ungelesen, verlässt die Liste)</dd>
           </div>
           <div>
             <dt>
               <kbd>↓</kbd>
             </dt>
-            <dd>
-              {isSpamReview
-                ? 'Als kein Spam markieren und in die Inbox verschieben'
-                : 'Newsletter für spätere Abmeldung markieren'}
-            </dd>
+            <dd>Newsletter für spätere Abmeldung markieren</dd>
+          </div>
+          <div>
+            <dt>
+              <kbd>E</kbd>
+            </dt>
+            <dd>Bucket erledigt: alle gezeigten Nachrichten als gelesen markieren</dd>
           </div>
           <div>
             <dt>
@@ -2722,18 +1782,28 @@ function SettingsDialog({
   demo,
   error,
   login,
+  memory,
+  memoryBusy,
   onClose,
+  onDecideProposal,
+  onSaveMemory,
   onStartLogin,
-}: {
+}: Readonly<{
   authBusy: boolean
   codex: CodexSettings
   demo: boolean
   error: string | null
   login: CodexLoginState | null
+  memory: TriageMemory
+  memoryBusy: boolean
   onClose: () => void
+  onDecideProposal: (id: string, accept: boolean) => void
+  onSaveMemory: (notes: string) => void
   onStartLogin: () => void
-}) {
+}>) {
   const dialogRef = useFocusRegion<HTMLElement>(true)
+  const [notes, setNotes] = useState(memory.notes)
+  useEffect(() => setNotes(memory.notes), [memory.notes])
   const waiting = login?.status === 'starting' || login?.status === 'waiting'
   const codexLogin = codex.authSource === 'codex'
   const modelLabel = codex.modelLabel ?? codexModelLabel(codex.model) ?? codex.model
@@ -2761,9 +1831,9 @@ function SettingsDialog({
             <div>
               <h3 id="settings-codex-title">Codex</h3>
               <p>
-                Codex analysiert alle gespeicherten Zusammenfassungen einer neuen Runde gemeinsam
-                und ordnet jede Nachricht einer Story oder der Einzelansicht zu. Modell, Denkaufwand
-                und Geschwindigkeit folgen der Codex-Konfiguration und gelten für neue Analysen und
+                Codex sortiert jede neue ungelesene Nachricht in einen Bucket ein und darf dafür im
+                Postfach suchen und Nachrichten lesen. Modell, Denkaufwand und Geschwindigkeit
+                folgen der Codex-Konfiguration und gelten für die Sortierung und für
                 Antwortentwürfe.
               </p>
             </div>
@@ -2830,6 +1900,64 @@ function SettingsDialog({
             </button>
           )}
         </section>
+        <section className="settings-section" aria-labelledby="settings-memory-title">
+          <div className="settings-section-heading">
+            <div>
+              <h3 id="settings-memory-title">Gedächtnis</h3>
+              <p>
+                Diese Notizen bekommt Codex bei jeder Sortierung als deine Vorlieben. Codex kann
+                Ergänzungen vorschlagen; sie gelten erst, wenn du sie übernimmst.
+              </p>
+            </div>
+          </div>
+          <label className="memory-field">
+            <span className="sr-only">Notizen für Codex</span>
+            <textarea
+              rows={6}
+              maxLength={TRIAGE_MEMORY_MAX_LENGTH}
+              value={notes}
+              onChange={(event) => setNotes(event.target.value)}
+              placeholder="Zum Beispiel: Bahn-Buchungen und Sitzplatzreservierungen gehören zur selben Reise."
+            />
+          </label>
+          <div className="memory-actions">
+            <button
+              type="button"
+              className="button secondary"
+              disabled={memoryBusy || notes === memory.notes}
+              onClick={() => onSaveMemory(notes)}
+            >
+              {memoryBusy ? 'Wird gespeichert …' : 'Notizen speichern'}
+            </button>
+          </div>
+          {memory.proposals.length > 0 && (
+            <ul className="memory-proposals" aria-label="Vorschläge von Codex">
+              {memory.proposals.map((proposal) => (
+                <li key={proposal.id}>
+                  <p>{proposal.note}</p>
+                  <div className="memory-proposal-actions">
+                    <button
+                      type="button"
+                      className="text-button"
+                      disabled={memoryBusy}
+                      onClick={() => onDecideProposal(proposal.id, true)}
+                    >
+                      Übernehmen
+                    </button>
+                    <button
+                      type="button"
+                      className="text-button"
+                      disabled={memoryBusy}
+                      onClick={() => onDecideProposal(proposal.id, false)}
+                    >
+                      Verwerfen
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
         <div className="button-row">
           <button type="button" className="button secondary" onClick={onClose}>
             Schließen
@@ -2851,7 +1979,7 @@ function ReplyPanel({
   onGenerate,
   onSave,
   onUpdate,
-}: {
+}: Readonly<{
   context?: ThreadContext
   draftResult?: DraftResult
   editor?: ReplyEditorState
@@ -2862,7 +1990,7 @@ function ReplyPanel({
   onGenerate: () => void
   onSave: () => void
   onUpdate: (patch: Partial<ReplyEditorState>) => void
-}) {
+}>) {
   const panelRef = useFocusRegion<HTMLElement>(false)
   const identity = context?.identities.find((item) => item.id === editor?.identityId)
   return (

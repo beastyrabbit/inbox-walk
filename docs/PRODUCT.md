@@ -1,38 +1,32 @@
 # Product behavior
 
-Inbox Walk is a focused personal mail-review tool, not a replacement for the
-Fastmail interface. It turns unread incoming mail into a linear reading session
+Inbox Walk is a focused personal mail todo, not a replacement for the Fastmail
+interface. It keeps unread incoming mail sorted into stories while you are away
 and makes every mailbox mutation explicit and recoverable.
 
-## Review contract
+## Todo contract
 
-1. Configure a new round before mail is loaded, explicitly choosing either Spam only or everything except Spam.
-2. Query a stable, fixed snapshot of matching unread, non-draft incoming mail. The query is paginated and has no fixed message-count cap.
-3. Keep only summaries in the initial payload and load bodies on demand.
-4. Store every round under a stable server-side ID and URL. The browser checkpoint contains only that opaque round pointer.
-5. Persist summaries, bundle analysis, decisions, editor state, and finalization in SQLite, but never received bodies or attachment content.
-6. Record deliberately kept-unread message IDs in a separate history and exclude them only when the user chooses that option.
-7. Let the user move backward or forward and protect any message as unread.
-8. Show the exact final counts before changing Fastmail.
-9. Mark only unprotected snapshot IDs as read; newer mail remains untouched.
-10. Report and retry partial failures without repeating successful changes.
-11. In a Spam review, move messages marked “Not Spam” from Spam to Inbox only after confirmation.
-12. For normal reviews, add the `Newsletter abmelden` Fastmail label after confirmation; never contact an unsubscribe endpoint automatically.
+1. Keep a JMAP push connection to Fastmail and refresh on every Email state change, plus a poll about once a minute as fallback. Each refresh lists unread, non-draft incoming mail outside Spam and queues every new message with its summary only.
+2. Drop a message from the todo when it is no longer unread in Fastmail, whatever changed it. Never re-queue a message this app marked done within the last two minutes.
+3. Show queued messages as unsorted entries at the top until a bucket claims them. They can be opened, read, replied to, parked, and marked done like any other message.
+4. A bucket is one real-world story. It is open while it has at least one sorted, unread member and closes on its own when the last member is done or parked. New mail that continues a closed story reopens it.
+5. Marking a bucket done marks exactly its shown message IDs read in Fastmail, then records them as done. Nothing else is touched. Failures are reported per message and leave those messages in the todo.
+6. Parking keeps a message unread and removes it from the todo. Fetching it back returns it to its bucket, or to the unsorted entries if the bucket is gone.
+7. The newsletter action adds the `Newsletter abmelden` label; it never contacts an unsubscribe endpoint and does not change read state.
+8. Reply editor state is stored per message and survives reloads. Drafts are created through JMAP and read back for verification. There is no send path.
+9. Every user action needs the same-origin check and the todo CSRF token.
 
-If a body cannot be loaded, that message is protected as unread automatically.
+## Sorting contract
 
-## Bundle analysis contract
-
-1. Create and persist the run ID before fetching mail. Keep the user on the rounds table while the backend fetches and analyzes it.
-2. Persist the frozen snapshot, Codex model, thinking level, and hashed learning-example corpus before the first provider request.
-3. Send every frozen summary to Codex in one global request without a local candidate prefilter. The supplied fields are ID, subject, preview, time, sender, recipients, thread ID, mailbox names, and summary flags; bodies and attachments are not part of grouping.
-4. Normalize the proposed partition deterministically: prefer higher-confidence stories for duplicate assignments, use stable model order as the tie-breaker, dissolve stories left with fewer than two messages, and classify every unassigned snapshot ID as standalone. Reject unknown IDs and malformed story metadata.
-5. Save the complete normalized partition before constructing the final review run. Resume from that checkpoint after a process restart.
-6. A reload or open action only reads stored status and results. Only an explicit reanalysis starts a new generation on the same snapshot.
-7. Keep later incoming mail outside the round. Analyze it in a new round.
-8. In live mode, fail visibly when Codex is unavailable or times out. Never silently downgrade the run to local or singleton analysis.
-9. Cover every message in the frozen snapshot. Do not stop analysis at an arbitrary provider-call count.
-10. Deleting a run aborts active snapshot or Codex analysis work. Reply generation and draft storage block deletion immediately. Finalization blocks deletion after it acquires the durable selection lock; if deletion wins before that lock, finalization stops before changing the mailbox. Reanalysis of an active round preserves review decisions and drafts. Reanalysis of a completed round reopens it, clears its decisions and finalization result, and preserves reply drafts.
+1. Only the sorter decides bucket membership. The app does not pre-group messages before Codex sees them, except in demo mode, where exact identifiers are grouped locally.
+2. One sorting session covers up to eight new messages. It receives their summaries, the buckets active in the last 45 days with their members, and the user's memory note.
+3. The session is isolated: no built-in tools, skills, extensions, prompts, themes, or project context. Its only tools are the read-only mailbox lookups, the bucket tools, the memory proposal, and `finish_triage`.
+4. Read-only lookups are bounded to 30 per session and return summaries or bounded plain text. Nothing fetched for sorting is persisted.
+5. Bucket tools only change this app's SQLite state. IDs outside the new batch or the open members are rejected. Every tool action is logged.
+6. A transient failure or a session that leaves a message unassigned counts one attempt for the affected messages. After three attempts a message stops retrying automatically and shows a retry control.
+7. An expired Codex login pauses sorting without counting attempts and shows a connect control. Sorting resumes on the next poll after login.
+8. Memory proposals never take effect until the user accepts them in the settings.
+9. Model, reasoning effort, and speed follow the Codex configuration at the time of each session.
 
 ## Reply contract
 
@@ -50,15 +44,13 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 
 ## Privacy and safety
 
-- The Fastmail credential is a backend-only runtime secret; rotating Codex OAuth data stays on the private app volume.
-- Round persistence stores mail summaries and review state, but never received bodies or attachment content. Retained-unread history remains ID-only.
+- The Fastmail credential is a backend-only runtime secret; rotating Codex OAuth data stays on the private app volume or in the Codex home.
+- Persistence stores mail summaries, bucket texts, todo state, editor state, notes and an action log, but never received bodies or attachment content.
 - Mail HTML is sanitized and isolated in a sandboxed iframe.
 - External images are fetched through a bounded, type-checked backend proxy; the mail document never contacts remote senders directly.
-- Blob downloads are allowlisted from server-owned snapshot metadata and returned with `Cache-Control: no-store`.
-- POST mutations require same-origin checks and a snapshot CSRF token.
-- Codex uses the ChatGPT subscription OAuth provider in a fresh in-memory session per decision.
-- Built-in tools, skills, extensions, prompts, themes, and project context are disabled; the model receives only one schema-constrained reply-submit tool.
-- Message content and attachments are treated as untrusted data, never as instructions.
+- Blob downloads are allowlisted from server-owned message metadata and returned with `Cache-Control: no-store`.
+- Codex uses the ChatGPT subscription OAuth provider in a fresh in-memory session per sort and per reply.
+- Message content, search results, and bucket texts are treated as untrusted data, never as instructions. The model cannot write to Fastmail.
 
 The app is intended for a single user behind Pangolin SSO in the Heerlab
 homelab. Security is pragmatic for that boundary, while credentials and mail

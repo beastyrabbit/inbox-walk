@@ -3,10 +3,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { FileAuthStorageBackend } from '@earendil-works/pi-coding-agent'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getCodexAuthStorage, runCodexBundlePartition, runCodexReply } from './codex.ts'
+import { getCodexAuthStorage, runCodexReply } from './codex.ts'
 import { withCodexRequest } from './codex-request.ts'
 import { demoEmails } from './demo.ts'
 import { withIoDeadline } from './io.ts'
+import { createDemoMailbox } from './mailbox.ts'
+import { createCodexSorter } from './triage-sorter.ts'
+import { createTriageStore } from './triage-store.ts'
 
 const inference = vi.hoisted(() =>
   vi.fn<typeof import('@earendil-works/pi-coding-agent').createAgentSession>(),
@@ -107,15 +110,17 @@ describe('Codex preflight cancellation', () => {
       const timeout = AbortSignal.timeout.bind(AbortSignal)
       if (phase === 'deadline')
         vi.spyOn(AbortSignal, 'timeout').mockImplementation((ms) =>
-          timeout(ms === 30 * 60_000 ? 40 : ms),
+          timeout(ms === 15 * 60_000 ? 40 : ms),
         )
-      const result = runCodexBundlePartition(
-        { emails: [demoEmails[0]], examples: [] },
-        'gpt-5.6-sol',
-        'high',
-        'standard',
-        controller.signal,
-      )
+      const store = createTriageStore(':memory:')
+      const mailbox = createDemoMailbox()
+      const { emails } = await mailbox.summaries([demoEmails[0]?.id ?? ''])
+      store.enqueue(emails)
+      const result = createCodexSorter(() => ({
+        model: 'gpt-5.6-sol',
+        speed: 'standard',
+        thinkingLevel: 'high',
+      }))({ batch: store.queued(1, 3), mailbox, signal: controller.signal, store })
       const rejected = expect(result).rejects.toThrow()
       await started.promise
       if (phase !== 'deadline') controller.abort()

@@ -15,16 +15,12 @@ assert.notEqual(process.getuid(), 0);
 await access("/data", constants.W_OK);
 const base = "http://127.0.0.1:3000";
 for (const path of ["/healthz", "/readyz", "/"]) assert.equal((await fetch(base + path)).status, 200);
-assert.equal((await (await fetch(base + "/api/review/options")).json()).mode, "demo");
-const response = await fetch(base + "/api/reviews", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ filters: { mailboxId: null, newsletter: "all", timeRange: "all" } }) });
-assert.equal(response.status, 202);
-const run = await response.json();
-assert.ok(run.id);
 for (let attempt = 0; attempt < 50; attempt += 1) {
-  const round = await (await fetch(base + "/api/reviews/" + run.id)).json();
-  if (round.bundleRun) { assert.ok(round.emails.length); break; }
-  assert.ok(attempt < 49, "Demo analysis must finish");
+  const todo = await (await fetch(base + "/api/todo")).json();
+  assert.equal(todo.mode, "demo");
+  if (todo.buckets.length > 0 && todo.buckets.every((bucket) => !bucket.unsorted)) break;
+  assert.ok(attempt < 49, "Demo triage must sort the sample mail");
   await new Promise(resolve => setTimeout(resolve, 100));
 }
-console.log("Node 24 non-root demo runtime, static assets and SQLite round creation passed.");
+console.log("Node 24 non-root demo runtime, static assets and SQLite triage passed.");
 '

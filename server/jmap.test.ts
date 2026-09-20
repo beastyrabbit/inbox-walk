@@ -2,12 +2,17 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   createAndVerifyDraft,
   fetchEmailDetail,
+  fetchEmailSummaries,
+  fetchMailAccount,
+  fetchThread,
   fetchUnreadEmailIds,
-  fetchUnreadSnapshot,
   markEmailsRead,
   moveEmailsOutOfSpam,
+  queryUnreadEmailIds,
+  readEventStream,
   tagEmailsForLaterUnsubscribe,
   unreadFilter,
+  watchMailChanges,
 } from './jmap.ts'
 
 const draftContext = {
@@ -181,11 +186,12 @@ describe('Fastmail JMAP adapter', () => {
           ])
         }),
       )
+      const account = await fetchMailAccount('fixture')
       if (mode === 'retry') {
-        expect((await fetchUnreadSnapshot('fixture')).emails.map((email) => email.id)).toEqual(ids)
+        expect(await queryUnreadEmailIds(account, 'fixture')).toEqual(ids)
         expect(attempts).toBe(2)
       } else {
-        await expect(fetchUnreadSnapshot('fixture')).rejects.toThrow()
+        await expect(queryUnreadEmailIds(account, 'fixture')).rejects.toThrow()
         expect(attempts).toBe(3)
       }
     },
@@ -373,44 +379,19 @@ describe('Fastmail JMAP adapter', () => {
     })
   })
 
-  it('switches explicitly between non-spam and spam queries', () => {
-    expect(
-      unreadFilter(
-        {
-          hideReviewed: false,
-          mailboxId: null,
-          newsletter: 'all',
-          spam: 'exclude',
-          timeRange: 'all',
-        },
-        'junk',
-      ),
-    ).toEqual({
+  it('excludes Spam and Trash at query level so tracked mail moved there drops out', () => {
+    expect(unreadFilter(['junk', 'trash'])).toEqual({
       operator: 'AND',
       conditions: [
         { notKeyword: '$seen' },
         { notKeyword: '$draft' },
         { operator: 'NOT', conditions: [{ inMailbox: 'junk' }] },
+        { operator: 'NOT', conditions: [{ inMailbox: 'trash' }] },
       ],
-    })
-    expect(
-      unreadFilter(
-        {
-          hideReviewed: false,
-          mailboxId: null,
-          newsletter: 'all',
-          spam: 'only',
-          timeRange: 'all',
-        },
-        'junk',
-      ),
-    ).toEqual({
-      operator: 'AND',
-      conditions: [{ notKeyword: '$seen' }, { notKeyword: '$draft' }, { inMailbox: 'junk' }],
     })
   })
 
-  it('loads and maps an unread snapshot while excluding sent-only mail', async () => {
+  it('loads and maps summaries while excluding sent-only mail', async () => {
     const fetchMock = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(
@@ -437,9 +418,6 @@ describe('Fastmail JMAP adapter', () => {
             'mailboxes',
           ],
         ]),
-      )
-      .mockResolvedValueOnce(
-        jmapResponse([['Email/query', { ids: ['incoming', 'outgoing'], total: 2 }, 'query']]),
       )
       .mockResolvedValueOnce(
         jmapResponse([
@@ -474,30 +452,42 @@ describe('Fastmail JMAP adapter', () => {
                   subject: 'Sent',
                   bodyValues: {},
                 },
+                {
+                  id: 'both',
+                  threadId: 'thread-3',
+                  mailboxIds: { inbox: true, sent: true },
+                  receivedAt: '2026-08-01T08:00:00Z',
+                  from: [{ name: 'Me', email: 'alex@example.com' }],
+                  to: [],
+                  subject: 'Inbox and Sent',
+                  bodyValues: {},
+                },
               ],
             },
             'emails',
           ],
         ]),
       )
-      .mockResolvedValueOnce(
-        jmapResponse([['Email/query', { ids: ['incoming', 'outgoing'], total: 2 }, 'query-check']]),
-      )
     vi.stubGlobal('fetch', fetchMock)
 
-    const snapshot = await fetchUnreadSnapshot('secret-token')
-    expect(snapshot.emails).toHaveLength(1)
-    expect(snapshot.emails[0]).toMatchObject({
+    const account = await fetchMailAccount('secret-token')
+    const result = await fetchEmailSummaries(account, 'secret-token', [
+      'incoming',
+      'outgoing',
+      'both',
+    ])
+    expect(result.emails.map((email) => email.id)).toEqual(['incoming', 'both'])
+    expect(result.emails[0]).toMatchObject({
       id: 'incoming',
       subject: 'Hallo',
       hasAttachment: true,
     })
-    expect(snapshot.totalBeforeLimit).toBe(1)
-    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(result.excludedIds).toEqual(['outgoing'])
+    expect(fetchMock).toHaveBeenCalledTimes(3)
     expect(fetchMock.mock.calls[0]?.[1]?.headers).toEqual({ Authorization: 'Bearer secret-token' })
   })
 
-  it('freezes every matching message when the server caps query pages below the requested size', async () => {
+  it('lists every unread ID when the server caps query pages below the requested size', async () => {
     const ids = Array.from({ length: 501 }, (_, index) => `mail-${index}`)
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       if (String(input).includes('/jmap/session')) {
@@ -517,10 +507,21 @@ describe('Fastmail JMAP adapter', () => {
       const [method, arguments_, callId] = request.methodCalls[0] ?? []
       if (method === 'Mailbox/get') {
         return jmapResponse([
-          ['Mailbox/get', { list: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }] }, callId],
+          [
+            'Mailbox/get',
+            {
+              list: [
+                { id: 'inbox', name: 'Inbox', role: 'inbox' },
+                { id: 'sent', name: 'Sent', role: 'sent' },
+                { id: 'trash', name: 'Trash', role: 'trash' },
+              ],
+            },
+            callId,
+          ],
         ])
       }
       if (method === 'Email/query') {
+        expect(arguments_?.filter).toEqual(unreadFilter(['trash']))
         const position = Number(arguments_?.position ?? 0)
         const requestedLimit = Number(arguments_?.limit ?? 250)
         const limit = Math.min(requestedLimit, 100)
@@ -563,11 +564,8 @@ describe('Fastmail JMAP adapter', () => {
     })
     vi.stubGlobal('fetch', fetchMock)
 
-    const snapshot = await fetchUnreadSnapshot('secret-token')
-    expect(snapshot.emails).toHaveLength(501)
-    expect(snapshot.emails.map((email) => email.id)).toEqual(ids)
-    expect(snapshot.truncated).toBe(false)
-    expect(snapshot.totalBeforeLimit).toBe(501)
+    const account = await fetchMailAccount('secret-token')
+    expect(await queryUnreadEmailIds(account, 'secret-token')).toEqual(ids)
   })
 
   it('does not classify message body blobs as attachments', async () => {
@@ -844,5 +842,148 @@ describe('Fastmail JMAP adapter', () => {
     expect(tagRequest.methodCalls[0][1].update).toEqual({
       news: { 'mailboxIds/unsubscribe-label': true },
     })
+  })
+
+  it('parses server-sent events across chunk boundaries', async () => {
+    const encoder = new TextEncoder()
+    const chunks = [
+      'event: state\ndata: {"changed":{"a',
+      'cc":{"Email":"s1"}}}\n\nevent: ping\ndata: {}\n\n',
+      'data: plain\r\n\r\n',
+    ]
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk))
+        controller.close()
+      },
+    })
+    const events: Array<{ data: string; type: string }> = []
+    await readEventStream(body, (event) => events.push(event), new AbortController().signal)
+    expect(events).toEqual([
+      { data: '{"changed":{"acc":{"Email":"s1"}}}', type: 'state' },
+      { data: '{}', type: 'ping' },
+      { data: 'plain', type: 'message' },
+    ])
+  })
+
+  it('reports Email state changes over push and reconnects after the stream ends', async () => {
+    const encoder = new TextEncoder()
+    let connections = 0
+    const stream = (states: string[]) =>
+      new ReadableStream<Uint8Array>({
+        start(controller) {
+          for (const state of states) {
+            controller.enqueue(
+              encoder.encode(
+                `event: state\ndata: ${JSON.stringify({ changed: { acc: { Email: state } } })}\n\n`,
+              ),
+            )
+          }
+          controller.enqueue(encoder.encode('event: ping\ndata: {}\n\n'))
+          controller.close()
+        },
+      })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async (input, init) => {
+        if (String(input).endsWith('/jmap/session')) {
+          return new Response(
+            JSON.stringify({
+              apiUrl: draftContext.apiUrl,
+              downloadUrl: draftContext.downloadUrl,
+              eventSourceUrl:
+                'https://api.example/jmap/event/?types={types}&closeafter={closeafter}&ping={ping}',
+              primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acc' },
+              capabilities: {},
+            }),
+          )
+        }
+        expect(String(input)).toBe(
+          'https://api.example/jmap/event/?types=Email&closeafter=no&ping=300',
+        )
+        expect((init?.headers as Record<string, string> | undefined)?.Accept).toBe(
+          'text/event-stream',
+        )
+        connections += 1
+        return new Response(connections === 1 ? stream(['s1', 's1', 's2']) : stream(['s2', 's3']), {
+          status: 200,
+          headers: { 'Content-Type': 'text/event-stream' },
+        })
+      }),
+    )
+    const controller = new AbortController()
+    const changes: number[] = []
+    const status: boolean[] = []
+    const watching = watchMailChanges(
+      'token',
+      () => changes.push(changes.length + 1),
+      controller.signal,
+      (connected) => status.push(connected),
+    )
+    await expect.poll(() => connections).toBe(2)
+    await expect.poll(() => changes.length).toBe(3)
+    controller.abort()
+    await watching
+    expect(status.slice(0, 4)).toEqual([true, false, true, false])
+  })
+
+  it('drops saved drafts from thread context so they never become the reply target', async () => {
+    const message = (id: string, extra: Record<string, unknown>) => ({
+      id,
+      threadId: 'thread-1',
+      mailboxIds: { inbox: true },
+      receivedAt: '2026-08-01T10:00:00Z',
+      from: [{ name: 'Mara', email: 'mara@example.com' }],
+      to: [{ name: 'Alex', email: 'alex@example.com' }],
+      subject: 'Hallo',
+      bodyValues: {},
+      ...extra,
+    })
+    vi.stubGlobal(
+      'fetch',
+      vi.fn<typeof fetch>(async (input, init) => {
+        if (String(input).endsWith('/jmap/session')) {
+          return new Response(
+            JSON.stringify({
+              apiUrl: draftContext.apiUrl,
+              downloadUrl: draftContext.downloadUrl,
+              primaryAccounts: { 'urn:ietf:params:jmap:mail': 'acc-1' },
+              capabilities: {},
+            }),
+          )
+        }
+        const [method, arguments_, callId] = JSON.parse(String(init?.body)).methodCalls[0]
+        if (method === 'Thread/get') {
+          return jmapResponse([
+            [method, { list: [{ id: 'thread-1', emailIds: ['a', 'd'] }] }, callId],
+          ])
+        }
+        if (method === 'Mailbox/get') {
+          return jmapResponse([
+            [method, { list: [{ id: 'inbox', name: 'Inbox', role: 'inbox' }] }, callId],
+          ])
+        }
+        expect(arguments_.properties).toContain('keywords')
+        return jmapResponse([
+          [
+            method,
+            {
+              list: [
+                message('a', {}),
+                message('d', {
+                  keywords: { $draft: true },
+                  mailboxIds: { drafts: true },
+                  receivedAt: '2026-08-01T11:00:00Z',
+                }),
+              ],
+            },
+            callId,
+          ],
+        ])
+      }),
+    )
+    const account = await fetchMailAccount('token')
+    const thread = await fetchThread(account.context, 'token', 'thread-1', account.mailboxes)
+    expect(thread.map((email) => email.id)).toEqual(['a'])
   })
 })

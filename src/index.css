@@ -3,22 +3,41 @@
   --surface: #1b1916;
   --surface-strong: #211f1b;
   --surface-muted: #2a2722;
+  --surface-raised: #302c26;
   --ink: #eee9df;
   --ink-soft: #aaa297;
+  --ink-faint: #7d766c;
   --line: #38342e;
   --line-strong: #575047;
   --accent: #b95d3f;
   --accent-dark: #e28a67;
   --accent-soft: #41291f;
   --olive: #a5b080;
+  --olive-soft: #25291f;
+  --olive-line: #596347;
+  --gold: #d4c08f;
+  --gold-soft: #30291d;
+  --gold-line: #6f6248;
   --danger: #e08478;
+  --danger-soft: #34201e;
+  --danger-line: #75443f;
   --focus: #db7654;
+  --font-sans:
+    "Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-serif: "Literata Variable", Literata, Georgia, "Times New Roman", serif;
+  --radius-sm: 6px;
+  --radius: 10px;
+  --radius-lg: 14px;
+  --shadow-pop: 0 14px 40px rgb(0 0 0 / 38%);
+  --shadow-panel: 0 24px 64px rgb(0 0 0 / 48%);
   color-scheme: dark;
   color: var(--ink);
   background: var(--canvas);
-  font-family:
-    Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
   font-synthesis: none;
+  font-feature-settings: "cv11", "ss01";
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
@@ -42,22 +61,31 @@ input,
 select,
 textarea {
   font: inherit;
+  color: inherit;
 }
 button,
 a {
   -webkit-tap-highlight-color: transparent;
 }
+a {
+  color: var(--accent-dark);
+}
 button:focus-visible,
 a:focus-visible,
 input:focus-visible,
 select:focus-visible,
-textarea:focus-visible {
+textarea:focus-visible,
+summary:focus-visible {
   outline: 3px solid color-mix(in srgb, var(--focus) 58%, transparent);
   outline-offset: 2px;
 }
 ::selection {
   color: var(--ink);
   background: #694132;
+}
+kbd {
+  font-family: var(--font-sans);
+  font-variant-numeric: tabular-nums;
 }
 
 .sr-only {
