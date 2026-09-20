@@ -61,15 +61,16 @@ entries in the meantime.
 
 ## Earlier upgrades
 
-Releases 0.9.x kept review rounds in the same database; see the release
-history for their migration notes. None of them require action before
-upgrading to 0.10.
+v0.9.6 moved the last deployment step into CI: the tag build hands off to the
+kub-homelab release deployer, which pins the new image by digest. Releases
+0.9.x kept review rounds in the same database; see the release history for
+their migration notes. None of them require action before upgrading to 0.10.
 
 ## Deployment path
 
 1. GitHub Actions runs on `arc-inbox-walk`, validates the project, boots a demo container, and publishes `ghcr.io/beastyrabbit/inbox-walk` for `v*` tags. The tag must match the package version.
 2. The Infisical Operator syncs the Fastmail token to namespace `tools`.
-3. Pin the verified image tag and digest in `cluster/homelab/apps/tools/inbox-walk/helmrelease.yaml` in `beastyrabbit/kub-homelab`. Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources.
+3. The `notify-homelab` job of the tag build dispatches `deploy-release.yaml` in `beastyrabbit/kub-homelab`. That workflow resolves the image digest from GHCR, pins `X.Y.Z@sha256:…` in `cluster/homelab/apps/tools/inbox-walk/helmrelease.yaml`, and pushes to `main`. Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources. Never edit the pin by hand; roll back with `git revert` of the deploy commit in kub-homelab.
 4. The tools Pangolin blueprint exposes `https://inbox-walk.heerlab.com` to the `BeastyOnly` role.
 5. Homepage lists the service under Additional Services.
 
