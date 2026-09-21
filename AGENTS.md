@@ -8,4 +8,4 @@
 - Never expose or print Fastmail, OpenAI, Infisical, or Forgejo credentials.
 - Run `pnpm check`, `pnpm build`, and the relevant Playwright tests for touched behavior.
 - Use the explicit `MAIL_REVIEW_DEMO=1` mode for automated tests; never call live providers from tests.
-- Deploy: push a v* tag. kub-homelab's deploy-release.yaml updates the cluster pin automatically; never edit kub-homelab by hand.
+- Deploy: push a v* tag. Flux image automation in kub-homelab picks up the new image within a few minutes; never edit kub-homelab by hand.
