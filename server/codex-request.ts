@@ -63,12 +63,13 @@ export async function refreshCodexCredentials(
       !Number.isFinite(value.expires_in) ||
       value.expires_in <= 0
     )
-      throw new Error()
+      throw new Error('Token response is missing required fields.')
     const parts = value.access_token.split('.')
-    if (parts.length !== 3) throw new Error()
+    if (parts.length !== 3) throw new Error('Access token is not a JWT.')
     const claims = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'))
     const accountId = claims['https://api.openai.com/auth']?.chatgpt_account_id
-    if (typeof accountId !== 'string' || !accountId) throw new Error()
+    if (typeof accountId !== 'string' || !accountId)
+      throw new Error('Access token has no account ID.')
     signal.throwIfAborted()
     const credentials: OAuthCredentials & { idToken?: string } = {
       access: value.access_token,

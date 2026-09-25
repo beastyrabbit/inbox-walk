@@ -14,7 +14,6 @@ import {
 } from '@earendil-works/pi-coding-agent'
 import { type Static, type TSchema, Type } from 'typebox'
 import {
-  type CodexModelId,
   type CodexSpeed,
   type CodexThinkingLevel,
   codexModelLabel,
@@ -34,11 +33,11 @@ import { codexRequestSignal, createCodexAuthStorage, withCodexRequest } from './
 import { abortable } from './io.ts'
 
 const CODEX_PROVIDER = 'openai-codex'
-const DEFAULT_CODEX_MODEL: CodexModelId = 'gpt-5.6-sol'
+const DEFAULT_CODEX_MODEL: string = 'gpt-5.6-sol'
 const DEFAULT_CODEX_THINKING_LEVEL: CodexThinkingLevel = 'high'
 const DEFAULT_CODEX_SPEED: CodexSpeed = 'standard'
 /** Unknown-to-Pi Codex models inherit this model's transport settings. */
-const CODEX_MODEL_TEMPLATE: CodexModelId = 'gpt-5.6-sol'
+const CODEX_MODEL_TEMPLATE: string = 'gpt-5.6-sol'
 /** Codex sends its `fast` service tier as this request value. */
 const CODEX_FAST_SERVICE_TIER = 'priority'
 export function finalCodexToolResult(text: string) {
@@ -97,14 +96,14 @@ async function requireCodexRequestAuth(
 }
 
 export interface CodexSettings {
-  model: CodexModelId
+  model: string
   thinkingLevel: CodexThinkingLevel
   speed: CodexSpeed
 }
 
 export type CodexSettingsSource = 'codex' | 'environment' | 'default'
 
-export function selectedCodexModel(): CodexModelId {
+export function selectedCodexModel(): string {
   return selectedCodexSettings().model
 }
 
@@ -139,11 +138,9 @@ export function resolvedCodexSettings(): {
     speed:
       configured.speed ?? (isCodexSpeed(environmentSpeed) ? environmentSpeed : DEFAULT_CODEX_SPEED),
   }
-  const source: CodexSettingsSource = configured.model
-    ? 'codex'
-    : isCodexModelId(environmentModel)
-      ? 'environment'
-      : 'default'
+  let source: CodexSettingsSource = 'default'
+  if (configured.model) source = 'codex'
+  else if (isCodexModelId(environmentModel)) source = 'environment'
   return { settings, source, path: configPath }
 }
 
@@ -153,7 +150,7 @@ type CodexModel = NonNullable<ReturnType<ModelRegistry['find']>>
  * Finds the configured model in Pi's catalog, or derives it from the Codex
  * model cache when Pi does not know the slug yet.
  */
-export function resolveCodexModel(registry: ModelRegistry, modelId: CodexModelId): CodexModel {
+export function resolveCodexModel(registry: ModelRegistry, modelId: string): CodexModel {
   const known = registry.find(CODEX_PROVIDER, modelId)
   if (known) return known
   const template = registry.find(CODEX_PROVIDER, CODEX_MODEL_TEMPLATE)

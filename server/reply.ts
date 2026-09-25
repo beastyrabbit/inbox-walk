@@ -91,6 +91,11 @@ function identityMatches(identity: MailIdentity, address: string) {
   return own === candidate
 }
 
+function primaryRecipients(target: ThreadMessage, targetFromIsSelf: boolean) {
+  if (targetFromIsSelf) return target.to
+  return target.replyTo.length > 0 ? target.replyTo : target.from
+}
+
 export function computeReplyRecipients(
   target: ThreadMessage,
   identities: MailIdentity[],
@@ -111,11 +116,7 @@ export function computeReplyRecipients(
   const targetFromIsSelf = target.from.some((address) =>
     concreteIdentities.some((item) => identityMatches(item, address.email)),
   )
-  const primary = targetFromIsSelf
-    ? target.to
-    : target.replyTo.length > 0
-      ? target.replyTo
-      : target.from
+  const primary = primaryRecipients(target, targetFromIsSelf)
   const to = uniqueAddresses([...primary, ...target.to], own)
   const toSet = new Set(to.map((address) => normalizeEmail(address.email)))
   const cc = uniqueAddresses(target.cc, new Set([...own, ...toSet]))
@@ -262,6 +263,89 @@ async function extractWithTika(
   return text
 }
 
+async function downloadAttachment(
+  download: typeof downloadBlob,
+  context: MailAccountContext,
+  token: string,
+  resource: MailResource,
+  maximumBytes: number,
+  signal: AbortSignal,
+) {
+  try {
+    const response = await abortable(download(context, token, resource, signal), signal)
+    return await readBoundedBody(response, maximumBytes, signal)
+  } catch (error) {
+    if (error instanceof IoError && error.code === 'RESPONSE_TOO_LARGE')
+      throw new ReplyError(
+        'Die Anhänge überschreiten das sichere Größenlimit.',
+        'ATTACHMENTS_TOO_LARGE',
+      )
+    if (error instanceof JmapError || error instanceof IoError) throw error
+    throw new ReplyError(
+      signal.aborted
+        ? 'Ein Anhang konnte nicht vollständig innerhalb des Zeitlimits geladen werden.'
+        : 'Ein Anhang konnte nicht vollständig geladen werden. Bitte erneut versuchen.',
+      signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_DOWNLOAD_FAILED',
+      undefined,
+      signal.aborted ? 504 : 502,
+      true,
+    )
+  }
+}
+
+function imageContent(resource: MailResource, mime: string, bytes: Buffer): ImageContent {
+  if (bytes.length > MAX_IMAGE_BYTES) {
+    throw new ReplyError(
+      `Das Bild „${resource.name}“ überschreitet das sichere Einzellimit von 20 MiB.`,
+      'IMAGE_TOO_LARGE',
+      { bytes: bytes.length, limit: MAX_IMAGE_BYTES, name: resource.name },
+    )
+  }
+  return { type: 'image', data: bytes.toString('base64'), mimeType: mime }
+}
+
+async function extractAttachmentText(
+  extractDocument: NonNullable<ReplyDependencies['extractDocument']>,
+  resource: MailResource,
+  bytes: Buffer,
+  extractionDeadline: number,
+  signal: AbortSignal,
+  remainingCharacters: number,
+) {
+  const extractionTimeRemaining = extractionDeadline - Date.now()
+  if (extractionTimeRemaining <= 0) {
+    throw new ReplyError(
+      'Das vollständige Auslesen aller Anhänge hat das Zeitlimit überschritten.',
+      'ATTACHMENT_EXTRACTION_TIMEOUT',
+      undefined,
+      504,
+    )
+  }
+  let text: string
+  try {
+    text = await abortable(
+      extractDocument(resource, bytes, extractionTimeRemaining, signal, remainingCharacters),
+      signal,
+    )
+  } catch (error) {
+    if (error instanceof ReplyError) throw error
+    throw new ReplyError(
+      'Ein Anhang konnte nicht vollständig ausgelesen werden.',
+      signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_EXTRACTION_FAILED',
+      undefined,
+      signal.aborted ? 504 : 502,
+      true,
+    )
+  }
+  if (bytes.length > 0 && !text.trim())
+    throw new ReplyError(
+      'Ein Anhang enthält keinen zuverlässig extrahierbaren Text.',
+      'ATTACHMENT_EXTRACTION_EMPTY',
+    )
+  return text
+}
+
+/** Loads every attachment completely or throws; no resource is ever skipped. */
 async function prepareAttachments(
   context: MailAccountContext,
   token: string,
@@ -280,34 +364,18 @@ async function prepareAttachments(
   let remainingCharacters = 1_000_000
   for (const resource of resources) {
     const mime = resource.type.toLowerCase().split(';')[0]?.trim() || 'application/octet-stream'
-    let bytes: Buffer
-    try {
-      const response = await abortable(download(context, token, resource, signal), signal)
-      bytes = await readBoundedBody(
-        response,
-        Math.min(
-          MAX_ATTACHMENT_BYTES - actualBytes,
-          IMAGE_TYPES.has(mime) ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES,
-        ),
-        signal,
-      )
-    } catch (error) {
-      if (error instanceof IoError && error.code === 'RESPONSE_TOO_LARGE')
-        throw new ReplyError(
-          'Die Anhänge überschreiten das sichere Größenlimit.',
-          'ATTACHMENTS_TOO_LARGE',
-        )
-      if (error instanceof JmapError || error instanceof IoError) throw error
-      throw new ReplyError(
-        signal.aborted
-          ? 'Ein Anhang konnte nicht vollständig innerhalb des Zeitlimits geladen werden.'
-          : 'Ein Anhang konnte nicht vollständig geladen werden. Bitte erneut versuchen.',
-        signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_DOWNLOAD_FAILED',
-        undefined,
-        signal.aborted ? 504 : 502,
-        true,
-      )
-    }
+    const isImage = IMAGE_TYPES.has(mime)
+    const bytes = await downloadAttachment(
+      download,
+      context,
+      token,
+      resource,
+      Math.min(
+        MAX_ATTACHMENT_BYTES - actualBytes,
+        isImage ? MAX_IMAGE_BYTES : MAX_ATTACHMENT_BYTES,
+      ),
+      signal,
+    )
     actualBytes += bytes.length
     if (actualBytes > MAX_ATTACHMENT_BYTES) {
       throw new ReplyError(
@@ -316,59 +384,31 @@ async function prepareAttachments(
         { bytes: actualBytes, limit: MAX_ATTACHMENT_BYTES },
       )
     }
-    if (IMAGE_TYPES.has(mime)) {
-      if (bytes.length > MAX_IMAGE_BYTES) {
-        throw new ReplyError(
-          `Das Bild „${resource.name}“ überschreitet das sichere Einzellimit von 20 MiB.`,
-          'IMAGE_TOO_LARGE',
-          { bytes: bytes.length, limit: MAX_IMAGE_BYTES, name: resource.name },
-        )
-      }
+    if (isImage) {
+      const image = imageContent(resource, mime, bytes)
       imageManifest.push({ index: images.length + 1, name: resource.name, type: mime })
-      images.push({ type: 'image', data: bytes.toString('base64'), mimeType: mime })
-    } else {
-      const extractionTimeRemaining = extractionDeadline - Date.now()
-      if (extractionTimeRemaining <= 0) {
-        throw new ReplyError(
-          'Das vollständige Auslesen aller Anhänge hat das Zeitlimit überschritten.',
-          'ATTACHMENT_EXTRACTION_TIMEOUT',
-          undefined,
-          504,
-        )
-      }
-      let text: string
-      try {
-        text = await abortable(
-          extractDocument(resource, bytes, extractionTimeRemaining, signal, remainingCharacters),
-          signal,
-        )
-      } catch (error) {
-        if (error instanceof ReplyError) throw error
-        throw new ReplyError(
-          'Ein Anhang konnte nicht vollständig ausgelesen werden.',
-          signal.aborted ? 'ATTACHMENT_EXTRACTION_TIMEOUT' : 'ATTACHMENT_EXTRACTION_FAILED',
-          undefined,
-          signal.aborted ? 504 : 502,
-          true,
-        )
-      }
-      if (bytes.length > 0 && !text.trim())
-        throw new ReplyError(
-          'Ein Anhang enthält keinen zuverlässig extrahierbaren Text.',
-          'ATTACHMENT_EXTRACTION_EMPTY',
-        )
-      remainingCharacters -= text.length
-      if (remainingCharacters < 0)
-        throw new ReplyError(
-          'Die Anhänge überschreiten das sichere Textlimit.',
-          'THREAD_TOO_LARGE_FOR_AI',
-        )
-      documents.push({
-        name: resource.name,
-        type: mime,
-        text,
-      })
+      images.push(image)
+      continue
     }
+    const text = await extractAttachmentText(
+      extractDocument,
+      resource,
+      bytes,
+      extractionDeadline,
+      signal,
+      remainingCharacters,
+    )
+    remainingCharacters -= text.length
+    if (remainingCharacters < 0)
+      throw new ReplyError(
+        'Die Anhänge überschreiten das sichere Textlimit.',
+        'THREAD_TOO_LARGE_FOR_AI',
+      )
+    documents.push({
+      name: resource.name,
+      type: mime,
+      text,
+    })
   }
   return { documents, imageManifest, images }
 }

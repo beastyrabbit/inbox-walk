@@ -162,7 +162,7 @@ function hoistHeadStyles(parsed: Document) {
 
 function blockImage(image: HTMLImageElement) {
   image.removeAttribute('src')
-  image.setAttribute('data-remote-image', 'blocked')
+  image.dataset.remoteImage = 'blocked'
   image.setAttribute('alt', image.getAttribute('alt') || 'Bild nicht verfügbar')
 }
 
@@ -209,6 +209,83 @@ function rewriteImages(
   }
 }
 
+const LINE_BREAKS = new Set(['\n', '\r', '\u2028', '\u2029'])
+
+type Span = { start: number; end: number } | null
+
+/**
+ * Caches the next span at or after a position. Callers pass increasing positions, so every
+ * character is scanned a bounded number of times.
+ */
+function forwardSearch(find: (from: number) => Span) {
+  let cached: Span | undefined
+  return (from: number) => {
+    if (cached === undefined || (cached !== null && cached.start < from)) cached = find(from)
+    return cached
+  }
+}
+
+function findLineBreak(value: string, from: number): Span {
+  for (let index = from; index < value.length; index += 1) {
+    if (LINE_BREAKS.has(value[index] ?? '')) return { start: index, end: index + 1 }
+  }
+  return null
+}
+
+/**
+ * Finds the earliest `quote\s*)` at or after `from`. The span starts where the reference's
+ * body ends: at the quote, or, without a quote, at the whitespace before the parenthesis.
+ */
+function findClosing(value: string, quote: string, from: number): Span {
+  if (!quote) {
+    const paren = value.indexOf(')', from)
+    if (paren === -1) return null
+    let start = paren
+    while (start > from && /\s/.test(value[start - 1] ?? '')) start -= 1
+    return { start, end: paren + 1 }
+  }
+  for (
+    let start = value.indexOf(quote, from);
+    start !== -1;
+    start = value.indexOf(quote, start + 1)
+  ) {
+    let paren = start + 1
+    while (paren < value.length && /\s/.test(value[paren] ?? '')) paren += 1
+    if (value[paren] === ')') return { start, end: paren + 1 }
+  }
+  return null
+}
+
+/**
+ * Replaces remote `url(…)` references with `none`, matching exactly what
+ * `/url\(\s*(['"]?)(?:https?:)?\/\/.*?\1\s*\)/gi` matched, but in linear time.
+ */
+function stripRemoteUrls(value: string) {
+  const opening = /url\(\s*(['"]?)(?:https?:)?\/\//gi
+  const closings: Record<string, (from: number) => Span> = {
+    '': forwardSearch((from) => findClosing(value, '', from)),
+    '"': forwardSearch((from) => findClosing(value, '"', from)),
+    "'": forwardSearch((from) => findClosing(value, "'", from)),
+  }
+  const lineBreak = forwardSearch((from) => findLineBreak(value, from))
+  let output = ''
+  let cursor = 0
+  for (let match = opening.exec(value); match; match = opening.exec(value)) {
+    const from = match.index + match[0].length
+    const closing = closings[match[1] ?? '']?.(from)
+    const nextLineBreak = lineBreak(from)
+    // The body before the closing may not span lines; only the trailing whitespace may.
+    if (closing && (!nextLineBreak || nextLineBreak.start >= closing.start)) {
+      output += `${value.slice(cursor, match.index)}none`
+      cursor = closing.end
+      opening.lastIndex = closing.end
+    } else {
+      opening.lastIndex = match.index + 1
+    }
+  }
+  return output + value.slice(cursor)
+}
+
 /** Removes every remaining way for the document to reach a remote host. */
 function stripRemoteReferences(parsed: Document) {
   for (const element of parsed.querySelectorAll('[srcset], [background], [poster]')) {
@@ -219,15 +296,13 @@ function stripRemoteReferences(parsed: Document) {
   for (const element of parsed.querySelectorAll('[src]')) {
     if (element.tagName.toLowerCase() !== 'img') element.removeAttribute('src')
   }
-  for (const element of parsed.querySelectorAll('[href], [xlink\\:href]')) {
+  for (const element of parsed.querySelectorAll(String.raw`[href], [xlink\:href]`)) {
     if (element.tagName.toLowerCase() === 'a') continue
     for (const attribute of ['href', 'xlink:href']) {
       const value = element.getAttribute(attribute) ?? ''
       if (/^(?:https?:)?\/\//i.test(value)) element.removeAttribute(attribute)
     }
   }
-  const stripRemoteUrls = (value: string) =>
-    value.replace(/url\(\s*(['"]?)(?:https?:)?\/\/.*?\1\s*\)/gi, 'none')
   for (const element of parsed.querySelectorAll<HTMLElement>('[style]')) {
     element.setAttribute('style', stripRemoteUrls(element.getAttribute('style') || ''))
   }

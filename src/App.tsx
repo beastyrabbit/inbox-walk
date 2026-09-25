@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { api, blobUrl, ClientApiError, type CodexSettings } from './api.ts'
 import { emailDocument, type MailColorMode } from './email-document.ts'
@@ -1686,13 +1686,13 @@ function RefreshIcon() {
 }
 
 function HelpDialog({ onClose }: Readonly<{ onClose: () => void }>) {
-  const dialogRef = useFocusRegion<HTMLElement>(true)
+  const dialogRef = useFocusRegion<HTMLDialogElement>(true)
   return (
     <div className="dialog-backdrop">
-      <section
+      <dialog
         ref={dialogRef}
+        open
         className="dialog help-dialog"
-        role="dialog"
         aria-modal="true"
         aria-labelledby="help-title"
         tabIndex={-1}
@@ -1747,7 +1747,7 @@ function HelpDialog({ onClose }: Readonly<{ onClose: () => void }>) {
             <dd>Panel schließen</dd>
           </div>
         </dl>
-      </section>
+      </dialog>
     </div>
   )
 }
@@ -1801,23 +1801,29 @@ function SettingsDialog({
   onSaveMemory: (notes: string) => void
   onStartLogin: () => void
 }>) {
-  const dialogRef = useFocusRegion<HTMLElement>(true)
+  const dialogRef = useFocusRegion<HTMLDialogElement>(true)
   const [notes, setNotes] = useState(memory.notes)
   useEffect(() => setNotes(memory.notes), [memory.notes])
+  useEffect(() => {
+    const dialog = dialogRef.current
+    if (!dialog) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose()
+    }
+    dialog.addEventListener('keydown', onKeyDown)
+    return () => dialog.removeEventListener('keydown', onKeyDown)
+  }, [dialogRef, onClose])
   const waiting = login?.status === 'starting' || login?.status === 'waiting'
   const codexLogin = codex.authSource === 'codex'
   const modelLabel = codex.modelLabel ?? codexModelLabel(codex.model) ?? codex.model
   return (
     <div className="dialog-backdrop">
-      <section
+      <dialog
         ref={dialogRef}
+        open
         className="dialog settings-dialog"
-        role="dialog"
         aria-modal="true"
         aria-labelledby="settings-title"
-        onKeyDown={(event) => {
-          if (event.key === 'Escape') onClose()
-        }}
         tabIndex={-1}
       >
         <div className="dialog-header">
@@ -1963,7 +1969,7 @@ function SettingsDialog({
             Schließen
           </button>
         </div>
-      </section>
+      </dialog>
     </div>
   )
 }
@@ -1992,7 +1998,31 @@ function ReplyPanel({
   onUpdate: (patch: Partial<ReplyEditorState>) => void
 }>) {
   const panelRef = useFocusRegion<HTMLElement>(false)
-  const identity = context?.identities.find((item) => item.id === editor?.identityId)
+  let body: ReactNode
+  if (loading && !editor) {
+    body = (
+      <div className="panel-loading">
+        <div className="spinner" />
+        <span>Thread wird geladen …</span>
+      </div>
+    )
+  } else if (editor && context) {
+    body = (
+      <ReplyForm
+        context={context}
+        draftResult={draftResult}
+        editor={editor}
+        loading={loading}
+        proposal={proposal}
+        submitting={submitting}
+        onGenerate={onGenerate}
+        onSave={onSave}
+        onUpdate={onUpdate}
+      />
+    )
+  } else {
+    body = <p className="panel-error">Antwortkontext ist nicht verfügbar.</p>
+  }
   return (
     <aside ref={panelRef} className="reply-panel" aria-label="Antwortentwurf" tabIndex={-1}>
       <div className="reply-header">
@@ -2009,155 +2039,174 @@ function ReplyPanel({
           ×
         </button>
       </div>
-      {loading && !editor ? (
-        <div className="panel-loading">
-          <div className="spinner" />
-          <span>Thread wird geladen …</span>
-        </div>
-      ) : editor && context ? (
-        <div className="reply-form">
-          <section className="context-note">
-            <strong>Kontext für Codex</strong>
-            <p>
-              Alle {context.messages.length} Thread-Nachrichten und alle{' '}
-              {context.attachmentManifest.length} Anhänge werden automatisch berücksichtigt. Wenn
-              eine Datei nicht verarbeitet werden kann, wird kein Entwurf erzeugt.
-            </p>
-            {context.attachmentManifest.length > 0 && (
-              <ul>
-                {context.attachmentManifest.map((attachment) => (
-                  <li key={attachment.blobId}>
-                    {attachment.name} · {formatBytes(attachment.size)}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </section>
+      {body}
+    </aside>
+  )
+}
+
+function generateButtonLabel(loading: boolean, hasDraft: boolean) {
+  if (loading) return 'Entwurf wird erstellt …'
+  return hasDraft ? 'Entwurf neu erstellen' : 'Entwurf erstellen'
+}
+
+function ReplyForm({
+  context,
+  draftResult,
+  editor,
+  loading,
+  proposal,
+  submitting,
+  onGenerate,
+  onSave,
+  onUpdate,
+}: Readonly<{
+  context: ThreadContext
+  draftResult?: DraftResult
+  editor: ReplyEditorState
+  loading: boolean
+  proposal?: ReplyProposal
+  submitting: boolean
+  onGenerate: () => void
+  onSave: () => void
+  onUpdate: (patch: Partial<ReplyEditorState>) => void
+}>) {
+  const identity = context.identities.find((item) => item.id === editor.identityId)
+  return (
+    <div className="reply-form">
+      <section className="context-note">
+        <strong>Kontext für Codex</strong>
+        <p>
+          Alle {context.messages.length} Thread-Nachrichten und alle{' '}
+          {context.attachmentManifest.length} Anhänge werden automatisch berücksichtigt. Wenn eine
+          Datei nicht verarbeitet werden kann, wird kein Entwurf erzeugt.
+        </p>
+        {context.attachmentManifest.length > 0 && (
+          <ul>
+            {context.attachmentManifest.map((attachment) => (
+              <li key={attachment.blobId}>
+                {attachment.name} · {formatBytes(attachment.size)}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+      <label>
+        {'Von'}
+        <select
+          value={editor.identityId}
+          onChange={(event) => onUpdate({ identityId: event.target.value })}
+        >
+          {context.identities.map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.name ? `${item.name} <${item.email}>` : item.email}
+            </option>
+          ))}
+        </select>
+      </label>
+      <label>
+        {'An'}
+        <input
+          type="text"
+          value={editor.toText ?? addressesToText(editor.to)}
+          onChange={(event) => onUpdate({ toText: event.target.value })}
+        />
+      </label>
+      <label>
+        {'Cc'}
+        <input
+          type="text"
+          value={editor.ccText ?? addressesToText(editor.cc)}
+          onChange={(event) => onUpdate({ ccText: event.target.value })}
+        />
+      </label>
+      <label>
+        {'Betreff'}
+        <input
+          type="text"
+          value={editor.subject}
+          onChange={(event) => onUpdate({ subject: event.target.value })}
+        />
+      </label>
+      <label>
+        {'Was soll die Antwort sagen?'}
+        <textarea
+          data-autofocus
+          rows={4}
+          value={editor.roughNotes}
+          onChange={(event) => onUpdate({ roughNotes: event.target.value })}
+          placeholder="Stichpunkte, Ton und wichtige Fakten …"
+        />
+      </label>
+      <button
+        type="button"
+        className="button secondary full"
+        onClick={onGenerate}
+        disabled={loading}
+      >
+        {generateButtonLabel(loading, Boolean(editor.bodyText))}
+      </button>
+      {editor.bodyText && (
+        <>
           <label>
-            Von
-            <select
-              value={editor.identityId}
-              onChange={(event) => onUpdate({ identityId: event.target.value })}
-            >
-              {context.identities.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name ? `${item.name} <${item.email}>` : item.email}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            An
-            <input
-              type="text"
-              value={editor.toText ?? addressesToText(editor.to)}
-              onChange={(event) => onUpdate({ toText: event.target.value })}
-            />
-          </label>
-          <label>
-            Cc
-            <input
-              type="text"
-              value={editor.ccText ?? addressesToText(editor.cc)}
-              onChange={(event) => onUpdate({ ccText: event.target.value })}
-            />
-          </label>
-          <label>
-            Betreff
-            <input
-              type="text"
-              value={editor.subject}
-              onChange={(event) => onUpdate({ subject: event.target.value })}
-            />
-          </label>
-          <label>
-            Was soll die Antwort sagen?
+            {'Antwort'}
             <textarea
-              data-autofocus
-              rows={4}
-              value={editor.roughNotes}
-              onChange={(event) => onUpdate({ roughNotes: event.target.value })}
-              placeholder="Stichpunkte, Ton und wichtige Fakten …"
+              className="draft-body"
+              rows={12}
+              value={editor.bodyText}
+              onChange={(event) => onUpdate({ bodyText: event.target.value })}
+            />
+          </label>
+          <label>
+            {'Korrekturwunsch'}
+            <textarea
+              rows={3}
+              value={editor.revisionInstruction}
+              onChange={(event) => onUpdate({ revisionInstruction: event.target.value })}
+              placeholder="Optional: kürzer, wärmer, ergänze …"
             />
           </label>
           <button
             type="button"
-            className="button secondary full"
+            className="text-button revise"
             onClick={onGenerate}
-            disabled={loading}
+            disabled={loading || !editor.revisionInstruction.trim()}
           >
-            {loading
-              ? 'Entwurf wird erstellt …'
-              : editor.bodyText
-                ? 'Entwurf neu erstellen'
-                : 'Entwurf erstellen'}
+            Korrektur anwenden
           </button>
-          {editor.bodyText && (
-            <>
-              <label>
-                Antwort
-                <textarea
-                  className="draft-body"
-                  rows={12}
-                  value={editor.bodyText}
-                  onChange={(event) => onUpdate({ bodyText: event.target.value })}
-                />
-              </label>
-              <label>
-                Korrekturwunsch
-                <textarea
-                  rows={3}
-                  value={editor.revisionInstruction}
-                  onChange={(event) => onUpdate({ revisionInstruction: event.target.value })}
-                  placeholder="Optional: kürzer, wärmer, ergänze …"
-                />
-              </label>
-              <button
-                type="button"
-                className="text-button revise"
-                onClick={onGenerate}
-                disabled={loading || !editor.revisionInstruction.trim()}
-              >
-                Korrektur anwenden
-              </button>
-              {proposal && (proposal.warnings.length > 0 || proposal.questions.length > 0) && (
-                <section className="proposal-notes">
-                  {proposal.warnings.map((warning) => (
-                    <p key={warning}>{warning}</p>
-                  ))}
-                  {proposal.questions.map((question) => (
-                    <p key={question}>Offen: {question}</p>
-                  ))}
-                </section>
-              )}
-              {identity && (identity.textSignature || identity.htmlSignature) && (
-                <section className="signature-preview">
-                  <strong>Fastmail-Signatur</strong>
-                  <pre>{identity.textSignature || 'Formatierte HTML-Signatur'}</pre>
-                </section>
-              )}
-              <button
-                type="button"
-                className="button primary full"
-                onClick={onSave}
-                disabled={submitting}
-              >
-                {submitting ? 'Draft wird gespeichert …' : 'In Fastmail als Draft speichern'}
-              </button>
-              <p className="no-send-note">Inbox Walk kann keine Nachricht senden.</p>
-            </>
+          {proposal && (proposal.warnings.length > 0 || proposal.questions.length > 0) && (
+            <section className="proposal-notes">
+              {proposal.warnings.map((warning) => (
+                <p key={warning}>{warning}</p>
+              ))}
+              {proposal.questions.map((question) => (
+                <p key={question}>Offen: {question}</p>
+              ))}
+            </section>
           )}
-          {draftResult && (
-            <p className="draft-success" role="status">
-              Draft gespeichert und verifiziert
-              {draftResult.recovered ? ' (nach Wiederherstellung)' : ''}.
-            </p>
+          {identity && (identity.textSignature || identity.htmlSignature) && (
+            <section className="signature-preview">
+              <strong>Fastmail-Signatur</strong>
+              <pre>{identity.textSignature || 'Formatierte HTML-Signatur'}</pre>
+            </section>
           )}
-        </div>
-      ) : (
-        <p className="panel-error">Antwortkontext ist nicht verfügbar.</p>
+          <button
+            type="button"
+            className="button primary full"
+            onClick={onSave}
+            disabled={submitting}
+          >
+            {submitting ? 'Draft wird gespeichert …' : 'In Fastmail als Draft speichern'}
+          </button>
+          <p className="no-send-note">Inbox Walk kann keine Nachricht senden.</p>
+        </>
       )}
-    </aside>
+      {draftResult && (
+        <output className="draft-success">
+          Draft gespeichert und verifiziert
+          {draftResult.recovered ? ' (nach Wiederherstellung)' : ''}.
+        </output>
+      )}
+    </div>
   )
 }
 

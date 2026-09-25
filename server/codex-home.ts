@@ -49,12 +49,13 @@ export function parseCodexToml(content: string) {
   for (const rawLine of content.split(/\r?\n/)) {
     const line = stripTomlComment(rawLine).trim()
     if (!line) continue
-    const header = /^\[\[?\s*(.+?)\s*\]\]?$/.exec(line)
-    if (header) {
-      table = normalizeTomlTableName(header[1])
+    const header = tomlTableHeader(line)
+    if (header !== undefined) {
+      table = normalizeTomlTableName(header)
       continue
     }
-    const assignment = /^([A-Za-z0-9_-]+|"[^"]*")\s*=\s*(.+)$/.exec(line)
+    // `line` is trimmed, so a value always ends with a non-space character.
+    const assignment = /^([A-Za-z0-9_-]+|"[^"]*")\s*=\s*(\S.*)$/.exec(line)
     if (!assignment) continue
     const key = assignment[1].replace(/^"|"$/g, '')
     const value = parseTomlScalar(assignment[2].trim())
@@ -67,6 +68,35 @@ export function parseCodexToml(content: string) {
     entries.set(key, value)
   }
   return tables
+}
+
+const LINE_TERMINATOR = /[\n\r\u2028\u2029]/
+
+/**
+ * Table name of a `[table]` or `[[array]]` header, or undefined for other
+ * lines. Captures what /^\[\[?\s*(.+?)\s*\]\]?$/ captures, without its
+ * super-linear backtracking.
+ */
+function tomlTableHeader(line: string) {
+  if (!line.startsWith('[') || !line.endsWith(']')) return undefined
+  for (const opening of line[1] === '[' ? [2, 1] : [1]) {
+    const name = tomlHeaderName(line.slice(opening, -1))
+    if (name !== undefined) return name
+  }
+  return undefined
+}
+
+/** Header text between the opening bracket(s) and the final `]`. */
+function tomlHeaderName(inner: string) {
+  const closing = inner.endsWith(']')
+  const name = (closing ? inner.slice(0, -1) : inner).trim()
+  if (name) return LINE_TERMINATOR.test(name) ? undefined : name
+  if (closing) return ']'
+  // Only whitespace: the pattern captures the last character that is not a line break.
+  for (let index = inner.length - 1; index >= 0; index -= 1) {
+    if (!LINE_TERMINATOR.test(inner[index])) return inner[index]
+  }
+  return undefined
 }
 
 function normalizeTomlTableName(name: string) {
@@ -170,42 +200,53 @@ export interface CodexCatalogModel {
   fastAvailable: boolean
 }
 
-export function codexModelCatalog(content: string): CodexCatalogModel[] {
+function modelsCacheEntries(content: string): unknown[] {
   let parsed: unknown
   try {
     parsed = JSON.parse(content)
   } catch {
     return []
   }
-  const models =
-    parsed && typeof parsed === 'object' && Array.isArray((parsed as { models?: unknown }).models)
-      ? ((parsed as { models: unknown[] }).models as unknown[])
-      : []
+  return parsed &&
+    typeof parsed === 'object' &&
+    Array.isArray((parsed as { models?: unknown }).models)
+    ? ((parsed as { models: unknown[] }).models as unknown[])
+    : []
+}
+
+function hasFastTier(model: Record<string, unknown>) {
+  const tiers = Array.isArray(model.service_tiers) ? model.service_tiers : []
+  const speedTiers = Array.isArray(model.additional_speed_tiers) ? model.additional_speed_tiers : []
+  return (
+    speedTiers.includes('fast') ||
+    tiers.some(
+      (tier) => tier && typeof tier === 'object' && (tier as { id?: unknown }).id === 'priority',
+    )
+  )
+}
+
+function codexCatalogModel(entry: unknown): CodexCatalogModel | undefined {
+  if (!entry || typeof entry !== 'object') return undefined
+  const model = entry as Record<string, unknown>
+  if (!isCodexModelId(model.slug) || model.visibility === 'hide') return undefined
+  const modalities = Array.isArray(model.input_modalities) ? model.input_modalities : ['text']
+  return {
+    id: model.slug,
+    label: typeof model.display_name === 'string' ? model.display_name : model.slug,
+    description: typeof model.description === 'string' ? model.description : '',
+    ...(typeof model.context_window === 'number' && model.context_window > 0
+      ? { contextWindow: model.context_window }
+      : {}),
+    supportsImages: modalities.includes('image'),
+    fastAvailable: hasFastTier(model),
+  }
+}
+
+export function codexModelCatalog(content: string): CodexCatalogModel[] {
   const catalog: CodexCatalogModel[] = []
-  for (const entry of models) {
-    if (!entry || typeof entry !== 'object') continue
-    const model = entry as Record<string, unknown>
-    if (!isCodexModelId(model.slug) || model.visibility === 'hide') continue
-    const tiers = Array.isArray(model.service_tiers) ? model.service_tiers : []
-    const speedTiers = Array.isArray(model.additional_speed_tiers)
-      ? model.additional_speed_tiers
-      : []
-    const modalities = Array.isArray(model.input_modalities) ? model.input_modalities : ['text']
-    catalog.push({
-      id: model.slug,
-      label: typeof model.display_name === 'string' ? model.display_name : model.slug,
-      description: typeof model.description === 'string' ? model.description : '',
-      ...(typeof model.context_window === 'number' && model.context_window > 0
-        ? { contextWindow: model.context_window }
-        : {}),
-      supportsImages: modalities.includes('image'),
-      fastAvailable:
-        speedTiers.includes('fast') ||
-        tiers.some(
-          (tier) =>
-            tier && typeof tier === 'object' && (tier as { id?: unknown }).id === 'priority',
-        ),
-    })
+  for (const entry of modelsCacheEntries(content)) {
+    const model = codexCatalogModel(entry)
+    if (model) catalog.push(model)
   }
   return catalog
 }
@@ -272,18 +313,18 @@ function accessTokenAccountId(accessToken: string) {
   return typeof accountId === 'string' && accountId ? accountId : undefined
 }
 
+function codexAccountId(tokens: CodexAuthFile['tokens'], access: string) {
+  if (typeof tokens?.account_id === 'string' && tokens.account_id) return tokens.account_id
+  return access ? accessTokenAccountId(access) : undefined
+}
+
 /** Pi's auth.json representation of the ChatGPT login stored by Codex. */
 export function codexAuthToPiStorage(content: string | undefined): string {
   const file = parseCodexAuthFile(content)
   const tokens = file.tokens
   const access = typeof tokens?.access_token === 'string' ? tokens.access_token : ''
   const refresh = typeof tokens?.refresh_token === 'string' ? tokens.refresh_token : ''
-  const accountId =
-    typeof tokens?.account_id === 'string' && tokens.account_id
-      ? tokens.account_id
-      : access
-        ? accessTokenAccountId(access)
-        : undefined
+  const accountId = codexAccountId(tokens, access)
   if (file.auth_mode !== 'chatgpt' || !access || !refresh || !accountId) return '{}'
   return JSON.stringify({
     [PI_PROVIDER]: {

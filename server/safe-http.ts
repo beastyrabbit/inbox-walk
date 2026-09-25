@@ -61,9 +61,9 @@ function isBlockedAddress(address: string) {
   }
 
   const normalized = address.toLowerCase()
-  const mapped = normalized.match(/::ffff:(\d+\.\d+\.\d+\.\d+)$/)?.[1]
+  const mapped = /::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(normalized)?.[1]
   if (mapped) return isBlockedAddress(mapped)
-  const mappedHex = normalized.match(/^(?:::ffff:|0:0:0:0:0:ffff:)([\da-f]{1,4}):([\da-f]{1,4})$/)
+  const mappedHex = /^(?:::ffff:|0:0:0:0:0:ffff:)([\da-f]{1,4}):([\da-f]{1,4})$/.exec(normalized)
   if (mappedHex) {
     const high = Number.parseInt(mappedHex[1] ?? '', 16)
     const low = Number.parseInt(mappedHex[2] ?? '', 16)
