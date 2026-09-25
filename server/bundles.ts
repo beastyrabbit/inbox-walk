@@ -36,9 +36,8 @@ function senderDomain(email: ReviewEmailSummary) {
 }
 
 function providerFor(email: ReviewEmailSummary) {
-  const haystack = normalized(
-    `${email.from.map((item) => `${item.name ?? ''} ${item.email ?? ''}`).join(' ')} ${email.subject}`,
-  )
+  const senders = email.from.map((item) => `${item.name ?? ''} ${item.email ?? ''}`).join(' ')
+  const haystack = normalized(`${senders} ${email.subject}`)
   if (/github/.test(haystack)) return 'GitHub'
   if (/railway/.test(haystack)) return 'Railway'
   if (/amazon/.test(haystack)) return 'Amazon'
@@ -47,10 +46,30 @@ function providerFor(email: ReviewEmailSummary) {
   return email.from[0]?.name?.trim() || senderDomain(email) || 'E-Mail'
 }
 
+const TRAILING_PUNCTUATION = new Set([')', ',', '.', ';'])
+
+function trimTrailingPunctuation(value: string) {
+  let end = value.length
+  while (end > 0 && TRAILING_PUNCTUATION.has(value[end - 1] ?? '')) end--
+  return value.slice(0, end)
+}
+
+// Optional separator between a label and its identifier, e.g. " #: ".
+const LABEL_SEPARATOR = String.raw`\s*(?:[#:-]+\s*)?`
+const TRACKING_PATTERN = new RegExp(
+  String.raw`\b(?:tracking|sendungs(?:nummer|nr\.?))${LABEL_SEPARATOR}([a-z0-9][a-z0-9-]{7,})\b`,
+  'g',
+)
+const ORDER_LABEL = String.raw`\b(?:order|bestell(?:ung|nummer|nr\.?))(?:\s+(?:nr\.?|nummer))?`
+const ORDER_PATTERN = new RegExp(
+  String.raw`${ORDER_LABEL}${LABEL_SEPARATOR}([a-z0-9][a-z0-9-]{4,})\b`,
+  'g',
+)
+
 function matches(text: string, pattern: RegExp, prefix: string) {
   const found: string[] = []
   for (const match of text.matchAll(pattern)) {
-    const value = match[1]?.replace(/[),.;]+$/, '').toLowerCase()
+    const value = match[1] && trimTrailingPunctuation(match[1]).toLowerCase()
     if (value) found.push(`${prefix}:${value}`)
   }
   return found
@@ -77,17 +96,11 @@ export function extractBundleSignals(email: ReviewEmailSummary): BundleSignals {
     /\b(?:deployment|deploy)(?: id)?\s*[#:\-/]\s*([a-z0-9][a-z0-9_-]{5,})\b/g,
     'deployment',
   )
-  const tracking = matches(
-    text,
-    /\b(?:tracking|sendungs(?:nummer|nr\.?))\s*[#:-]*\s*([a-z0-9][a-z0-9-]{7,})\b/g,
-    'tracking',
+  const tracking = matches(text, TRACKING_PATTERN, 'tracking')
+  const orders = matches(text, ORDER_PATTERN, 'order').filter((key) =>
+    /\d/.test(key.slice('order:'.length)),
   )
-  const orders = matches(
-    text,
-    /\b(?:order|bestell(?:ung|nummer|nr\.?))(?:\s+(?:nr\.?|nummer))?\s*[#:-]*\s*([a-z0-9][a-z0-9-]{4,})\b/g,
-    'order',
-  ).filter((key) => /\d/.test(key.slice('order:'.length)))
-  const pullRequests = matches(text, /\b(?:pull request|pr)\s*#?\s*(\d{1,8})\b/g, 'pr')
+  const pullRequests = matches(text, /\b(?:pull request|pr)\s*(?:#\s*)?(\d{1,8})\b/g, 'pr')
   const exactKeys = unique([
     `thread:${email.threadId}`,
     ...deployments,
@@ -163,6 +176,14 @@ function hardConflict(
   return false
 }
 
+function currentStateFor(latestText: string, memberCount: number) {
+  if (/success|successful|healthy|erfolgreich|zugestellt|delivered/.test(latestText)) {
+    return 'Erfolgreich'
+  }
+  if (/fail|failed|error|fehler|fehlgeschlagen/.test(latestText)) return 'Fehlgeschlagen'
+  return memberCount === 1 ? 'Einzelne Nachricht' : 'Letzter Stand'
+}
+
 function heuristicMetadata(
   members: readonly ReviewEmailSummary[],
   signals: Map<string, BundleSignals>,
@@ -173,17 +194,8 @@ function heuristicMetadata(
   if (!latest) throw new Error('Cannot describe an empty bundle')
   const providers = unique(members.map((member) => signals.get(member.id)?.provider ?? 'E-Mail'))
   const latestText = normalized(`${latest.subject} ${latest.preview}`)
-  const currentState = /success|successful|healthy|erfolgreich|zugestellt|delivered/.test(
-    latestText,
-  )
-    ? 'Erfolgreich'
-    : /fail|failed|error|fehler|fehlgeschlagen/.test(latestText)
-      ? 'Fehlgeschlagen'
-      : members.length === 1
-        ? 'Einzelne Nachricht'
-        : 'Letzter Stand'
   return {
-    currentState,
+    currentState: currentStateFor(latestText, members.length),
     kind: defaultKind(providers),
     linkEvidence: unique(
       members

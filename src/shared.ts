@@ -80,9 +80,6 @@ export const codexModels = [
   },
 ] as const
 
-/** Any model slug Codex can be configured with; known slugs get a short label. */
-export type CodexModelId = string
-
 export function codexModelLabel(id: string | undefined) {
   if (!id) return undefined
   return codexModels.find((model) => model.id === id)?.label ?? id
@@ -101,7 +98,7 @@ export const codexThinkingLevels = [
 export type CodexThinkingLevel = (typeof codexThinkingLevels)[number]
 
 export function isCodexThinkingLevel(value: unknown): value is CodexThinkingLevel {
-  return codexThinkingLevels.some((level) => level === value)
+  return (codexThinkingLevels as readonly unknown[]).includes(value)
 }
 
 export const codexSpeeds = ['standard', 'fast'] as const
@@ -109,10 +106,11 @@ export const codexSpeeds = ['standard', 'fast'] as const
 export type CodexSpeed = (typeof codexSpeeds)[number]
 
 export function isCodexSpeed(value: unknown): value is CodexSpeed {
-  return codexSpeeds.some((speed) => speed === value)
+  return (codexSpeeds as readonly unknown[]).includes(value)
 }
 
-export function isCodexModelId(value: unknown): value is CodexModelId {
+/** Any model slug Codex can be configured with; known slugs get a short label. */
+export function isCodexModelId(value: unknown): value is string {
   return typeof value === 'string' && /^[a-z0-9][a-z0-9._-]{0,79}$/i.test(value)
 }
 
@@ -121,7 +119,7 @@ export type CodexAuthSource = 'codex' | 'pi'
 
 export interface CodexAuthStatus {
   configured: boolean
-  model: CodexModelId
+  model: string
   modelLabel?: string
   thinkingLevel?: CodexThinkingLevel
   speed?: CodexSpeed

@@ -285,9 +285,7 @@ function decodeHtmlAttribute(value: string) {
     .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) =>
       String.fromCodePoint(Number.parseInt(code, 16)),
     )
-    .replace(/&#([0-9]+);/g, (_match, code: string) =>
-      String.fromCodePoint(Number.parseInt(code, 10)),
-    )
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number.parseInt(code, 10)))
 }
 
 function normalizedRemoteImageSource(value: string) {
@@ -754,7 +752,8 @@ async function draft(
     const htmlSignature = identity.htmlSignature.trim()
       ? identity.htmlSignature
       : escapeDraftHtml(identity.textSignature.trim())
-    const bodyHtml = `${escapeDraftHtml(parsed.data.bodyText.trim())}${htmlSignature ? `<br><br>${htmlSignature}` : ''}`
+    const signatureHtml = htmlSignature ? `<br><br>${htmlSignature}` : ''
+    const bodyHtml = `${escapeDraftHtml(parsed.data.bodyText.trim())}${signatureHtml}`
     const references = [...new Set([...latest.references, ...latest.messageId])]
     return await mailbox.createDraft({
       bodyHtml,

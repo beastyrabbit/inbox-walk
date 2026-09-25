@@ -1013,6 +1013,12 @@
 }
 
 .dialog {
+  /* Undo the user-agent <dialog> defaults; the backdrop grid positions it. */
+  position: static;
+  height: auto;
+  max-width: none;
+  margin: 0;
+  color: inherit;
   width: min(470px, 100%);
   max-height: calc(100dvh - 40px);
   overflow-y: auto;
@@ -1401,6 +1407,7 @@
 }
 
 .draft-success {
+  display: block;
   margin: 14px 0 0;
   padding: 10px 12px;
   border: 1px solid var(--olive-line);

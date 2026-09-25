@@ -894,18 +894,26 @@ export async function markEmailsRead(
         },
       )
     }
-    const result = responseFor(responses, 'mark-read')
-    const notUpdated = result.notUpdated ?? {}
-    const updated = new Set(Object.keys(result.updated ?? {}))
-    for (const id of batch) {
-      if (updated.has(id)) markedIds.push(id)
-      else if (notUpdated[id])
-        failed.push({ id, reason: notUpdated[id].description ?? notUpdated[id].type })
-      else failed.push({ id, reason: 'Fastmail hat die Änderung nicht bestätigt.' })
-    }
+    collectSetOutcome(batch, responseFor(responses, 'mark-read'), markedIds, failed)
     onProgress?.({ failed: [...failed], markedIds: [...markedIds] })
   }
   return { failed, markedIds }
+}
+
+function collectSetOutcome(
+  batch: readonly string[],
+  result: MethodResponse<never>,
+  succeededIds: string[],
+  failed: { id: string; reason: string }[],
+) {
+  const notUpdated = result.notUpdated ?? {}
+  const updated = new Set(Object.keys(result.updated ?? {}))
+  for (const id of batch) {
+    if (updated.has(id)) succeededIds.push(id)
+    else if (notUpdated[id])
+      failed.push({ id, reason: notUpdated[id].description ?? notUpdated[id].type })
+    else failed.push({ id, reason: 'Fastmail hat die Änderung nicht bestätigt.' })
+  }
 }
 
 function patchPathSegment(value: string) {
@@ -1003,15 +1011,7 @@ async function updateMailboxMembership(
         },
       )
     }
-    const result = responseFor(responses, callId)
-    const notUpdated = result.notUpdated ?? {}
-    const updated = new Set(Object.keys(result.updated ?? {}))
-    for (const id of batch) {
-      if (updated.has(id)) succeededIds.push(id)
-      else if (notUpdated[id])
-        failed.push({ id, reason: notUpdated[id].description ?? notUpdated[id].type })
-      else failed.push({ id, reason: 'Fastmail hat die Änderung nicht bestätigt.' })
-    }
+    collectSetOutcome(batch, responseFor(responses, callId), succeededIds, failed)
     onProgress?.({ failed: [...failed], succeededIds: [...succeededIds] })
   }
   return { failed, succeededIds }
@@ -1137,12 +1137,12 @@ export async function downloadBlob(
 function normalizedAddresses(addresses: readonly { email: string }[]) {
   return addresses
     .map((address) => address.email.trim().toLowerCase())
-    .sort()
+    .sort((a, b) => (a < b ? -1 : Number(a > b)))
     .join(',')
 }
 
 function normalizeText(value: string) {
-  return value.replace(/\r\n/g, '\n').trim()
+  return value.replaceAll('\r\n', '\n').trim()
 }
 
 async function getDraftMailbox(context: MailAccountContext, token: string) {
