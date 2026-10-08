@@ -1,0 +1,27 @@
+{
+  "$schema": "https://t3.codes/schema/t3.json",
+  "defaultThreadEnvMode": "worktree",
+  "scripts": [
+    {
+      "name": "Setup worktree",
+      "command": "corepack pnpm install --frozen-lockfile",
+      "icon": "configure",
+      "runOnWorktreeCreate": true
+    },
+    {
+      "name": "Start dev server",
+      "command": "pnpm dev",
+      "icon": "play"
+    },
+    {
+      "name": "Run checks",
+      "command": "pnpm check",
+      "icon": "test"
+    },
+    {
+      "name": "Build",
+      "command": "pnpm build",
+      "icon": "build"
+    }
+  ]
+}
