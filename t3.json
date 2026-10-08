@@ -11,9 +11,7 @@
     {
       "name": "Start dev server",
       "command": "pnpm dev",
-      "icon": "play",
-      "previewUrl": "http://localhost:5173",
-      "autoOpenPreview": true
+      "icon": "play"
     },
     {
       "name": "Run checks",
