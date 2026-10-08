@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# Cancel runs superseded by a newer push to the same PR; push, tag and manual runs keep separate groups.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
