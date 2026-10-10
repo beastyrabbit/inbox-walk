@@ -6,10 +6,19 @@ action.
 
 ## Start using the todo
 
-Copy `.env.example` to `.env`, start the app, and connect Codex from
-**Einstellungen** when sorting is needed. New unread messages appear as
-unsorted entries. Codex groups them into buckets in the background; later mail
-is picked up by the push connection or its poll fallback.
+For a safe local walkthrough, copy `.env.example` to `.env` and start the app
+in explicit demo mode:
+
+```bash
+MAIL_REVIEW_DEMO=1 pnpm dev
+```
+
+Demo mode uses synthetic mail and does not contact Fastmail or Codex. For live
+mail, provide a dedicated `FASTMAIL_JMAP_TOKEN`, start Apache Tika, and run
+`pnpm dev` with `MAIL_REVIEW_DEMO=0` before connecting Codex from
+**Einstellungen**. New unread messages appear as unsorted entries. Codex groups
+them into buckets in the background; later mail is picked up by the push
+connection or its poll fallback.
 
 Open a bucket to read its messages. The reader keeps the original message
 layout in a script-free sandbox. A message that cannot be loaded remains
