@@ -94,7 +94,9 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GHCR_PUBLISH_TOKEN is a classic PAT with write:packages scope.
+          # Fall back to the repository token for newly linked packages.
+          password: ${{ secrets.GHCR_PUBLISH_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Extract image metadata
         id: meta
