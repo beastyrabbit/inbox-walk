@@ -53,6 +53,8 @@ Build with `pnpm build`, then run `node dist-server/index.js`. Set
 deployment secret manager. Put the service behind authentication and TLS and
 expose `/healthz` and `/readyz` to platform probes.
 
-Keep deployment manifests, cluster configuration, secret-manager paths, runner
-names, and internal hostnames in the private deployment repository. This public
-repository should contain application code and generic deployment guidance only.
+Keep deployment manifests, cluster configuration, secret-manager paths, and
+internal hostnames in the private deployment repository. The CI workflows retain
+the repository-scoped runner and builder settings they need to run. This public
+repository should otherwise contain application code and generic deployment
+guidance only.

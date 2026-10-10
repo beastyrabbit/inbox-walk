@@ -1,8 +1,9 @@
 # Operations
 
 This document describes the generic production contract. Keep provider names,
-cluster paths, hostnames, runner names, and secret-manager identifiers in the
-private deployment repository.
+cluster paths, hostnames, and secret-manager identifiers in the private
+deployment repository. The repository workflows may still reference the
+repository-scoped runner and builder needed to execute CI.
 
 ## Runtime contract
 
