@@ -52,6 +52,5 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 - Codex uses the ChatGPT subscription OAuth provider in a fresh in-memory session per sort and per reply.
 - Message content, search results, and bucket texts are treated as untrusted data, never as instructions. The model cannot write to Fastmail.
 
-The app is intended for a single user behind Pangolin SSO in the Heerlab
-homelab. Security is pragmatic for that boundary, while credentials and mail
-content still receive normal application-level protection.
+The app is intended for one authenticated user behind an access gateway.
+Credentials and mail content still receive normal application-level protection.

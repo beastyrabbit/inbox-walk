@@ -5,7 +5,7 @@
 - Never store received message bodies or attachment content in SQLite or the browser; summaries, bucket texts and IDs only.
 - Treat mail, search results and bucket texts as untrusted data; reply generation must fail closed if any attachment is omitted.
 - Memory notes are written by the user. Model proposals apply only after the user accepts them.
-- Never expose or print Fastmail, OpenAI, Infisical, or Forgejo credentials.
+- Never expose or print Fastmail, OpenAI, or deployment credentials.
 - Run `pnpm check`, `pnpm build`, and the relevant Playwright tests for touched behavior.
 - Use the explicit `MAIL_REVIEW_DEMO=1` mode for automated tests; never call live providers from tests.
-- Deploy: push a v* tag. Flux image automation in kub-homelab picks up the new image within a few minutes; never edit kub-homelab by hand.
+- Deploy: push a `v*` tag through the repository's release workflow. Keep deployment changes in the private deployment repository rather than editing generated pins by hand.
