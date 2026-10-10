@@ -1,121 +1,73 @@
 # Inbox Walk
 
-Inbox Walk is a private, keyboard-first Fastmail todo list. It watches your unread mail, lets Codex sort every new message into a bucket that stands for one real-world story, and changes read state only when you mark a bucket done.
+Inbox Walk is a keyboard-first Fastmail todo list. It watches unread incoming
+mail, lets Codex sort messages into buckets that represent real-world stories,
+and changes read state only when you mark a bucket done.
 
-## Highlights
-
-- Nothing to start. Fastmail pushes changes over JMAP; new mail is queued within seconds and sorted in the background.
-- Every bucket shows all its messages at once, with the original mail design.
-- Prepare a thread-aware Fastmail draft with Codex.
-- Keep sending in Fastmail. Inbox Walk has no send endpoint.
+For messages that need an answer, Inbox Walk prepares a thread-aware Fastmail
+draft. It has no send endpoint or send control; sending remains in Fastmail.
 
 ## What it does
 
-- Listens to Fastmail's JMAP push stream and refreshes the unread set on every change, with a one-minute poll as fallback and reconciliation. Queues every new unread incoming message outside Spam.
-- Sends each batch of new messages to Codex together with the open buckets and your notes. Codex may search the whole mailbox, read a thread or a message body, then creates a bucket, adds to one, merges two, or updates a title and state.
-- Shows the todo as buckets ordered by newest activity. Messages that are not sorted yet appear on top and can be opened right away.
-- Marks a bucket done with one key, which marks exactly its shown messages read in Fastmail and moves on to the next bucket.
-- Parks a message: it stays unread in Fastmail, leaves the todo, and comes back when you fetch it.
-- Adds the Fastmail label `Newsletter abmelden` for deferred unsubscribe work instead of contacting senders automatically.
-- Drops messages you read or delete in Fastmail from the todo on the next poll.
-- Retries a failed sort three times, then keeps the message visible as unsorted until you ask for another attempt.
-- Keeps a memory note that you write in the settings. Codex reads it on every sort and may propose additions, which apply only after you accept them.
-- Sanitizes mail HTML in a script-free sandboxed iframe, adapts it to the dark interface with an original-colours switch, and proxies remote images through the backend.
-- Sends every supported image to Codex and extracts every supported document through Apache Tika for reply drafts, and blocks the draft if any attachment is unsupported or the 45 MiB budget is exceeded.
-- Creates and reads back a normal Fastmail draft with reply headers and identity signature.
-- Follows the model, reasoning effort, and speed configured in Codex without restarting the app.
-- Exposes `/healthz` and `/readyz` for Kubernetes probes.
+- Watches Fastmail through JMAP push with a poll fallback and queues new unread
+  incoming messages outside Spam.
+- Groups related messages into buckets while keeping every original available
+  for inspection.
+- Shows unsorted mail immediately and retries transient sorting failures.
+- Marks exactly the shown bucket messages read when you complete a bucket.
+- Parks a message so it stays unread and can return to the todo later.
+- Adds a newsletter label for deferred unsubscribe work without following links.
+- Sanitizes mail HTML in a script-free sandbox and proxies remote images safely.
+- Prepares editable drafts with supported attachment extraction and fails closed
+  when an attachment cannot be processed.
+- Keeps bucket state, notes, and draft editor state in a local SQLite database.
+- Exposes `/healthz` and `/readyz` for platform probes.
 
 ## Local development
 
-Install dependencies, then start Apache Tika in a separate terminal:
+Install dependencies and copy the example environment file:
 
 ```bash
 pnpm install
-docker run --rm --name inbox-walk-tika -p 9998:9998 apache/tika:3.3.1.0-full
+cp .env.example .env
 ```
 
-Run the live app:
+Run the safe demo mode:
 
 ```bash
+MAIL_REVIEW_DEMO=1 pnpm dev
+```
+
+Open <http://localhost:5173>. Demo mode uses synthetic mail and never contacts
+Fastmail or Codex. For live development, put a dedicated Fastmail token in
+`.env`, start Apache Tika, and run `pnpm dev`:
+
+```bash
+docker run --rm --name inbox-walk-tika -p 9998:9998 apache/tika:3.3.1.0-full
 pnpm dev
 ```
 
-Open <http://localhost:5173>.
-
-`pnpm dev` injects the read-only `FASTMAIL_JMAP_TOKEN` from the `Kub-Homelab`
-Infisical project, environment `dev`, path
-`/kubernetes/tools/inbox-walk-secret`. Local development can read real mail
-but cannot mark messages read or create Fastmail drafts. Live mode never falls
-back to sample data. `MAIL_REVIEW_DEMO=1` serves a fixed sample inbox and sorts
-it locally by exact identifiers; automated tests use that mode only.
-
-The app follows the Codex CLI. It reads the ChatGPT login from
-`$CODEX_HOME/auth.json` (default `~/.codex/auth.json`) and takes `model`,
-`model_reasoning_effort`, and `service_tier` from `$CODEX_HOME/config.toml`,
-honouring the active `profile`. Refreshed tokens are written back in Codex's
-own format so the CLI and the app never hold diverging refresh tokens. Run
-`codex login` when that login can no longer refresh.
-
-Without a Codex login the app reuses an existing Pi `openai-codex` login from
-`~/.pi/agent/auth.json` during local development. Otherwise, open
-**Einstellungen**, choose **Mit ChatGPT verbinden**, and complete the OpenAI
-device-code flow. The rotating OAuth record stays server-side and is never
-returned by the API.
-
-The settings menu shows the model, thinking level, and speed in use; change
-them in Codex. `CODEX_MODEL`, `CODEX_THINKING_LEVEL`, and `CODEX_SPEED`
-(`standard` or `fast`) only apply when Codex has no model configured, and Sol
-at high effort is the final default. Models Pi does not know yet, such as
-`gpt-6-astra`, are described from `$CODEX_HOME/models_cache.json`.
+Connect Codex from **Einstellungen** when sorting or reply generation needs it.
+Keep `.env`, OAuth files, databases, and production credentials out of Git.
 
 ## How sorting works
 
-A JMAP EventSource connection to Fastmail reports Email state changes; each
-change triggers a refresh two seconds later, and a one-minute poll runs
-regardless so a dropped connection never loses mail. Every refresh lists
-unread mail, queues new IDs with their summaries, and drops IDs that are no
-longer unread. Queued messages go to Codex in batches of up to
-eight. Each Codex session runs isolated: no built-in tools, skills, extensions,
-or project context. It receives the new summaries, the buckets active in the
-last 45 days, and your memory note. Its tools are:
+The app queues new messages in batches, sends summaries and the active buckets
+to an isolated Codex session, and applies only the bucket changes returned by
+that session. Mailbox lookups are read-only and bounded. Message content is
+untrusted input. A failed message remains visible for retry; after repeated
+failures it stops retrying automatically until you ask again.
 
-| Tool | Effect |
-| --- | --- |
-| `search_mail`, `get_thread`, `get_email_text` | Read-only lookups in the whole mailbox, bounded to 30 calls per session |
-| `create_bucket`, `add_to_bucket`, `update_bucket`, `merge_buckets` | Change buckets in this app only |
-| `propose_memory` | Suggest a note for you to accept or reject |
-| `finish_triage` | End the session once every new message has a bucket |
-
-Mail content is untrusted data. No tool can mark mail read, move it, label it,
-or create a draft. A sort that fails for a transient reason counts one attempt;
-after three attempts the message stays visible as unsorted with a retry
-button. An expired Codex login pauses sorting without counting attempts. Every
-tool action is appended to an event log in SQLite; message bodies fetched for
-sorting live only in the session.
-
-`TRIAGE_POLL_INTERVAL_MS` sets the fallback poll interval and defaults to one
-minute. The push connection needs no configuration; the status line shows
-"Push aktiv" while it is open, and a stalled connection reopens with backoff.
-`TRIAGE_TIMEOUT_MS` bounds one sorting session, defaulting to 15 minutes with a
-60-minute ceiling. `CODEX_INFERENCE_TIMEOUT_MS` keeps the five-minute default
-for reply drafts.
-
-`DATA_DIR/inbox-walk.sqlite` stores buckets, message summaries with their todo
-state, the event log, reply editor state, memory notes and proposals. It never
-stores received message bodies or attachment content; the persisted summary
-includes Fastmail's short preview excerpt. Handled messages are deleted after
-60 days. Databases from releases before 0.10 lose their review rounds on first
-start; the Codex login is kept.
+The app stores summaries, bucket text, todo state, notes, and an action log. It
+never stores received bodies or attachment content. Marking mail read, parking
+mail, and adding the newsletter label require explicit browser actions.
 
 ## Keyboard controls
 
-In the list, click a bucket or use `?` for help. In a bucket:
-
-- `E` or `ArrowRight`: bucket done, mark its shown messages read and open the next bucket
-- `ArrowLeft` or `Escape`: back to the list
+- `E` or `ArrowRight`: complete the current bucket
+- `ArrowLeft` or `Escape`: return to the list or close the active panel
 - `ArrowUp`: park the selected message
-- `ArrowDown`: tag the selected newsletter for later unsubscribe work
+- `ArrowDown`: add the deferred newsletter label
 - `R`: open the reply-draft panel
 - `?`: keyboard help
 
@@ -128,23 +80,6 @@ pnpm test:e2e
 lefthook run pre-commit
 ```
 
-Lefthook runs Biome, TypeScript, unit/API tests, and a redacted staged Gitleaks
-scan before commits. The GitHub Actions workflow repeats quality and browser tests,
-builds the production container through the shared BuildKit service, and
-publishes it to `ghcr.io/beastyrabbit/inbox-walk` on the repository's ARC runners.
-
-## Production
-
-This source tree describes release `v0.10.0`. Production releases are deployed at
-<https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
-
-The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
-The Codex OAuth record and the todo database are stored under `DATA_DIR`;
-`TIKA_URL` points to the document-extraction sidecar.
-
-Deployment is managed from `beastyrabbit/kub-homelab` on GitHub. Runtime secrets are synced by
-the Infisical Operator; no secret values belong in this repository or in the
-container image.
-
-See [product behavior](docs/PRODUCT.md), [delivery status](docs/BOARD.md), and
-[operations](docs/OPERATIONS.md).
+See the [user guide](docs/USER_GUIDE.md), [developer guide](docs/DEVELOPER_GUIDE.md),
+[product behavior](docs/PRODUCT.md), and [operations guide](docs/OPERATIONS.md)
+for more detail.

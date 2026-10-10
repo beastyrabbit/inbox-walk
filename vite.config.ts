@@ -16,6 +16,7 @@ export default defineConfig(({ mode }) => {
   for (const key of [
     'CODEX_INFERENCE_TIMEOUT_MS',
     'CODEX_MODEL',
+    'CODEX_SPEED',
     'CODEX_THINKING_LEVEL',
     'DATA_DIR',
     'TIKA_URL',
