@@ -61,16 +61,17 @@ entries in the meantime.
 
 ## Earlier upgrades
 
-v0.9.6 moved the last deployment step into CI: the tag build hands off to the
-kub-homelab release deployer, which pins the new image by digest. Releases
-0.9.x kept review rounds in the same database; see the release history for
-their migration notes. None of them require action before upgrading to 0.10.
+Release 0.10 replaced the review-round storage with the continuous todo; see
+the migration notes below. The image hand-off is now owned by Flux image
+automation in `beastyrabbit/kub-homelab`, so Inbox Walk's GitHub workflow only
+builds and publishes the tagged image. Releases 0.9.x kept review rounds in
+the same database; none of them require action before upgrading to 0.10.
 
 ## Deployment path
 
 1. GitHub Actions runs on `arc-inbox-walk`, validates the project, boots a demo container, and publishes `ghcr.io/beastyrabbit/inbox-walk` for `v*` tags. The tag must match the package version.
-2. The Infisical Operator syncs the Fastmail token to namespace `tools`.
-3. The `notify-homelab` job of the tag build dispatches `deploy-release.yaml` in `beastyrabbit/kub-homelab`. That workflow resolves the image digest from GHCR, pins `X.Y.Z@sha256:…` in `cluster/homelab/apps/tools/inbox-walk/helmrelease.yaml`, and pushes to `main`. Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources. Never edit the pin by hand; roll back with `git revert` of the deploy commit in kub-homelab.
+2. Flux image automation in `beastyrabbit/kub-homelab` observes the published tags and updates the workload's immutable image reference. Do not add a deploy hand-off job to this repository; the current workflow has no `notify-homelab` job.
+3. The Infisical Operator syncs the Fastmail token to namespace `tools`; Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources from kub-homelab. Roll back with the corresponding GitOps change there.
 4. The tools Pangolin blueprint exposes `https://inbox-walk.heerlab.com` to the `BeastyOnly` role.
 5. Homepage lists the service under Additional Services.
 
