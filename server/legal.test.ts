@@ -92,27 +92,33 @@ describe('standalone legal routes', () => {
       } else {
         expect(html).not.toMatch(/Kontaktformular|Contact form/)
         expect(html).toContain('https://inbox-walk.heerlab.com')
-        expect(html.match(/<h2 /g)).toHaveLength(17)
+        expect(html.match(/<h2 /g)).toHaveLength(16)
         expect(html).toContain('OpenAI Ireland Ltd')
         expect(html).toContain('<table>')
         expect(html.match(/<th scope="col">/g)).toHaveLength(5)
         expect(html.match(/<td>/g)).toHaveLength(10)
-        expect(html).toContain('inbox-walk.mail-colors (localStorage)')
         expect(html).toContain(
           route.language === 'de'
-            ? 'p_session_token (ggf. mit Zusatz)'
-            : 'p_session_token (possibly with a suffix)',
+            ? 'Darstellungs-Einstellung (localStorage)'
+            : 'Display setting (localStorage)',
+        )
+        expect(html).toContain(route.language === 'de' ? 'Sitzungs-Cookie' : 'Session cookie')
+        expect(html).toContain(
+          route.language === 'de'
+            ? 'bis zu 30 Tage, bei Nutzung verlängert'
+            : 'up to 30 days, extended while in use',
         )
         expect(html).toContain(
           route.language === 'de'
-            ? '30 Tage; verlängert sich bei Nutzung'
-            : '30 days; extended while in use',
+            ? 'Nutzungsanalyse und Fehlerüberwachung'
+            : 'Usage analytics and error tracking',
         )
         expect(html).toContain(
           route.language === 'de'
-            ? 'Umami setzt keine Cookies und speichert keine Daten im Browser.'
-            : 'Umami sets no cookies and stores no data in your browser.',
+            ? 'Erledigte Nachrichten werden nach 60 Tagen gelöscht; die übrigen gespeicherten Daten werden spätestens nach 10 Jahren gelöscht.'
+            : 'Completed messages are deleted after 60 days; other stored data is deleted after 10 years at the latest.',
         )
+        expect(html).toContain(route.language === 'de' ? '10 Jahre' : '10 years')
         expect(html).toContain(route.language === 'de' ? '21. Oktober 2026' : 'October 21, 2026')
       }
     },
@@ -149,8 +155,8 @@ describe('standalone legal routes', () => {
       const html = renderLegalPage('/datenschutz')
       expect(html).toContain('>2. Zusätzlicher Abschnitt</h2>')
       expect(html).toContain('>3. Überblick</h2>')
-      expect(html).toContain('>18. Änderungen</h2>')
-      expect(html).toContain('Die im Abschnitt „E-Mail-Verarbeitung und gespeicherte Daten“')
+      expect(html).toContain('>17. Änderungen</h2>')
+      expect(html).toContain('siehe Abschnitt „Kontakt per E-Mail“')
     } finally {
       privacyPolicies.de.sections.splice(1, 1)
     }

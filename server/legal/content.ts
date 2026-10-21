@@ -101,7 +101,7 @@ Personenbezogene Daten werden nicht verkauft und nicht für Werbung verwendet. E
 
 Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO. Das berechtigte Interesse liegt in einer sicheren und zuverlässigen Bereitstellung der Website.
 
-Die im Abschnitt „E-Mail-Verarbeitung und gespeicherte Daten“ beschriebenen Anwendungsdaten werden regelmäßig gesichert. Sicherungskopien werden innerhalb der eigenen Infrastruktur in Deutschland gespeichert und nach spätestens drei Monaten überschrieben. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt im Schutz vor Datenverlust.`,
+Zur Datensicherung werden regelmäßig Sicherungskopien innerhalb der eigenen Infrastruktur erstellt; sie werden nach Ablauf ihrer Aufbewahrungszeit überschrieben.`,
       },
       {
         heading: `Server-Logfiles`,
@@ -119,11 +119,7 @@ Die Header Cookie und Authorization werden geschwärzt. URL-Pfade und Abfragepar
 
 Die Daten dienen dem Betrieb, der Fehleranalyse und der Abwehr von Angriffen und Missbrauch. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO. Das berechtigte Interesse liegt in Stabilität und Sicherheit des Angebots. Die Logfiles werden nach 14 Tagen automatisch gelöscht.
 
-Pangolin, der Reverse-Proxy, führt zusätzlich ein Anfrageprotokoll (aufgerufene Adresse, Zeitpunkt, IP-Adresse, Ergebnis der Zugriffsprüfung) für 14 Tage, ein Anmeldeprotokoll (Benutzer, Zeitpunkt, IP-Adresse, Ergebnis) für 90 Tage und ein Netzwerkprotokoll für 30 Tage. Die Protokolle dienen dem Betrieb, der Sicherheit und der Zugangskontrolle. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt im sicheren Betrieb und im Schutz des Zugangs.
-
-CrowdSec speichert auf dem Reverse-Proxy lokale Meldungen über erkannte Angriffe (IP-Adresse, Zeitpunkt, Art des Angriffs). Sie werden in der Regel nach sieben Tagen gelöscht; Sperren dauern in der Regel vier Stunden. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt im Schutz vor Angriffen.
-
-Die Anwendung selbst führt kein Zugriffsprotokoll mit IP-Adressen oder Anfrageinhalten. Betriebsmeldungen (Start und Stopp, Anzahl verarbeiteter Nachrichten, Fehlermeldungen) werden nur als kurzlebige Container-Logs auf der eigenen Infrastruktur des Verantwortlichen ausgegeben und nicht zentral gesammelt. Sie werden entfernt, wenn Kubernetes die Logs rotiert oder den Container ersetzt. Fehlermeldungen können technische Angaben wie Dateinamen von Anhängen oder Fehlertexte von Fastmail oder OpenAI enthalten. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in Fehleranalyse und Betrieb.`,
+Darüber hinaus protokolliert der Reverse-Proxy Anfragen und Anmeldungen zur Zugangskontrolle und zum Schutz vor Angriffen; diese Protokolle werden nach höchstens 90 Tagen gelöscht. Die Anwendung selbst schreibt nur kurzlebige Betriebs- und Fehlermeldungen, die nicht zentral gesammelt werden. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO.`,
       },
       {
         heading: `Schutz vor Angriffen (CrowdSec)`,
@@ -139,29 +135,15 @@ Vollständige IP-Adressen werden grundsätzlich höchstens drei Monate gespeiche
         heading: `Anmeldung (Single Sign-On)`,
         body: `Inbox Walk ist nur für eingeladene Personen zugänglich. Die Anmeldung erfolgt über den Reverse-Proxy Pangolin mit dem selbst betriebenen Identitätsdienst Pocket-ID auf der eigenen Infrastruktur. Dabei werden Benutzername, E-Mail-Adresse, Gruppenzugehörigkeit, Zeitpunkt der Anmeldung und IP-Adresse verarbeitet. Nach der Anmeldung setzt Pangolin ein Sitzungs-Cookie, das für den Zugang technisch erforderlich ist.
 
-Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO. Das berechtigte Interesse liegt darin, den Zugang auf berechtigte Personen zu beschränken. Das Benutzerkonto in Pocket-ID und Pangolin besteht, solange der Zugang eingeräumt ist, und wird auf Anfrage oder nach Entzug des Zugangs gelöscht. Anmeldeprotokolle werden nach 90 Tagen gelöscht. Sicherungskopien werden nach spätestens drei Monaten überschrieben.`,
+Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO. Das berechtigte Interesse liegt darin, den Zugang auf berechtigte Personen zu beschränken. Das Benutzerkonto in Pocket-ID und Pangolin besteht, solange der Zugang eingeräumt ist, und wird auf Anfrage oder nach Entzug des Zugangs gelöscht. Anmeldeprotokolle werden nach 90 Tagen gelöscht.`,
       },
       {
         heading: `E-Mail-Verarbeitung und gespeicherte Daten`,
-        body: `Inbox Walk liest über die Fastmail-Schnittstelle JMAP die ungelesenen eingehenden E-Mails des Verantwortlichen. Für den Sortierkontext kann die Anwendung das gesamte Postfach einschließlich gelesener E-Mails durchsuchen. Verarbeitet werden Namen und Adressen von Absendern und Empfängern, Betreffzeilen, Datumsangaben, Vorschautexte, Nachrichteninhalte, Anhänge sowie Absenderidentitäten und Signaturen des Verantwortlichen.
+        body: `Inbox Walk liest ungelesene E-Mails aus dem Fastmail-Postfach des Verantwortlichen und durchsucht zur Einordnung das gesamte Postfach. Dabei werden Angaben zu Absendern und Empfängern, Betreffzeilen, Inhalte und Anhänge verarbeitet. Änderungen im Postfach, etwa das Markieren als gelesen, das Setzen eines Labels oder das Speichern von Antwortentwürfen, erfolgen nur auf ausdrückliche Aktion des Nutzers. Inbox Walk versendet keine E-Mails.
 
-Änderungen im Postfach erfolgen nur nach einer ausdrücklichen Aktion des Nutzers: Genau die ausgewählten Nachrichten werden als gelesen markiert, mit dem Label „Newsletter abmelden“ versehen oder als Antwortentwurf gespeichert. Inbox Walk versendet keine E-Mails.
+Die Datenbank der Anwendung auf der eigenen Infrastruktur speichert Nachrichtenmetadaten und kurze Vorschautexte, Aufgabengruppen und Zusammenfassungen, Notizen und den Entwurfszustand. Nachrichteninhalte und Anhänge werden nicht gespeichert, sondern nur vorübergehend verarbeitet. Dokumentanhänge werden auf der eigenen Infrastruktur in Text umgewandelt.
 
-In einer SQLite-Datenbank auf der eigenen Infrastruktur in Deutschland werden gespeichert:
-
-- je Nachricht ID, Thread-ID, Betreff, Datum, Namen und Adressen von Absendern und Empfängern, der kurze Vorschautext von Fastmail, Postfachnamen und Bearbeitungsstand;
-- vom KI-Modell verfasste Aufgabentitel und Zusammenfassungen;
-- die vom Nutzer geschriebene Gedächtnisnotiz und Vorschläge dazu;
-- ein Ereignisprotokoll der Sortieraktionen mit IDs und Anzahlen;
-- der Zustand des Antworteditors mit Empfängern, Betreff, Entwurfstext und Notizen.
-
-Nachrichteninhalte und Inhalte von Anhängen werden nicht in der Datenbank gespeichert. Sie liegen während der Verarbeitung nur vorübergehend im Arbeitsspeicher des Servers. Dokumentanhänge für Antwortentwürfe wandelt ein Dienst zur Textextraktion (Apache Tika) auf der eigenen Infrastruktur in Text um. Temporäre Dateien werden mit dem temporären Speicher des Containers gelöscht.
-
-Erledigte oder in Fastmail nicht mehr ungelesene Nachrichten werden nach 60 Tagen gelöscht, zusammen mit leeren geschlossenen Aufgabengruppen. Offene oder geparkte Nachrichten und Aufgabengruppen, die noch Nachrichten enthalten, haben keine feste Löschfrist und bleiben bis zur Bearbeitung bestehen. Die Gedächtnisnotiz bleibt, bis der Nutzer sie ändert. Das Ereignisprotokoll enthält die letzten 5.000 Einträge, die Gedächtnisvorschläge die letzten 50. Der Zustand des Antworteditors wird mit seiner Nachricht gelöscht. Die ursprünglichen E-Mails bleiben im Fastmail-Postfach; Inbox Walk löscht sie dort nicht. Zu Sicherungskopien siehe Abschnitt „Hosting und Bereitstellung“.
-
-Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO. Das berechtigte Interesse liegt in der effizienten Bearbeitung der eigenen E-Mail-Korrespondenz.
-
-Die OpenAI-Anmeldedaten (OAuth-Tokens) werden auf dem Server gespeichert, damit das KI-Modell genutzt werden kann. Sie bleiben gespeichert, bis die Anmeldung entfernt wird.`,
+Erledigte Nachrichten werden nach 60 Tagen gelöscht; die übrigen gespeicherten Daten werden spätestens nach 10 Jahren gelöscht. Die ursprünglichen E-Mails bleiben im Fastmail-Postfach. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO. Das berechtigte Interesse liegt in der effizienten Bearbeitung der eigenen Korrespondenz.`,
       },
       {
         heading: `Fastmail (E-Mail-Postfach)`,
@@ -169,37 +151,17 @@ Die OpenAI-Anmeldedaten (OAuth-Tokens) werden auf dem Server gespeichert, damit 
       },
       {
         heading: `KI-Verarbeitung durch OpenAI`,
-        body: `Für die Sortierung und Antwortentwürfe nutzt Inbox Walk ein KI-Modell von OpenAI Ireland Ltd, 1st Floor, The Liffey Trust Centre, 117–126 Sheriff Street Upper, Dublin 1, D01 YC43, Irland. Der Zugriff erfolgt über das ChatGPT-Pro-Abonnement des Verantwortlichen über die Codex-Schnittstelle auf chatgpt.com. Die Anmeldung bei OpenAI erfolgt über auth.openai.com.
-
-Für die Sortierung werden Angaben zu neuen Nachrichten (Absender, Empfänger, Betreff, Datum, Vorschautext), bestehende Aufgabentexte und die Gedächtnisnotiz übermittelt. Auf Anforderung des Modells kommen Suchergebnisse und Nachrichtentexte mit bis zu 12.000 Zeichen hinzu. Für Antwortentwürfe werden der vollständige Nachrichtenverlauf mit Adressen, Betreffzeilen, Datumsangaben und Nachrichteninhalten, Bilder aus Anhängen, aus Dokumentanhängen extrahierter Text sowie die Notizen und der Entwurf des Nutzers übermittelt.
-
-Zweck ist die Sortierung von E-Mails und die Vorbereitung von Antwortentwürfen. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in der effizienten Bearbeitung der eigenen Korrespondenz.
-
-Die Nutzung erfolgt nach den Bedingungen von OpenAI für individuelle ChatGPT-Abonnements. Für diesen Tarif bietet OpenAI keinen Vertrag zur Auftragsverarbeitung nach Art. 28 DSGVO an und ist daher nicht als Auftragsverarbeiter gebunden. Nach diesen Bedingungen darf OpenAI die Inhalte zur Verbesserung seiner Modelle verwenden, sofern dies nicht in den Kontoeinstellungen deaktiviert wird.
-
-OpenAI verarbeitet Daten auch außerhalb der EU, insbesondere in den USA. Nach Angaben von OpenAI beruhen Übermittlungen auf Angemessenheitsbeschlüssen der Europäischen Kommission oder Standardvertragsklauseln. Inbox Walk fordert bei den Anfragen keine Speicherung an (store: false). Die Aufbewahrung bei OpenAI richtet sich dennoch nach dessen Datenschutzerklärung; eine feste Löschfrist ist nicht zugesichert. Details: [OpenAI-Datenschutzerklärung](https://openai.com/policies/eu-privacy-policy/) und [OpenAI-Nutzungsbedingungen](https://openai.com/policies/eu-terms-of-use/).`,
+        body: `Für die Sortierung und für Antwortentwürfe werden E-Mail-Inhalte (Absender, Empfänger, Betreff, Text, Anhänge) sowie Notizen an die OpenAI Ireland Ltd, 1st Floor, The Liffey Trust Centre, 117–126 Sheriff Street Upper, Dublin 1, D01 YC43, Irland, übermittelt und dort von einem KI-Modell verarbeitet. OpenAI verarbeitet Daten auch außerhalb der EU, insbesondere in den USA; nach Angaben von OpenAI auf Grundlage von Angemessenheitsbeschlüssen oder Standardvertragsklauseln. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in der effizienten Bearbeitung der eigenen Korrespondenz. Details: [OpenAI-Datenschutzerklärung](https://openai.com/policies/eu-privacy-policy/).`,
       },
       {
         heading: `Externe Bilder in E-Mails`,
-        body: `Wenn Sie eine Nachricht öffnen, lädt der Inbox-Walk-Server als Proxy die Bilder, die der Absender von externen Servern eingebunden hat. Der Browser lädt diese Bilder nicht direkt. Der externe Server erhält die IP-Adresse des Inbox-Walk-Servers, die Bildadresse (die vom Absender gesetzte Tracking-Kennungen enthalten kann), den Zeitpunkt und eine allgemeine Browser-Kennung. Er erhält weder Ihre IP-Adresse noch Cookies oder E-Mail-Inhalte. Die Bilder werden nicht gespeichert.
-
-Welche Server dies sind, bestimmt der Absender der jeweiligen E-Mail. Deren Standort und Umgang mit Daten liegen außerhalb der Kontrolle des Verantwortlichen. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt darin, E-Mails wie vorgesehen darzustellen und dabei Ihre IP-Adresse zu verbergen.`,
+        body: `Beim Öffnen einer E-Mail lädt der Inbox-Walk-Server externe Bilder als Proxy; der externe Server erhält dabei die IP-Adresse des Servers und die Bildadresse, nicht Ihre IP-Adresse. Die Bilder werden nicht gespeichert. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt darin, E-Mails wie vorgesehen darzustellen und dabei Ihre IP-Adresse zu verbergen.`,
       },
       {
-        heading: `Nutzungsanalyse (Umami)`,
-        body: `Umami wird auf der eigenen Infrastruktur des Verantwortlichen in Deutschland unter umami.heerlab.com betrieben. Es ist kein Drittanbieter beteiligt. Erfasst werden Aufrufe fester virtueller Seiten (etwa Liste, Aufgabengruppe und Einstellungen), Arbeitsablauf-Ereignisse mit Anzahlen und Zeitspannen sowie Leistungsdaten wie Lade- und Antwortzeiten. Hinzu kommen maskierte Sitzungsaufzeichnungen (Replay) und Heatmaps von Klick- und Scrollpositionen mit Seiten- und Fenstergröße.
+        heading: `Nutzungsanalyse und Fehlerüberwachung`,
+        body: `Umami und GlitchTip werden auf der eigenen Infrastruktur des Verantwortlichen in Deutschland betrieben; es ist kein Drittanbieter beteiligt. Umami erfasst Aufrufe fester App-Ansichten, Arbeitsablauf-Ereignisse, Leistungsdaten sowie maskierte Sitzungsaufzeichnungen und Heatmaps ohne E-Mail-Inhalte und setzt weder Cookies noch andere Daten im Browser. GlitchTip erhält Fehlerberichte, aus denen persönliche Angaben entfernt werden. IP-Adresse und Browser-Kennung erreichen beide Dienste technisch bedingt.
 
-In Aufzeichnungen sind alle Texte und Eingaben maskiert; E-Mail- und Editorbereiche sind vollständig ausgeschlossen. E-Mail-Inhalte, Betreffzeilen, Adressen, Aufgabentitel, Notizen, Antworttexte und Fastmail-IDs werden nicht übermittelt. Umami verarbeitet die IP-Adresse und Browser-Kennung der Anfrage, um eine Sitzungskennung, Browser, Betriebssystem, Gerätetyp und ungefähren Standort abzuleiten. Umami setzt keine Cookies und speichert keine Daten im Browser.
-
-Zweck ist die Verbesserung von Arbeitsabläufen und Leistung der Anwendung. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in einer gut nutzbaren und schnellen Anwendung. Der Zugriff auf Informationen im Browser beschränkt sich auf das technisch Erforderliche für den vom einzigen Nutzer dieses internen Werkzeugs ausdrücklich gewünschten Dienst (§ 25 Abs. 2 Nr. 2 TDDDG).
-
-Eine automatische Löschung der Analysedaten ist derzeit nicht eingerichtet; sie werden gelöscht, sobald sie für die Auswertung nicht mehr benötigt werden. Zu Sicherungskopien siehe Abschnitt „Hosting und Bereitstellung“.`,
-      },
-      {
-        heading: `Fehlerüberwachung (GlitchTip)`,
-        body: `GlitchTip wird auf der eigenen Infrastruktur des Verantwortlichen in Deutschland unter glitchtip.heerlab.com betrieben. Bei Fehlern im Browser oder auf dem Server werden Fehlertyp mit einer allgemeinen Meldung, Codestelle (Datei und Zeile), Version und Umgebung sowie Zeitpunkt übermittelt. Für eine Stichprobe von 10 % der Anfragen werden außerdem die Routenvorlage und Zeitmessungen erfasst.
-
-Fehlermeldungen, Anfrageinhalte, Cookies, Header, E-Mail-Inhalte und Adressen werden vor der Übermittlung entfernt. Die IP-Adresse des sendenden Browsers erreicht den Dienst technisch bedingt. Zweck ist das Erkennen und Beheben von Fehlern. Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in einem fehlerfreien Betrieb der Anwendung. Fehlerereignisse und Leistungsdaten werden nach 90 Tagen automatisch gelöscht.`,
+Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in einer gut nutzbaren, schnellen und fehlerfreien Anwendung. Der Zugriff auf Informationen im Browser beschränkt sich auf das technisch Erforderliche (§ 25 Abs. 2 Nr. 2 TDDDG). Analysedaten werden spätestens nach 10 Jahren gelöscht, Fehlerberichte nach 90 Tagen.`,
       },
       {
         heading: `Kontakt per E-Mail`,
@@ -213,12 +175,10 @@ Der Verantwortliche löscht Nachrichten nach Erledigung der Anfrage, soweit kein
         heading: `Cookies und lokale Speicherung`,
         body: `| Name | Anbieter | Zweck | Dauer | Einordnung |
 | --- | --- | --- | --- | --- |
-| p_session_token (ggf. mit Zusatz) | Pangolin (Reverse-Proxy, eigene Infrastruktur) | Anmeldung und Zugangsschutz | 30 Tage; verlängert sich bei Nutzung | technisch erforderlich (§ 25 Abs. 2 Nr. 2 TDDDG) |
-| inbox-walk.mail-colors (localStorage) | Inbox Walk | speichert die gewählte Darstellung von E-Mails (dunkel oder Originalfarben) | bis zur Änderung oder Löschung im Browser | technisch erforderlich, da vom Nutzer ausdrücklich gewählte Einstellung (§ 25 Abs. 2 Nr. 2 TDDDG) |
+| Sitzungs-Cookie | Pangolin (Anmeldung) | Zugang nach Anmeldung | bis zu 30 Tage, bei Nutzung verlängert | technisch erforderlich (§ 25 Abs. 2 Nr. 2 TDDDG) |
+| Darstellungs-Einstellung (localStorage) | Inbox Walk | gewählte Darstellung von E-Mails | bis zur Änderung | technisch erforderlich |
 
-Darüber hinaus setzt Inbox Walk keine Cookies und nutzt weder sessionStorage noch IndexedDB. Die Nutzungsanalyse und die Fehlerüberwachung speichern nichts im Browser.
-
-Die Seiten Impressum und Datenschutzerklärung setzen keine Cookies.`,
+Weitere Cookies oder Browserspeicher werden nicht verwendet; die rechtlichen Seiten setzen keine Cookies und speichern keine Daten im Browser.`,
       },
       {
         heading: `Ihre Rechte`,
@@ -278,7 +238,7 @@ Personal data is not sold and not used for advertising. There is no automated de
 
 The legal basis is Art. 6(1)(f) GDPR. The legitimate interest is the secure and reliable provision of the website.
 
-The application data described in the section "Mail processing and stored data" is backed up regularly. Backups are stored within the controller's own infrastructure in Germany and overwritten after no more than three months. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is protection against data loss.`,
+For data protection against loss, backup copies are created regularly within the controller's own infrastructure; they are overwritten once their retention period expires.`,
       },
       {
         heading: `Server log files`,
@@ -296,11 +256,7 @@ The Cookie and Authorization headers are redacted. URL paths and query parameter
 
 This data is used to operate the site, analyse errors, and defend against attacks and abuse. The legal basis is Art. 6(1)(f) GDPR. The legitimate interest is the stability and security of the service. Log files are deleted automatically after 14 days.
 
-Pangolin, the reverse proxy, also keeps a request log (requested address, time, IP address, result of the access check) for 14 days, an authentication log of sign-ins (user, time, IP address, result) for 90 days, and a network log for 30 days. These logs are used for operation, security and access control. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is secure operation and access protection.
-
-CrowdSec keeps local alerts about detected attacks (IP address, time, type of attack) on the reverse proxy. They are generally deleted after seven days; blocks normally last four hours. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is protection against attacks.
-
-The application itself keeps no access log of IP addresses or request contents. Its operational messages (start and stop, number of processed messages, error messages) are written only as short-lived container logs on the controller's own infrastructure and are not collected centrally. They are removed when Kubernetes rotates the logs or replaces the container. Error messages can contain technical details such as attachment file names or error texts from Fastmail or OpenAI. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is error analysis and operation.`,
+The reverse proxy also logs requests and sign-ins for access control and protection against attacks; these logs are deleted after no more than 90 days. The application itself writes only short-lived operational and error messages, which are not collected centrally. The legal basis is Art. 6(1)(f) GDPR.`,
       },
       {
         heading: `Protection against attacks (CrowdSec)`,
@@ -316,29 +272,15 @@ Full IP addresses are generally retained for no more than three months and then 
         heading: `Sign-in (single sign-on)`,
         body: `Inbox Walk is only accessible to invited people. Sign-in is handled by the Pangolin reverse proxy with Pocket-ID, an identity service self-hosted on the controller's infrastructure. This processes your user name, e-mail address, group membership, time of sign-in and IP address. After sign-in, Pangolin sets a session cookie that is technically required for access.
 
-The legal basis is Art. 6(1)(f) GDPR. The legitimate interest is restricting access to authorised people. The user account in Pocket-ID and Pangolin exists for as long as access is granted and is deleted on request or after access is withdrawn. Sign-in logs are deleted after 90 days. Backups are overwritten after no more than three months.`,
+The legal basis is Art. 6(1)(f) GDPR. The legitimate interest is restricting access to authorised people. The user account in Pocket-ID and Pangolin exists for as long as access is granted and is deleted on request or after access is withdrawn. Sign-in logs are deleted after 90 days.`,
       },
       {
         heading: `Mail processing and stored data`,
-        body: `Inbox Walk reads the controller's unread incoming mail through Fastmail's JMAP interface. For sorting context, the application may search the entire mailbox, including read mail. It processes sender and recipient names and addresses, subjects, dates, preview excerpts, message bodies, attachments, and the controller's sender identities and signatures.
+        body: `Inbox Walk reads unread e-mails from the controller's Fastmail mailbox and searches the entire mailbox for context. This processes sender and recipient details, subjects, contents and attachments. Changes in the mailbox, such as marking messages as read, applying a label or saving reply drafts, happen only on explicit user action. Inbox Walk does not send e-mails.
 
-Changes in the mailbox happen only after an explicit action by the user: exactly the selected messages are marked as read, assigned the label "Newsletter abmelden", or saved as reply drafts. Inbox Walk does not send e-mail.
+The application's database on the controller's own infrastructure stores message metadata and short previews, task groups and summaries, notes and draft state. Message bodies and attachments are not stored, but only processed temporarily. Document attachments are converted to text on the controller's own infrastructure.
 
-A SQLite database on the controller's own infrastructure in Germany stores:
-
-- for each message, its ID, thread ID, subject, date, sender and recipient names and addresses, Fastmail's short preview excerpt, mailbox names and processing state;
-- bucket titles and summaries written by the AI model;
-- the memory note written by the user and proposals for it;
-- an event log of sorting actions with IDs and counts;
-- reply-editor state with recipients, subject, draft text and notes.
-
-Message bodies and attachment contents are not stored in the database. They are held only temporarily in the server's memory during processing. A document-extraction service (Apache Tika) on the controller's own infrastructure converts document attachments for reply drafts to text. Temporary files are deleted with the container's temporary storage.
-
-Messages that are done or no longer unread in Fastmail are deleted after 60 days, together with empty closed buckets. Open or parked messages and buckets that still contain messages have no fixed deletion period and remain until handled. The memory note stays until the user changes it. The event log keeps the latest 5,000 entries, and memory proposals the latest 50. Reply-editor state is deleted with its message. The original e-mails remain in the Fastmail mailbox; Inbox Walk does not delete them there. For backups, see the section "Hosting and delivery".
-
-The legal basis is Art. 6(1)(f) GDPR. The legitimate interest is the efficient handling of the controller's own e-mail correspondence.
-
-The OpenAI login record (OAuth tokens) is stored on the server so the AI model can be used. It remains until the login is removed.`,
+Completed messages are deleted after 60 days; other stored data is deleted after 10 years at the latest. The original e-mails remain in the Fastmail mailbox. The legal basis is Art. 6(1)(f) GDPR. The legitimate interest is the efficient handling of the controller's own correspondence.`,
       },
       {
         heading: `Fastmail (mailbox)`,
@@ -346,37 +288,17 @@ The OpenAI login record (OAuth tokens) is stored on the server so the AI model c
       },
       {
         heading: `AI processing by OpenAI`,
-        body: `For sorting and reply drafts, Inbox Walk uses an AI model from OpenAI Ireland Ltd, 1st Floor, The Liffey Trust Centre, 117–126 Sheriff Street Upper, Dublin 1, D01 YC43, Ireland. Access is through the controller's ChatGPT Pro subscription via the Codex interface on chatgpt.com. Sign-in to OpenAI uses auth.openai.com.
-
-For sorting, the details of new messages (sender, recipients, subject, date, preview), existing bucket texts and the memory note are sent. On the model's request, search results and message texts of up to 12,000 characters are also sent. For reply drafts, the full thread with addresses, subjects, dates and bodies, images from attachments, text extracted from document attachments, and the user's notes and draft are sent.
-
-The purpose is sorting mail and preparing reply drafts. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is the efficient handling of the controller's own correspondence.
-
-Use is governed by OpenAI's terms for individual ChatGPT subscriptions. OpenAI offers no data processing agreement under Art. 28 GDPR for this plan and is therefore not bound as a processor. Under these terms, OpenAI may use the content to improve its models unless this is deactivated in the account settings.
-
-OpenAI also processes data outside the EU, in particular in the USA. According to OpenAI, transfers are based on adequacy decisions of the European Commission or Standard Contractual Clauses. Inbox Walk asks OpenAI not to store the requests (store: false). Nevertheless, OpenAI's retention is governed by its privacy policy; no fixed deletion period is assured. Details: [OpenAI privacy policy](https://openai.com/policies/eu-privacy-policy/) and [OpenAI terms of use](https://openai.com/policies/eu-terms-of-use/).`,
+        body: `For sorting and reply drafts, e-mail contents (sender, recipients, subject, text, attachments) and notes are sent to OpenAI Ireland Ltd, 1st Floor, The Liffey Trust Centre, 117–126 Sheriff Street Upper, Dublin 1, D01 YC43, Ireland, and processed there by an AI model. OpenAI also processes data outside the EU, in particular in the USA; according to OpenAI, this is based on adequacy decisions or Standard Contractual Clauses. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is the efficient handling of the controller's own correspondence. Details: [OpenAI privacy policy](https://openai.com/policies/eu-privacy-policy/).`,
       },
       {
         heading: `External images in e-mails`,
-        body: `When you open a message, the Inbox Walk server acts as a proxy to load images that the sender embedded from external servers. The browser does not load these images directly. The external server receives the Inbox Walk server's IP address, the image address (which may contain tracking identifiers set by the sender), the time and a generic browser identifier. It receives neither your IP address nor cookies or mail contents. Images are not stored.
-
-The sender of each e-mail decides which servers these are. Their location and data handling are outside the controller's control. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is displaying e-mails as intended while hiding your IP address.`,
+        body: `When you open an e-mail, the Inbox Walk server loads external images as a proxy; the external server receives the server's IP address and the image address, not your IP address. Images are not stored. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is displaying e-mails as intended while hiding your IP address.`,
       },
       {
-        heading: `Usage analytics (Umami)`,
-        body: `Umami is self-hosted on the controller's own infrastructure in Germany at umami.heerlab.com. No third party is involved. It collects views of fixed virtual pages (such as list, bucket and settings), workflow events with counts and duration ranges, and performance metrics such as load and response times. It also collects masked session recordings (replay) and heatmaps of click and scroll positions with page and window size.
+        heading: `Usage analytics and error tracking`,
+        body: `Umami and GlitchTip are self-hosted on the controller's own infrastructure in Germany; no third party is involved. Umami records views of fixed app pages, workflow events, performance data, and masked session recordings and heatmaps without mail contents, and uses neither cookies nor other browser storage. GlitchTip receives error reports with personal details removed. IP addresses and browser identifiers reach both services for technical reasons.
 
-All text and inputs are masked in recordings; mail and editor areas are fully excluded. Mail contents, subjects, addresses, bucket titles, notes, reply texts and Fastmail IDs are not transmitted. Umami processes the IP address and browser identifier of the request to derive a session identifier, browser, operating system, device type and approximate location. Umami sets no cookies and stores no data in your browser.
-
-The purpose is improving the application's workflow and performance. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is an application that is easy to use and fast. Access to information in the browser is limited to what is technically necessary for the service explicitly requested by the only user of this internal tool (Section 25(2) no. 2 TDDDG).
-
-Automatic deletion of analytics data is not currently configured; it is deleted once it is no longer needed for analysis. For backups, see the section "Hosting and delivery".`,
-      },
-      {
-        heading: `Error tracking (GlitchTip)`,
-        body: `GlitchTip is self-hosted on the controller's own infrastructure in Germany at glitchtip.heerlab.com. When errors occur in the browser or on the server, the error type with a generic message, code location (file and line), release and environment, and time are sent. For a sample of 10% of requests, the route template and timings are also collected.
-
-Error messages, request contents, cookies, headers, mail contents and addresses are removed before sending. The sending browser's IP address reaches the service for technical reasons. The purpose is detecting and fixing errors. The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is the error-free operation of the application. Error events and performance data are deleted automatically after 90 days.`,
+The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is an application that is easy to use, fast and free of errors. Access to information in the browser is limited to what is technically necessary (Section 25(2) no. 2 TDDDG). Analytics data is deleted after 10 years at the latest, error reports after 90 days.`,
       },
       {
         heading: `Contact by e-mail`,
@@ -390,12 +312,10 @@ The controller deletes messages after dealing with the request unless retention 
         heading: `Cookies and local storage`,
         body: `| Name | Provider | Purpose | Duration | Classification |
 | --- | --- | --- | --- | --- |
-| p_session_token (possibly with a suffix) | Pangolin (reverse proxy, own infrastructure) | Sign-in and access protection | 30 days; extended while in use | Technically necessary (Section 25(2) no. 2 TDDDG) |
-| inbox-walk.mail-colors (localStorage) | Inbox Walk | Stores the selected display of e-mails (dark or original colours) | Until changed or deleted in the browser | Technically necessary as a setting explicitly chosen by the user (Section 25(2) no. 2 TDDDG) |
+| Session cookie | Pangolin (sign-in) | Access after sign-in | up to 30 days, extended while in use | technically necessary (Section 25(2) no. 2 TDDDG) |
+| Display setting (localStorage) | Inbox Walk | selected display of e-mails | until changed | technically necessary |
 
-Beyond this, Inbox Walk sets no cookies and uses neither sessionStorage nor IndexedDB. Usage analytics and error tracking store nothing in the browser.
-
-The Legal Notice and Privacy Policy pages set no cookies.`,
+No other cookies or browser storage are used; the legal pages set no cookies and store no data in the browser.`,
       },
       {
         heading: `Your rights`,

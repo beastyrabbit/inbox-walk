@@ -167,21 +167,26 @@ test('legal routes work with JavaScript disabled and no session', async ({ brows
           await expect(table).toBeVisible()
           await expect(table.getByRole('columnheader')).toHaveCount(5)
           await expect(table.getByRole('row')).toHaveCount(3)
-          await expect(table).toContainText('inbox-walk.mail-colors')
           await expect(table).toContainText(
             path === '/datenschutz'
-              ? 'p_session_token (ggf. mit Zusatz)'
-              : 'p_session_token (possibly with a suffix)',
+              ? 'Darstellungs-Einstellung (localStorage)'
+              : 'Display setting (localStorage)',
+          )
+          await expect(table).toContainText(
+            path === '/datenschutz' ? 'Sitzungs-Cookie' : 'Session cookie',
           )
           await expect(table).toContainText(
             path === '/datenschutz'
-              ? '30 Tage; verlängert sich bei Nutzung'
-              : '30 days; extended while in use',
+              ? 'bis zu 30 Tage, bei Nutzung verlängert'
+              : 'up to 30 days, extended while in use',
           )
           await expect(page.locator('main')).toContainText(
             path === '/datenschutz'
-              ? 'Umami setzt keine Cookies und speichert keine Daten im Browser.'
-              : 'Umami sets no cookies and stores no data in your browser.',
+              ? 'Nutzungsanalyse und Fehlerüberwachung'
+              : 'Usage analytics and error tracking',
+          )
+          await expect(page.locator('main')).toContainText(
+            path === '/datenschutz' ? '10 Jahre' : '10 years',
           )
         }
         expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(
