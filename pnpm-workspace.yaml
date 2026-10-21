@@ -1,11 +1,12 @@
 allowBuilds:
+  '@sentry/cli': true
   '@google/genai': true
   esbuild: true
   lefthook: true
   protobufjs: true
 minimumReleaseAgeExclude:
   - esbuild@0.28.1
-  - undici@8.9.0
+  - undici@8.10.2
 overrides:
   esbuild@>=0.27.3 <0.28.1: ^0.28.1
-  undici@>=8.0.0 <8.9.0: ^8.9.0
+  undici@>=8.0.0 <9.0.0: 8.10.2

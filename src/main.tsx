@@ -4,12 +4,19 @@ import '@fontsource-variable/inter'
 import '@fontsource-variable/literata'
 import './index.css'
 import App from './App.tsx'
+import { ErrorBoundary } from './ErrorBoundary.tsx'
+import { startTelemetry, watchInteractions } from './telemetry.ts'
+
+watchInteractions()
+void startTelemetry()
 
 const root = document.getElementById('root')
 if (!root) throw new Error('Root element is missing')
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </StrictMode>,
 )

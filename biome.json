@@ -4,12 +4,14 @@
   "files": {
     "includes": [
       "**",
+      "!.claude",
       "!dist",
       "!dist-server",
       "!node_modules",
       "!coverage",
       "!playwright-report",
-      "!test-results"
+      "!test-results",
+      "!e2e/fixtures"
     ]
   },
   "formatter": { "enabled": true, "indentStyle": "space", "lineWidth": 100 },
