@@ -90,6 +90,10 @@ describe('telemetry', () => {
     const noReplay = harness({ ...config, umami: { ...config.umami, replay: false } })
     await noReplay.telemetry.start()
     expect(noReplay.startReplay).not.toHaveBeenCalled()
+    noReplay.telemetry.track('app_loaded', { mode: 'demo' })
+    expect(noReplay.sent).toEqual([
+      expect.objectContaining({ name: 'app_loaded', data: { mode: 'demo' } }),
+    ])
   })
   it('fails closed for unknown events, properties, identities, URLs and performance fields', async () => {
     const test = harness()

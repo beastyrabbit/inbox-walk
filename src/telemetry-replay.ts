@@ -134,10 +134,15 @@ export function scrubRecording(input: unknown, website: string, stylesheet = '')
   return events.length ? { type, payload: { website, timestamp: payload.timestamp, events } } : null
 }
 
-/** Narrow fetch guard: only the configured recorder endpoint is changed. No proxy or storage. */
+/** Fail closed for every Umami transport. Non-Umami requests retain their original arguments. */
 export function guardRecorder(url: string, websiteId: string) {
   const endpoint = `${url}/api/record`
+  const origin = new URL(url).origin
+  const configPath = `/api/websites/${websiteId}/recorder`
   const original = window.fetch.bind(window)
+  const drop = () => Promise.resolve(new Response(null, { status: 204 }))
+  const cleanUrl = (target: URL) =>
+    !target.search && !target.hash && !target.username && !target.password
   const link = document.querySelector<HTMLLinkElement>('link[rel="stylesheet"]')?.href
   let stylesheet = ''
   if (link) {
@@ -151,8 +156,15 @@ export function guardRecorder(url: string, websiteId: string) {
   window.fetch = (input, init) => {
     const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
     const parsed = new URL(target, location.href)
-    if (parsed.origin !== url || !parsed.pathname.startsWith('/api/record'))
+    if (parsed.origin !== origin) return original(input, init)
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase()
+    if (!cleanUrl(parsed)) return drop()
+    if (
+      (method === 'POST' && parsed.pathname === '/api/send') ||
+      (method === 'GET' && parsed.pathname === configPath)
+    )
       return original(input, init)
+    if (method !== 'POST' || parsed.pathname !== '/api/record') return drop()
     try {
       if (target !== endpoint) throw new Error('Unexpected recorder URL')
       if (init?.method !== 'POST' || typeof init.body !== 'string' || init.body.length > 1_000_000)
@@ -173,7 +185,42 @@ export function guardRecorder(url: string, websiteId: string) {
       })
     } catch {
       // A successful empty response drops unrecognized payloads without retries or logs.
-      return Promise.resolve(new Response(null, { status: 204 }))
+      return drop()
     }
+  }
+
+  const originalBeacon = navigator.sendBeacon.bind(navigator)
+  navigator.sendBeacon = (target, data) => {
+    const parsed = new URL(target, location.href)
+    if (parsed.origin !== origin || (parsed.pathname === '/api/send' && cleanUrl(parsed)))
+      return originalBeacon(target, data)
+    // Beacons provide no response and may use an unknown encoding. Drop recorder data entirely.
+    return true
+  }
+
+  const originalOpen = XMLHttpRequest.prototype.open
+  const originalSend = XMLHttpRequest.prototype.send
+  const blocked = new WeakSet<XMLHttpRequest>()
+  XMLHttpRequest.prototype.open = function (
+    ...args: [
+      method: string,
+      target: string | URL,
+      async?: boolean,
+      username?: string | null,
+      password?: string | null,
+    ]
+  ) {
+    if (new URL(args[1], location.href).origin === origin) {
+      blocked.add(this)
+      // Cancel any previously opened request before reusing this instance.
+      this.abort()
+      return
+    }
+    blocked.delete(this)
+    return Reflect.apply(originalOpen, this, args)
+  }
+  XMLHttpRequest.prototype.send = function (...args: Parameters<XMLHttpRequest['send']>) {
+    if (blocked.has(this)) return
+    return Reflect.apply(originalSend, this, args)
   }
 }

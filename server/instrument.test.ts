@@ -30,11 +30,13 @@ describe('server instrumentation preload', () => {
         sendDefaultPii: false,
         sendClientReports: false,
         defaultIntegrations: false,
+        registerEsmLoaderHooks: false,
         tracePropagationTargets: [],
         beforeSend: expect.any(Function),
         beforeSendTransaction: expect.any(Function),
         beforeBreadcrumb: expect.any(Function),
       }),
     )
+    expect(sentry.onUnhandledRejectionIntegration).toHaveBeenCalledWith({ mode: 'strict' })
   })
 })

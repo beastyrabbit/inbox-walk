@@ -11,10 +11,11 @@ if (config.glitchtip) {
     sendDefaultPii: false,
     sendClientReports: false,
     defaultIntegrations: false,
+    registerEsmLoaderHooks: false,
     // No HTTP/body/header/cookie, console, local-variable or provider auto-instrumentation.
     integrations: [
       Sentry.onUncaughtExceptionIntegration(),
-      Sentry.onUnhandledRejectionIntegration(),
+      Sentry.onUnhandledRejectionIntegration({ mode: 'strict' }),
     ],
     tracePropagationTargets: [],
     beforeSend: scrubEvent,
