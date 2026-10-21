@@ -112,7 +112,7 @@ describe('todo API', () => {
       'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
     })
     expect(result.headers['set-cookie']).toBeUndefined()
-    expect(middleware.mock.calls.length).toBe(calls)
+    expect(middleware.mock.calls).toHaveLength(calls)
   })
 
   it('does not report expected client and validation failures to GlitchTip', async () => {

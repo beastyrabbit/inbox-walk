@@ -3,10 +3,11 @@
    --------------------------------------------------------------------------- */
 
 .app-shell {
+  --legal-footer-height: 36px;
   height: 100dvh;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: 56px minmax(0, 1fr) 68px 36px;
+  grid-template-rows: 56px minmax(0, 1fr) 68px var(--legal-footer-height);
 }
 
 .topbar,
@@ -973,7 +974,7 @@
   position: fixed;
   z-index: 80;
   right: 18px;
-  bottom: 86px;
+  bottom: calc(86px + var(--legal-footer-height));
   max-width: 470px;
   display: flex;
   gap: 14px;
@@ -1462,7 +1463,7 @@
   }
 
   .app-shell {
-    grid-template-rows: 52px minmax(0, 1fr) 64px 36px;
+    grid-template-rows: 52px minmax(0, 1fr) 64px var(--legal-footer-height);
   }
   .topbar {
     gap: 8px;
@@ -1568,7 +1569,7 @@
 
   .toast {
     right: 10px;
-    bottom: 74px;
+    bottom: calc(74px + var(--legal-footer-height));
     left: 10px;
   }
   .dialog-backdrop {

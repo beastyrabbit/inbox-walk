@@ -43,13 +43,51 @@ function escapeHtml(text: string): string {
 
 // Only the Markdown constructs used by our trusted legal copy are supported.
 // Escape all source HTML and allow only explicit local, HTTPS, or mailto links.
+function links(text: string): string {
+  const parts: string[] = []
+  let cursor = 0
+  let searchFrom = 0
+  // Advance past each delimiter once, including malformed links.
+  while (searchFrom < text.length) {
+    const start = text.indexOf('[', searchFrom)
+    if (start === -1) break
+    const labelEnd = text.indexOf(']', start + 1)
+    if (labelEnd === -1) break
+    searchFrom = labelEnd + 1
+    if (labelEnd === start + 1 || text[labelEnd + 1] !== '(') continue
+    const hrefStart = labelEnd + 2
+    const hrefEnd = text.indexOf(')', hrefStart)
+    if (hrefEnd === -1) break
+    if (hrefEnd === hrefStart) continue
+    const label = text.slice(start + 1, labelEnd)
+    const href = text.slice(hrefStart, hrefEnd)
+    const link = /^(?:\/(?!\/)|https:\/\/|mailto:)/.test(href)
+      ? `<a href="${href}">${label}</a>`
+      : label
+    parts.push(text.slice(cursor, start), link)
+    cursor = hrefEnd + 1
+    searchFrom = cursor
+  }
+  parts.push(text.slice(cursor))
+  return parts.join('')
+}
+
 function inline(text: string): string {
-  return escapeHtml(text)
-    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, (_match, label: string, href: string) =>
-      /^(?:\/(?!\/)|https:\/\/|mailto:)/.test(href) ? `<a href="${href}">${label}</a>` : label,
-    )
+  return links(escapeHtml(text))
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
     .replaceAll('\n', '<br>')
+}
+
+function tableHeader(cell: string): string {
+  return `<th scope="col">${inline(cell)}</th>`
+}
+
+function tableCell(cell: string): string {
+  return `<td>${inline(cell)}</td>`
+}
+
+function tableRow(row: string[]): string {
+  return `<tr>${row.map(tableCell).join('')}</tr>`
 }
 
 function blocks(text: string): string {
@@ -75,7 +113,7 @@ function blocks(text: string): string {
           separator.every((cell) => /^---+$/.test(cell)) &&
           rows.every((row) => row.length === header.length)
         ) {
-          return `<div class="table-scroll"><table><thead><tr>${header.map((cell) => `<th scope="col">${inline(cell)}</th>`).join('')}</tr></thead><tbody>${body.map((row) => `<tr>${row.map((cell) => `<td>${inline(cell)}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
+          return `<div class="table-scroll"><table><thead><tr>${header.map(tableHeader).join('')}</tr></thead><tbody>${body.map(tableRow).join('')}</tbody></table></div>`
         }
       }
       return block.startsWith('- ')
@@ -101,25 +139,41 @@ export function renderLegalPage(path: LegalPath): string {
   const { language, kind } = legalRoutes[path]
   const document: LegalDocument =
     kind === 'notice' ? legalNotices[language] : privacyPolicies[language]
-  const german = language === 'de'
+  const labels = {
+    de: {
+      navigation: 'Rechtliche Informationen',
+      back: 'Zur App',
+      notice: { path: '/impressum', title: 'Impressum' },
+      privacy: { path: '/datenschutz', title: 'Datenschutz' },
+      otherLanguage: 'en',
+      otherLanguageName: 'English',
+    },
+    en: {
+      navigation: 'Legal information',
+      back: 'Back to app',
+      notice: { path: '/legal-notice', title: 'Legal Notice' },
+      privacy: { path: '/privacy', title: 'Privacy Policy' },
+      otherLanguage: 'de',
+      otherLanguageName: 'Deutsch',
+    },
+  }[language]
   const counterpart: Record<LegalLanguage, Record<typeof kind, LegalPath>> = {
     de: { notice: '/legal-notice', privacy: '/privacy' },
     en: { notice: '/impressum', privacy: '/datenschutz' },
   }
-  const sibling =
-    kind === 'notice'
-      ? `<a href="${german ? '/datenschutz' : '/privacy'}">${german ? 'Datenschutz' : 'Privacy Policy'}</a>`
-      : `<a href="${german ? '/impressum' : '/legal-notice'}">${german ? 'Impressum' : 'Legal Notice'}</a>`
-  const navigation = `<nav aria-label="${german ? 'Rechtliche Informationen' : 'Legal information'}"><a href="/">${german ? 'Zur App' : 'Back to app'}</a>${sibling}<a href="${counterpart[language][kind]}" hreflang="${german ? 'en' : 'de'}" lang="${german ? 'en' : 'de'}">${german ? 'English' : 'Deutsch'}</a></nav>`
+  const sibling = kind === 'notice' ? labels.privacy : labels.notice
+  const siblingLink = `<a href="${sibling.path}">${sibling.title}</a>`
+  const navigation = `<nav aria-label="${labels.navigation}"><a href="/">${labels.back}</a>${siblingLink}<a href="${counterpart[language][kind]}" hreflang="${labels.otherLanguage}" lang="${labels.otherLanguage}">${labels.otherLanguageName}</a></nav>`
+  const sections = document.sections
+    .map((section, index) => {
+      const number = document.numbered ? `${index + 1}. ` : ''
+      return `<section aria-labelledby="section-${index + 1}"><h2 id="section-${index + 1}">${number}${inline(section.heading)}</h2>${blocks(section.body)}</section>`
+    })
+    .join('\n')
   return `<!doctype html>
 <html lang="${language}">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex"><link rel="icon" href="data:,"><title>${escapeHtml(document.title)} · Inbox Walk</title><style>${css}</style></head>
-<body><main><p class="brand">Inbox Walk</p>${navigation}<h1>${escapeHtml(document.title)}</h1>${blocks(document.intro)}${document.sections
-    .map(
-      (section, index) =>
-        `<section aria-labelledby="section-${index + 1}"><h2 id="section-${index + 1}">${document.numbered ? `${index + 1}. ` : ''}${inline(section.heading)}</h2>${blocks(section.body)}</section>`,
-    )
-    .join('\n')}<footer>${navigation}</footer></main></body></html>`
+<body><main><p class="brand">Inbox Walk</p>${navigation}<h1>${escapeHtml(document.title)}</h1>${blocks(document.intro)}${sections}<footer>${navigation}</footer></main></body></html>`
 }
 
 // Run before API/session handling and application telemetry. Match only these paths.

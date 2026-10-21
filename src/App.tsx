@@ -121,6 +121,10 @@ function isTypingTarget(target: EventTarget | null) {
   )
 }
 
+function isLegalLinkTarget(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest('.legal-footer'))
+}
+
 function bucketIdFromPath() {
   const match = /^\/buckets\/([^/]+)\/?$/.exec(window.location.pathname)
   return match?.[1] ? decodeURIComponent(match[1]) : null
@@ -718,19 +722,20 @@ function App() {
   }, [summary, threadContexts])
 
   useEffect(() => {
+    const closeActiveView = (target: EventTarget | null) => {
+      if (settingsOpen) return
+      if (helpOpen) setHelpOpen(false)
+      else if (replyOpen) setReplyOpen(false)
+      else if (bucket && !isLegalLinkTarget(target)) backToList()
+    }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return
       if (submitting || busy) return
-      const legalLinkFocused =
-        event.target instanceof Element && Boolean(event.target.closest('.legal-footer'))
       if (event.key === 'Escape') {
-        if (settingsOpen) return
-        if (helpOpen) setHelpOpen(false)
-        else if (replyOpen) setReplyOpen(false)
-        else if (bucket && !legalLinkFocused) backToList()
+        closeActiveView(event.target)
         return
       }
-      if (legalLinkFocused) return
+      if (isLegalLinkTarget(event.target)) return
       if (settingsOpen || helpOpen || replyOpen || replyLoading) return
       if (isTypingTarget(event.target)) return
       if (event.key === '?') {

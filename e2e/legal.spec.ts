@@ -98,11 +98,11 @@ test('follows legal footer links to self-contained German and English pages', as
   for (const legal of pages) {
     await page.goto('/')
     await expect(page.getByRole('heading', { name: 'Inbox Walk', exact: true })).toBeVisible()
-    await page.waitForLoadState('networkidle')
+    await expect(page.locator('main[aria-busy="true"]')).toHaveCount(0)
     requests.length = 0
     await page.locator(`footer a[href="${legal.path}"]`).click()
     await expect(page.getByRole('heading', { level: 1 })).toHaveText(legal.title)
-    await page.waitForLoadState('networkidle')
+    await page.waitForLoadState('load')
     expect(requests).toEqual([legal.path])
     await expect(page.locator('html')).toHaveAttribute('lang', 'de')
     await expect(page.locator('meta[name="robots"]')).toHaveAttribute('content', 'noindex')
@@ -128,7 +128,7 @@ test('follows legal footer links to self-contained German and English pages', as
     await expect(page.getByRole('heading', { level: 1 })).toHaveText(legal.englishTitle)
     await expect(page.locator('html')).toHaveAttribute('lang', 'en')
     await expect(page.locator('main')).toContainText('Tobias Heer')
-    await page.waitForLoadState('networkidle')
+    await page.waitForLoadState('load')
     expect(requests).toEqual([legal.english])
     await expect(page.getByRole('link', { name: 'Deutsch', exact: true }).first()).toHaveAttribute(
       'href',
@@ -223,7 +223,7 @@ test('legal pages load no telemetry even when integrations are configured', asyn
     expect(csp).toContain("connect-src 'none'")
     expect(csp).not.toMatch(/umami|glitchtip|https?:/)
     await expect(page.locator('script')).toHaveCount(0)
-    await page.waitForLoadState('networkidle')
+    await expect(page.getByRole('heading', { level: 1 })).toBeVisible()
   }
   expect(requests).toEqual(
     ['/impressum', '/datenschutz', '/legal-notice', '/privacy'].map(
