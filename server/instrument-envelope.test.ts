@@ -57,7 +57,7 @@ it.each(['captured exception', 'unhandled rejection'])(
       expect(result).toBe(scenario === 'unhandled rejection' ? 1 : 0)
       expect(bodies).toHaveLength(1)
       const body = bodies.join('')
-      expect(body).toContain('"release":"inbox-walk@0.11.0"')
+      expect(body).toContain('"release":"inbox-walk@0.11.1"')
       expect(body).toContain('"environment":"test"')
       expect(body).toContain('Application error (details withheld)')
       if (scenario === 'unhandled rejection') {
