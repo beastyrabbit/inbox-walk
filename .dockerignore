@@ -6,6 +6,7 @@
 node_modules
 dist
 dist-server
+sourcemaps
 coverage
 playwright-report
 test-results

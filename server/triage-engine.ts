@@ -2,6 +2,7 @@ import { TRIAGE_MAX_ATTEMPTS, type TriageStatus } from '../src/shared.ts'
 import { CodexAuthenticationError, isCodexAuthenticationFailure } from './codex.ts'
 import { withoutIoDeadline } from './io.ts'
 import type { Mailbox } from './mailbox.ts'
+import { reportServerError } from './telemetry.ts'
 import type { TriageSorter } from './triage-sorter.ts'
 import type { TriageStore } from './triage-store.ts'
 
@@ -118,6 +119,7 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       if (added > 0 || gone.length > 0) log('triage_poll', { added, gone: gone.length })
     } catch (error) {
       if (signal.aborted) return
+      reportServerError(error)
       log('triage_poll_failed', { message: error instanceof Error ? error.message : 'unknown' })
       store.recordPoll(new Date().toISOString(), publicPollError(error))
     } finally {
@@ -156,6 +158,7 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
 
   /** Returns false when sorting must pause instead of trying the next batch. */
   function recordSortFailure(ids: readonly string[], error: unknown) {
+    reportServerError(error)
     log('triage_sort_failed', { message: error instanceof Error ? error.message : 'unknown' })
     const reason = publicSortError(error)
     store.recordSort(new Date().toISOString(), reason)

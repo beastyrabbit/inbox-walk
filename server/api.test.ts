@@ -8,10 +8,14 @@ import type {
   TriageSnapshot,
 } from '../src/shared.ts'
 import { clearApiStateForTests, createApiMiddleware } from './api.ts'
+import { IoError } from './io.ts'
+import { JmapError } from './jmap.ts'
 import { createDemoMailbox } from './mailbox.ts'
+import { ReplyError } from './reply.ts'
+import * as telemetry from './telemetry.ts'
 import { createTriageEngine } from './triage-engine.ts'
 import { heuristicSorter } from './triage-sorter.ts'
-import { createTriageStore } from './triage-store.ts'
+import { createTriageStore, TriageStoreError } from './triage-store.ts'
 
 let server: Server
 let baseUrl = ''
@@ -64,6 +68,50 @@ afterAll(async () => {
 })
 
 describe('todo API', () => {
+  it('does not report expected client and validation failures to GlitchTip', async () => {
+    const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
+    try {
+      const snapshot = await todo()
+      const forbidden = await json('/api/todo/messages/done', post({ emailIds: [] }))
+      expect(forbidden.response.status).toBe(403)
+      const invalid = await json('/api/todo/messages/done', post({}, snapshot.csrfToken))
+      expect(invalid.response.status).toBe(400)
+      const missing = await json('/api/todo/emails/ghost')
+      expect(missing.response.status).toBe(404)
+      expect(report).not.toHaveBeenCalled()
+    } finally {
+      report.mockRestore()
+    }
+  })
+
+  it.each([
+    [new ReplyError('Expected reply outcome', 'INVALID_REPLY'), 422],
+    [new JmapError('Authentication required', 'AUTH_REQUIRED', 401), 401],
+    [new JmapError('Missing email', 'NOT_FOUND', 404), 404],
+    [new TriageStoreError('Invalid bucket', 'INVALID_BUCKET'), 400],
+    [new TriageStoreError('Missing bucket', 'UNKNOWN_BUCKET'), 404],
+    [new ReplyError('Reply service failed', 'REPLY_FAILED', undefined, 502), 502],
+    [new JmapError('Upstream failed', 'UPSTREAM_ERROR', 503), 502],
+    [new IoError('Timed out', 'IO_TIMEOUT'), 504],
+    [new Error('Unexpected failure'), 500],
+    ['unknown failure', 500],
+  ])(
+    'reports an API failure only when its response maps to 5xx (%s → %i)',
+    async (error, status) => {
+      const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
+      const detail = vi.spyOn(mailbox, 'detail').mockRejectedValueOnce(error)
+      try {
+        const failed = await json('/api/todo/emails/demo-shop')
+        expect(failed.response.status).toBe(status)
+        if (status >= 500) expect(report).toHaveBeenCalledExactlyOnceWith(error)
+        else expect(report).not.toHaveBeenCalled()
+      } finally {
+        detail.mockRestore()
+        report.mockRestore()
+      }
+    },
+  )
+
   it('serves the sorted todo with tokens, status and memory', async () => {
     const snapshot = await todo()
     expect(snapshot.mode).toBe('demo')

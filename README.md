@@ -26,6 +26,21 @@ Inbox Walk is a private, keyboard-first Fastmail todo list. It watches your unre
 - Follows the model, reasoning effort, and speed configured in Codex without restarting the app.
 - Exposes `/healthz` and `/readyz` for Kubernetes probes.
 
+## Telemetry and privacy
+
+This private app runs behind Pangolin SSO and has no consent banner. Optional
+runtime configuration enables self-hosted Umami workflow analytics, performance
+metrics, masked replay and heatmaps, plus GlitchTip error tracking in the browser
+and server. With telemetry variables unset, neither integration starts.
+
+Telemetry excludes mail content, subjects, addresses, previews, bucket titles,
+notes, reply text and Fastmail IDs. Views use fixed virtual paths. All replay
+text and inputs are masked, mail and editor regions are blocked, and outgoing
+recordings pass an additional URL and DOM filter. Error messages and arbitrary
+metadata are discarded. Telemetry writes no browser storage or cookies.
+See [Operations](docs/OPERATIONS.md#telemetry) for configuration, the event
+catalogue, source maps, and the current recorder-config access requirement.
+
 ## Local development
 
 Install dependencies, then start Apache Tika in a separate terminal:

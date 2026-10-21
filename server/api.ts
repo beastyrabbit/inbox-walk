@@ -22,6 +22,8 @@ import { JmapError } from './jmap.ts'
 import { type Mailbox, threadResources } from './mailbox.ts'
 import { appendSignature, computeReplyRecipients, escapeDraftHtml, ReplyError } from './reply.ts'
 import { fetchRemoteImage, SafeHttpError } from './safe-http.ts'
+import { reportServerError } from './telemetry.ts'
+import { serveClientConfig, telemetryConfig } from './telemetry-config.ts'
 import type { TriageEngine } from './triage-engine.ts'
 import { type TriageStore, TriageStoreError } from './triage-store.ts'
 
@@ -871,12 +873,13 @@ function errorResponse(error: unknown): ErrorResponse {
 }
 
 function handleError(res: ServerResponse, error: unknown) {
+  const response = errorResponse(error)
+  if (response.status >= 500) reportServerError(error)
   logApiError(error)
   if (res.headersSent || res.destroyed) {
     if (!res.destroyed) res.destroy()
     return
   }
-  const response = errorResponse(error)
   return apiError(
     res,
     response.status,
@@ -993,9 +996,11 @@ function mailRoute(
 
 export function createApiMiddleware(apiOptions: ApiOptions) {
   const cache = createMailCache()
+  const clientConfig = telemetryConfig()
   return (req: IncomingMessage, res: ServerResponse, next: () => void) =>
     withIoDeadline(async () => {
       if (!req.url?.startsWith('/api/')) return next()
+      if (serveClientConfig(req, res, clientConfig)) return
       const url = new URL(req.url, 'http://localhost')
       const parts = url.pathname.split('/').filter(Boolean)
       try {

@@ -21,6 +21,12 @@ export default defineConfig(({ mode }) => {
     'TIKA_URL',
     'TRIAGE_POLL_INTERVAL_MS',
     'TRIAGE_TIMEOUT_MS',
+    'UMAMI_URL',
+    'UMAMI_WEBSITE_ID',
+    'UMAMI_REPLAY',
+    'GLITCHTIP_DSN',
+    'GLITCHTIP_ENVIRONMENT',
+    'GLITCHTIP_TRACES_SAMPLE_RATE',
   ]) {
     if (!process.env[key] && env[key]) process.env[key] = env[key]
   }
@@ -29,6 +35,7 @@ export default defineConfig(({ mode }) => {
     forceDemo: (process.env.MAIL_REVIEW_DEMO || env.MAIL_REVIEW_DEMO) === '1',
   }
   return {
+    build: { sourcemap: 'hidden' },
     define: {
       __APP_VERSION__: JSON.stringify(packageMetadata.version),
     },

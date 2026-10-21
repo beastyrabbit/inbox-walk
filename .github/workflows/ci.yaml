@@ -63,6 +63,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v6
@@ -117,6 +118,50 @@ jobs:
 
       - name: Boot non-root Node 24 runtime in demo mode
         run: bash scripts/smoke-container.sh inbox-walk:ci-candidate
+
+      - name: Export injected source maps from the candidate build
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          target: sourcemaps
+          outputs: type=local,dest=./sourcemaps
+
+      - uses: actions/setup-node@v6
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        with:
+          node-version: 24
+
+      - uses: pnpm/action-setup@v4
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+
+      - name: Install source map uploader
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch GlitchTip release token through OIDC
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: Infisical/secrets-action@d2e351f16c6ca20d17c85e6c992e04bdeb64e87d # v1.0.18
+        with:
+          method: oidc
+          identity-id: ${{ vars.INFISICAL_GITHUB_ACTIONS_IDENTITY_ID }}
+          domain: "http://192.168.60.11:8080"
+          project-slug: "kub-homelab"
+          env-slug: "prod"
+          secret-path: "/projects/inbox-walk/ci"
+
+      - name: Upload source maps before publishing
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${GLITCHTIP_AUTH_TOKEN:-}"
+          export SENTRY_AUTH_TOKEN="$GLITCHTIP_AUTH_TOKEN"
+          release="inbox-walk@$(node -p 'JSON.parse(require("node:fs").readFileSync("sourcemaps/package.json", "utf8")).version')"
+          pnpm exec sentry-cli --url http://192.168.60.68:8000 sourcemaps upload \
+            --org beasty-rabbit --project inbox-walk --release "$release" \
+            --strict --wait sourcemaps/dist sourcemaps/dist-server
 
       - name: Build and publish image
         uses: docker/build-push-action@v7
