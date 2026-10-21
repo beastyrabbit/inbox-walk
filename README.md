@@ -155,7 +155,7 @@ publishes it to `ghcr.io/beastyrabbit/inbox-walk` on the repository's ARC runner
 
 ## Production
 
-This source tree describes release `v0.12.0`. Production releases are deployed at
+This source tree describes release `v0.12.1`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.

@@ -161,7 +161,7 @@ Erledigte Nachrichten werden nach 60 Tagen gelöscht; die übrigen gespeicherten
         heading: `Nutzungsanalyse und Fehlerüberwachung`,
         body: `Umami und GlitchTip werden auf der eigenen Infrastruktur des Verantwortlichen in Deutschland betrieben; es ist kein Drittanbieter beteiligt. Umami erfasst Aufrufe fester App-Ansichten, Arbeitsablauf-Ereignisse, Leistungsdaten sowie maskierte Sitzungsaufzeichnungen und Heatmaps ohne E-Mail-Inhalte und setzt weder Cookies noch andere Daten im Browser. GlitchTip erhält Fehlerberichte, aus denen persönliche Angaben entfernt werden. IP-Adresse und Browser-Kennung erreichen beide Dienste technisch bedingt.
 
-Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in einer gut nutzbaren, schnellen und fehlerfreien Anwendung. Der Zugriff auf Informationen im Browser beschränkt sich auf das technisch Erforderliche (§ 25 Abs. 2 Nr. 2 TDDDG). Analysedaten werden spätestens nach 10 Jahren gelöscht, Fehlerberichte nach 90 Tagen.`,
+Rechtsgrundlage ist Art. 6 Abs. 1 lit. f DSGVO; das berechtigte Interesse liegt in einer gut nutzbaren, schnellen und fehlerfreien Anwendung. Der Zugriff auf Informationen im Browser beschränkt sich auf das technisch Erforderliche (§ 25 Abs. 2 Nr. 2 TDDDG). Analysedaten werden nach 25 Monaten gelöscht, Sitzungsaufzeichnungen und Heatmaps nach 30 Tagen, Fehlerberichte nach 90 Tagen.`,
       },
       {
         heading: `Kontakt per E-Mail`,
@@ -298,7 +298,7 @@ Completed messages are deleted after 60 days; other stored data is deleted after
         heading: `Usage analytics and error tracking`,
         body: `Umami and GlitchTip are self-hosted on the controller's own infrastructure in Germany; no third party is involved. Umami records views of fixed app pages, workflow events, performance data, and masked session recordings and heatmaps without mail contents, and uses neither cookies nor other browser storage. GlitchTip receives error reports with personal details removed. IP addresses and browser identifiers reach both services for technical reasons.
 
-The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is an application that is easy to use, fast and free of errors. Access to information in the browser is limited to what is technically necessary (Section 25(2) no. 2 TDDDG). Analytics data is deleted after 10 years at the latest, error reports after 90 days.`,
+The legal basis is Art. 6(1)(f) GDPR; the legitimate interest is an application that is easy to use, fast and free of errors. Access to information in the browser is limited to what is technically necessary (Section 25(2) no. 2 TDDDG). Analytics data is deleted after 25 months, session recordings and heatmaps after 30 days, and error reports after 90 days.`,
       },
       {
         heading: `Contact by e-mail`,
