@@ -17,7 +17,7 @@ describe('runtime telemetry config', () => {
     expect(
       telemetryConfig({ FASTMAIL_JMAP_TOKEN: 'private', GLITCHTIP_AUTH_TOKEN: 'private' }),
     ).toEqual({ release })
-    expect(release).toBe('inbox-walk@0.12.0')
+    expect(release).toBe('inbox-walk@0.12.1')
   })
   it('validates targets, DSNs, website IDs and defaults', () => {
     expect(telemetryConfig(configured)).toEqual({

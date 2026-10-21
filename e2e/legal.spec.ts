@@ -186,6 +186,11 @@ test('legal routes work with JavaScript disabled and no session', async ({ brows
               : 'Usage analytics and error tracking',
           )
           await expect(page.locator('main')).toContainText(
+            path === '/datenschutz'
+              ? 'Analysedaten werden nach 25 Monaten gelöscht, Sitzungsaufzeichnungen und Heatmaps nach 30 Tagen, Fehlerberichte nach 90 Tagen.'
+              : 'Analytics data is deleted after 25 months, session recordings and heatmaps after 30 days, and error reports after 90 days.',
+          )
+          await expect(page.locator('main')).toContainText(
             path === '/datenschutz' ? '10 Jahre' : '10 years',
           )
         }

@@ -115,6 +115,11 @@ describe('standalone legal routes', () => {
         )
         expect(html).toContain(
           route.language === 'de'
+            ? 'Analysedaten werden nach 25 Monaten gelöscht, Sitzungsaufzeichnungen und Heatmaps nach 30 Tagen, Fehlerberichte nach 90 Tagen.'
+            : 'Analytics data is deleted after 25 months, session recordings and heatmaps after 30 days, and error reports after 90 days.',
+        )
+        expect(html).toContain(
+          route.language === 'de'
             ? 'Erledigte Nachrichten werden nach 60 Tagen gelöscht; die übrigen gespeicherten Daten werden spätestens nach 10 Jahren gelöscht.'
             : 'Completed messages are deleted after 60 days; other stored data is deleted after 10 years at the latest.',
         )

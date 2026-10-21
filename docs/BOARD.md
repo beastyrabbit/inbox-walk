@@ -4,7 +4,7 @@ Last updated: 2026-09-19
 
 ## Release
 
-`v0.12.0` is the release described by this source tree. GitHub Actions publishes
+`v0.12.1` is the release described by this source tree. GitHub Actions publishes
 its immutable image, and Flux deploys the pinned tag through kub-homelab to
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
