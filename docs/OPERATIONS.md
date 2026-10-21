@@ -163,8 +163,9 @@ and maps. The runtime target shares the cached build stage, removes every
 client `.map` before copying `dist`, and keeps server maps outside `dist`.
 The HTTP server also rejects `.map` paths for local production builds.
 
-The tag-only `sourcemaps` job exports and uploads artifacts after `quality`
-succeeds. Only this job has `id-token:write`. The `container` job builds for
+The `sourcemaps` job exports and uploads artifacts on every `v*` tag-ref run,
+including manual runs, after `quality` succeeds. Only this job has
+`id-token:write`. The `container` job builds for
 PRs and main when `sourcemaps` is skipped; tag publication requires a successful
 upload. Both jobs use the same remote BuildKit endpoint and cached build stage.
 The source-map job uses the pinned Infisical secrets action
@@ -219,7 +220,7 @@ entries in the meantime.
 ## Earlier upgrades
 
 Release 0.10 replaced the review-round storage with the continuous todo; see
-the migration notes below. The image hand-off is now owned by Flux image
+the migration notes above. The image hand-off is now owned by Flux image
 automation in `beastyrabbit/kub-homelab`, so Inbox Walk's GitHub workflow only
 builds and publishes the tagged image. Releases 0.9.x kept review rounds in
 the same database; none of them require action before upgrading to 0.10.

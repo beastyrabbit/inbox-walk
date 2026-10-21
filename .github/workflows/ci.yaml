@@ -56,7 +56,7 @@ jobs:
           pnpm test:e2e
 
   sourcemaps:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v')
     needs: quality
     runs-on: arc-inbox-walk
     timeout-minutes: 30
