@@ -180,8 +180,13 @@ through the uploader's `SENTRY_AUTH_TOKEN` environment variable.
 bundle on assembly but never reports a final processing state to `--wait`
 polling. GlitchTip 6.2.6 supports debug-ID artifact bundles. No legacy
 URL-prefix upload or release new/finalize commands are needed; the token needs
-only `project:releases`. Upload failure blocks image publication. The token
-never enters Docker build arguments, image layers or browser configuration.
+only `project:releases`. Upload, authentication and assemble-request failures,
+plus anything `--strict` rejects, fail the job and block image publication.
+Processing after a successful upload is not awaited, so a later GlitchTip-side
+assembly failure does not block publication. After each release, check
+`http://192.168.60.68:8000/api/0/organizations/beasty-rabbit/releases/inbox-walk@<version>/files/`
+and verify that every JS file has a `debug-id`. The token never enters Docker
+build arguments, image layers or browser configuration.
 The uploader remains on CLI 2.x and SDKs on 10.x for the documented
 `sendDefaultPii` API and compatibility with this GlitchTip deployment.
 
