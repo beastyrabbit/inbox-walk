@@ -1,6 +1,17 @@
 import { Component, type ReactNode } from 'react'
 import { reportBrowserError } from './telemetry.ts'
 
+export function LegalFooter() {
+  return (
+    <footer className="legal-footer">
+      <nav aria-label="Rechtliche Informationen">
+        <a href="/impressum">Impressum</a>
+        <a href="/datenschutz">Datenschutz</a>
+      </nav>
+    </footer>
+  )
+}
+
 export class ErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
   state = { failed: false }
   static getDerivedStateFromError() {
@@ -18,6 +29,7 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { failed: 
           <button type="button" className="button primary" onClick={() => location.reload()}>
             Seite neu laden
           </button>
+          <LegalFooter />
         </main>
       )
     return this.props.children

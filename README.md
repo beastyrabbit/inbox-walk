@@ -28,6 +28,11 @@ Inbox Walk is a private, keyboard-first Fastmail todo list. It watches your unre
 
 ## Telemetry and privacy
 
+The standalone legal pages are `/impressum` and `/datenschutz` in German, and
+`/legal-notice` and `/privacy` in English. They require no app session and load
+no app scripts, assets or telemetry. Both languages describe the data processing
+and retention rules as of October 21, 2026.
+
 This private app runs behind Pangolin SSO and has no consent banner. Optional
 runtime configuration enables self-hosted Umami workflow analytics, performance
 metrics, masked replay and heatmaps, plus GlitchTip error tracking in the browser
