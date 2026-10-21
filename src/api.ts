@@ -117,6 +117,12 @@ async function payload<T>(response: Response): Promise<T> {
   return body as T
 }
 
+function statusClass(status: number) {
+  if (status >= 500) return '5xx'
+  if (status >= 400) return '4xx'
+  return 'other'
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
@@ -132,7 +138,7 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   if (!response.ok && response.status !== 207) {
     track('api_failure', {
       route: url,
-      status_class: response.status >= 500 ? '5xx' : response.status >= 400 ? '4xx' : 'other',
+      status_class: statusClass(response.status),
     })
   }
   return payload<T>(response)

@@ -325,19 +325,12 @@ function App() {
     track('app_loaded', { mode: snapshot.mode })
   }, [snapshot])
   useEffect(() => {
-    pageView(
-      settingsOpen
-        ? '/settings'
-        : helpOpen
-          ? '/help'
-          : replyOpen
-            ? '/reply'
-            : bucketId
-              ? '/bucket'
-              : showParked
-                ? '/parked'
-                : '/',
-    )
+    if (settingsOpen) pageView('/settings')
+    else if (helpOpen) pageView('/help')
+    else if (replyOpen) pageView('/reply')
+    else if (bucketId) pageView('/bucket')
+    else if (showParked) pageView('/parked')
+    else pageView('/')
   }, [bucketId, helpOpen, replyOpen, settingsOpen, showParked])
   const openedBucketRef = useRef<string | null>(null)
   useEffect(() => {

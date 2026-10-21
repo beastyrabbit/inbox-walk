@@ -52,14 +52,32 @@ const finite = (value: unknown): value is number =>
   typeof value === 'number' && Number.isFinite(value)
 const mask = (value: unknown) => (typeof value === 'string' ? value.replace(/\S/g, '*') : '')
 
-/** rrweb masks text, but not attributes, CSS, metadata URLs or custom-event payloads. */
-function replayValue(value: unknown, stylesheet: string, depth = 0): unknown {
-  if (depth > 80) return null
-  if (finite(value) || typeof value === 'boolean' || value === null) return value
-  if (Array.isArray(value))
-    return value.slice(0, 20_000).map((entry) => replayValue(entry, stylesheet, depth + 1))
-  if (!value || typeof value !== 'object') return undefined
-  const result: Record<string, unknown> = {}
+function replayAttributes(attrs: Record<string, unknown>, stylesheet: string) {
+  const safe: Record<string, unknown> = {}
+  if (typeof attrs.class === 'string')
+    safe.class = attrs.class
+      .split(/\s+/)
+      .filter((name) => classes.has(name))
+      .join(' ')
+  for (const dimension of ['rr_width', 'rr_height']) {
+    if (typeof attrs[dimension] === 'string' && /^\d+(\.\d+)?px$/.test(attrs[dimension]))
+      safe[dimension] = attrs[dimension]
+  }
+  // Replace captured CSS with the build's static stylesheet. No dynamic CSS or URLs escape.
+  if ('_cssText' in attrs && stylesheet) safe._cssText = `@import url("${stylesheet}");`
+  return safe
+}
+
+function replayEntry(key: string, entry: unknown, stylesheet: string, depth: number): unknown {
+  if (key === 'href' || key === 'url') return telemetryPath(entry)
+  if (key === 'textContent' || key === 'text' || key === 'value') return mask(entry)
+  if (key === 'tagName') return typeof entry === 'string' && tags.has(entry) ? entry : 'div'
+  if (key === 'attributes' && entry && typeof entry === 'object' && !Array.isArray(entry))
+    return replayAttributes(entry as Record<string, unknown>, stylesheet)
+  return replayValue(entry, stylesheet, depth + 1)
+}
+
+function replayObject(value: object, stylesheet: string, depth: number) {
   if ('type' in value && value.type === 1 && 'name' in value) {
     return {
       type: 1,
@@ -69,33 +87,23 @@ function replayValue(value: unknown, stylesheet: string, depth = 0): unknown {
       ...('id' in value && finite(value.id) ? { id: value.id } : {}),
     }
   }
+  const result: Record<string, unknown> = {}
   for (const [key, entry] of Object.entries(value)) {
     if (!structure.has(key)) continue
-    if (key === 'href' || key === 'url') result[key] = telemetryPath(entry)
-    else if (key === 'textContent' || key === 'text' || key === 'value') result[key] = mask(entry)
-    else if (key === 'tagName')
-      result[key] = typeof entry === 'string' && tags.has(entry) ? entry : 'div'
-    else if (key === 'attributes' && entry && typeof entry === 'object' && !Array.isArray(entry)) {
-      const attrs = entry as Record<string, unknown>
-      const safe: Record<string, unknown> = {}
-      if (typeof attrs.class === 'string')
-        safe.class = attrs.class
-          .split(/\s+/)
-          .filter((name) => classes.has(name))
-          .join(' ')
-      for (const dimension of ['rr_width', 'rr_height']) {
-        if (typeof attrs[dimension] === 'string' && /^\d+(\.\d+)?px$/.test(attrs[dimension]))
-          safe[dimension] = attrs[dimension]
-      }
-      // Replace captured CSS with the build's static stylesheet. No dynamic CSS or URLs escape.
-      if ('_cssText' in attrs && stylesheet) safe._cssText = `@import url("${stylesheet}");`
-      result[key] = safe
-    } else {
-      const safe = replayValue(entry, stylesheet, depth + 1)
-      if (safe !== undefined) result[key] = safe
-    }
+    const safe = replayEntry(key, entry, stylesheet, depth)
+    if (safe !== undefined) result[key] = safe
   }
   return result
+}
+
+/** rrweb masks text, but not attributes, CSS, metadata URLs or custom-event payloads. */
+function replayValue(value: unknown, stylesheet: string, depth = 0): unknown {
+  if (depth > 80) return null
+  if (finite(value) || typeof value === 'boolean' || value === null) return value
+  if (Array.isArray(value))
+    return value.slice(0, 20_000).map((entry) => replayValue(entry, stylesheet, depth + 1))
+  if (!value || typeof value !== 'object') return undefined
+  return replayObject(value, stylesheet, depth)
 }
 
 export function scrubRecording(input: unknown, website: string, stylesheet = '') {
@@ -134,6 +142,12 @@ export function scrubRecording(input: unknown, website: string, stylesheet = '')
   return events.length ? { type, payload: { website, timestamp: payload.timestamp, events } } : null
 }
 
+function requestUrl(input: RequestInfo | URL) {
+  if (typeof input === 'string') return input
+  if (input instanceof URL) return input.href
+  return input.url
+}
+
 /** Fail closed for every Umami transport. Non-Umami requests retain their original arguments. */
 export function guardRecorder(url: string, websiteId: string) {
   const endpoint = `${url}/api/record`
@@ -154,7 +168,7 @@ export function guardRecorder(url: string, websiteId: string) {
       stylesheet = parsed.href
   }
   window.fetch = (input, init) => {
-    const target = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    const target = requestUrl(input)
     const parsed = new URL(target, location.href)
     if (parsed.origin !== origin) return original(input, init)
     const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase()

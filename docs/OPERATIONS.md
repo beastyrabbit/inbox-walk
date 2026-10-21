@@ -55,7 +55,7 @@ only public telemetry configuration and `release`, with `Cache-Control: no-store
 It needs no app session, and remains behind the deployment's Pangolin boundary.
 
 - `UMAMI_URL`: HTTPS origin of the self-hosted Umami installation. Requires `UMAMI_WEBSITE_ID`, a website UUID. Missing or invalid configuration disables Umami.
-- `UMAMI_REPLAY`: `off`, `false`, or `0` disables the recorder and heatmaps. Defaults to on when Umami is configured.
+- `UMAMI_REPLAY`: `off`, `false`, or `0` disables the recorder and heatmaps. Defaults to on when Umami is configured. Replay is also disabled when Umami shares the app's origin; analytics remain enabled.
 - `GLITCHTIP_DSN`: public project DSN, with HTTPS origin, public key and numeric project path. Missing or invalid configuration disables both browser and Node error tracking.
 - `GLITCHTIP_ENVIRONMENT`: short environment label, default `production`.
 - `GLITCHTIP_TRACES_SAMPLE_RATE`: number from 0 to 1, default `0.1`. Set to `0` for errors only.
@@ -163,8 +163,11 @@ and maps. The runtime target shares the cached build stage, removes every
 client `.map` before copying `dist`, and keeps server maps outside `dist`.
 The HTTP server also rejects `.map` paths for local production builds.
 
-Only `v*` tag pushes export and upload the artifacts before image publication.
-The ARC runner uses `id-token:write` and the pinned Infisical secrets action
+The tag-only `sourcemaps` job exports and uploads artifacts after `quality`
+succeeds. Only this job has `id-token:write`. The `container` job builds for
+PRs and main when `sourcemaps` is skipped; tag publication requires a successful
+upload. Both jobs use the same remote BuildKit endpoint and cached build stage.
+The source-map job uses the pinned Infisical secrets action
 with OIDC, repository variable `INFISICAL_GITHUB_ACTIONS_IDENTITY_ID`, LAN
 domain `http://192.168.60.11:8080`, project `kub-homelab`, environment `prod`,
 path `/projects/inbox-walk/ci`. It injects `GLITCHTIP_AUTH_TOKEN`, passed only

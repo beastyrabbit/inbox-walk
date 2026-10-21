@@ -11,7 +11,8 @@ import { scrubBreadcrumb, scrubEvent } from './telemetry-scrub.ts'
 
 export function startErrors(config: ClientConfig) {
   if (!config.glitchtip) return
-  const api = new RegExp(`^${location.origin.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/api(?:/|$)`)
+  const escapedOrigin = location.origin.replace(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`)
+  const api = new RegExp(`^${escapedOrigin}/api(?:/|$)`)
   init({
     ...config.glitchtip,
     release: config.release,

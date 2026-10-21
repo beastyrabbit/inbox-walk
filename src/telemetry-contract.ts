@@ -16,7 +16,7 @@ export function telemetryPath(value: unknown): string {
   } catch {
     return '/:id'
   }
-  if (virtualPaths.some((entry) => entry === path)) return path
+  if ((virtualPaths as readonly string[]).includes(path)) return path
   if (/^\/buckets\/[^/]+\/?$/.test(path)) return '/bucket'
   const routes: [RegExp, string][] = [
     [/^\/api\/client-config$/, '/api/client-config'],
@@ -86,11 +86,8 @@ export function eventProperties(name: string, input: Record<string, unknown>) {
 }
 
 export function durationBucket(milliseconds: number) {
-  return milliseconds < 1000
-    ? 'under_1s'
-    : milliseconds < 10_000
-      ? 'under_10s'
-      : milliseconds < 60_000
-        ? 'under_60s'
-        : 'over_60s'
+  if (milliseconds < 1000) return 'under_1s'
+  if (milliseconds < 10_000) return 'under_10s'
+  if (milliseconds < 60_000) return 'under_60s'
+  return 'over_60s'
 }

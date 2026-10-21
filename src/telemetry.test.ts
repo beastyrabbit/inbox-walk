@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createTelemetry } from './telemetry.ts'
 import { type ClientConfig, eventProperties, telemetryPath } from './telemetry-contract.ts'
 
@@ -18,6 +18,7 @@ function harness(settings: ClientConfig = config) {
   const loadScript = vi.fn(async () => {})
   const startErrors = vi.fn(async () => {})
   const startReplay = vi.fn(async () => {})
+  const trackerResult = vi.fn<() => unknown>()
   const telemetry = createTelemetry({
     config: async () => settings,
     hostname: 'inbox.test',
@@ -27,6 +28,7 @@ function harness(settings: ClientConfig = config) {
     tracker: () => ({
       track: (payload) => {
         sent.push(hook('event', payload))
+        return trackerResult()
       },
     }),
     beforeSend: (callback) => {
@@ -38,12 +40,98 @@ function harness(settings: ClientConfig = config) {
     loadScript,
     startErrors,
     startReplay,
+    trackerResult,
     sent,
     hook: (type: string, payload: Record<string, unknown>) => hook(type, payload),
   }
 }
 
+afterEach(() => {
+  vi.unstubAllGlobals()
+  vi.useRealTimers()
+})
+
 describe('telemetry', () => {
+  it('keeps analytics working without starting replay on the application origin', async () => {
+    vi.stubGlobal('location', { origin: 'https://analytics.test' })
+    const test = harness()
+    test.telemetry.page('/bucket')
+    test.telemetry.track('app_loaded', { mode: 'demo' })
+    await test.telemetry.start()
+    expect(test.loadScript).toHaveBeenCalledTimes(1)
+    expect(test.startReplay).not.toHaveBeenCalled()
+    expect(test.sent).toEqual([
+      expect.objectContaining({ url: '/bucket' }),
+      expect.objectContaining({ name: 'app_loaded' }),
+    ])
+  })
+
+  it('flushes queued events even when recorder startup never settles', async () => {
+    const test = harness()
+    test.startReplay.mockImplementation(() => new Promise<void>(() => {}))
+    test.telemetry.page('/bucket')
+    test.telemetry.track('app_loaded', { mode: 'demo' })
+    await test.telemetry.start()
+    expect(test.startReplay).toHaveBeenCalledTimes(1)
+    expect(test.sent).toHaveLength(2)
+  })
+
+  it('waits for the first tracker response before flushing the rest in order', async () => {
+    const test = harness()
+    let acknowledge = () => {}
+    test.trackerResult.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        acknowledge = resolve
+      }),
+    )
+    test.telemetry.page('/bucket')
+    test.telemetry.track('app_loaded', { mode: 'demo' })
+    const started = test.telemetry.start()
+    await vi.waitFor(() => expect(test.sent).toHaveLength(1))
+    // Events arriving while the initial response is in flight must also wait for its cache.
+    test.telemetry.track('keyboard_help_opened', { interaction: 'keyboard' })
+    expect(test.sent).toHaveLength(1)
+    acknowledge()
+    await started
+    expect(test.sent).toEqual([
+      expect.objectContaining({ url: '/bucket' }),
+      expect.objectContaining({ name: 'app_loaded' }),
+      expect.objectContaining({ name: 'keyboard_help_opened' }),
+    ])
+  })
+
+  it('bounds the first tracker response wait to five seconds', async () => {
+    vi.useFakeTimers()
+    const test = harness()
+    test.trackerResult.mockReturnValueOnce(new Promise<void>(() => {}))
+    test.telemetry.page('/bucket')
+    test.telemetry.track('app_loaded', { mode: 'demo' })
+    const started = test.telemetry.start()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(test.sent).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(4999)
+    expect(test.sent).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await started
+    expect(test.sent).toHaveLength(2)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each(['throw', 'reject'])(
+    'flushes remaining events when the first tracker call fails: %s',
+    async (failure) => {
+      const test = harness()
+      test.trackerResult.mockImplementationOnce(() => {
+        if (failure === 'throw') throw new Error('Stubbed tracker failure')
+        return Promise.reject(new Error('Stubbed tracker failure'))
+      })
+      test.telemetry.page('/bucket')
+      test.telemetry.track('app_loaded', { mode: 'demo' })
+      await test.telemetry.start()
+      expect(test.sent).toHaveLength(2)
+    },
+  )
+
   it('queues bounded early events, deduplicates startup, and loads only configured scripts', async () => {
     const test = harness()
     test.telemetry.page('/bucket')

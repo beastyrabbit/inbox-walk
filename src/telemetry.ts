@@ -1,12 +1,11 @@
 import {
   type ClientConfig,
-  durationBucket,
   eventProperties,
   telemetryPath,
   type ViewPath,
 } from './telemetry-contract.ts'
 
-export { durationBucket }
+export { durationBucket } from './telemetry-contract.ts'
 
 type Payload = Record<string, unknown>
 type Umami = { track: (payload: Payload) => unknown }
@@ -27,6 +26,82 @@ export interface TelemetryDependencies {
   beforeSend: (hook: (type: string, payload: Payload) => Payload | null) => void
 }
 
+function performancePayload(base: Payload, payload: Payload) {
+  for (const key of ['ttfb', 'fcp', 'lcp', 'cls', 'inp', 'duration']) {
+    const value = payload[key]
+    if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
+      base[key] = key === 'cls' ? Math.round(value * 1000) / 1000 : Math.round(value)
+    }
+  }
+  return base
+}
+
+function beforeSendHook(
+  config: ClientConfig,
+  websiteId: string,
+  deps: TelemetryDependencies,
+  view: () => ViewPath,
+) {
+  let performanceSent = false
+  return (type: string, payload: Payload): Payload | null => {
+    const base: Payload = {
+      website: websiteId,
+      hostname: deps.hostname,
+      title: 'Inbox Walk',
+      url: telemetryPath(payload.url ?? view()),
+      referrer: '',
+      tag: config.release,
+    }
+    if (type === 'performance') {
+      if (performanceSent) return null
+      performanceSent = true
+      return performancePayload(base, payload)
+    }
+    if (type !== 'event') return null
+    if (payload.name === undefined) return base
+    if (typeof payload.name !== 'string') return null
+    const data = eventProperties(payload.name, isRecord(payload.data) ? payload.data : {})
+    if (!data) return null
+    return { ...base, name: payload.name, data }
+  }
+}
+
+async function startErrorTracking(deps: TelemetryDependencies, config: ClientConfig) {
+  if (!config.glitchtip) return
+  try {
+    await deps.startErrors(config)
+  } catch {
+    /* Error tracking must not disable analytics. */
+  }
+}
+
+function sendPayload(deps: TelemetryDependencies, payload: Payload): Promise<unknown> {
+  try {
+    return Promise.resolve(deps.tracker()?.track(payload)).catch(() => {})
+  } catch {
+    // A tracker failure must never interrupt mail review or discard the remaining queue.
+    return Promise.resolve()
+  }
+}
+
+async function waitForInitialEvent(result: Promise<unknown>) {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await Promise.race([
+      result,
+      new Promise<void>((resolve) => {
+        timer = setTimeout(resolve, 5000)
+      }),
+    ])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+function sameAppOrigin(url: string) {
+  return typeof location !== 'undefined' && new URL(url).origin === location.origin
+}
+
 /** No mail data, identities or DOM values are accepted by the telemetry API. */
 export function createTelemetry(deps: TelemetryDependencies) {
   let ready = false
@@ -34,89 +109,61 @@ export function createTelemetry(deps: TelemetryDependencies) {
   let started: Promise<void> | undefined
   let view: ViewPath = '/'
   let pageSent = false
-  let performanceSent = false
   let pending: Payload[] = []
   const send = (payload: Payload) => {
-    if (enabled) {
-      try {
-        void deps.tracker()?.track(payload)
-      } catch {
-        /* Telemetry must never interrupt mail review. */
-      }
-    } else if (!ready && pending.length < 100) pending.push(payload)
+    if (!ready) {
+      if (pending.length < 100) pending.push(payload)
+      return
+    }
+    if (enabled) void sendPayload(deps, payload)
+  }
+  async function startAnalytics(config: ClientConfig) {
+    if (!config.umami) return
+    const { url, websiteId } = config.umami
+    deps.beforeSend(beforeSendHook(config, websiteId, deps, () => view))
+    await deps
+      .loadScript(`${url}/script.js`, {
+        'data-website-id': websiteId,
+        'data-host-url': url,
+        'data-domains': deps.hostname,
+        'data-auto-pageview': 'false',
+        'data-exclude-search': 'true',
+        'data-exclude-hash': 'true',
+        'data-before-send': 'inboxWalkBeforeSend',
+        'data-performance': 'true',
+        'data-fetch-credentials': 'omit',
+        'data-tag': config.release,
+      })
+      .catch(() => {})
+    enabled = Boolean(deps.tracker())
+    if (enabled && config.umami.replay && !sameAppOrigin(url))
+      void deps.startReplay(url, websiteId).catch(() => {})
+  }
+  async function flushPending() {
+    const first = pending.shift()
+    if (enabled && first) await waitForInitialEvent(sendPayload(deps, first))
+    const queued = pending
+    pending = []
+    ready = true
+    if (enabled) for (const payload of queued) void sendPayload(deps, payload)
+  }
+  async function initialize() {
+    try {
+      const config = await deps.config()
+      // Errors and analytics are independent; a blocked script must not disable errors.
+      const errors = startErrorTracking(deps, config)
+      await startAnalytics(config)
+      await errors
+    } catch {
+      /* Missing/unavailable config leaves both integrations off. */
+    } finally {
+      if (!fetchErrors) earlyErrors = []
+      await flushPending()
+    }
   }
   return {
     start() {
-      started ??= (async () => {
-        try {
-          const config = await deps.config()
-          // Errors and analytics are independent; a blocked script must not disable errors.
-          const errors = config.glitchtip
-            ? deps.startErrors(config).catch(() => {})
-            : Promise.resolve()
-          if (config.umami) {
-            const { url, websiteId } = config.umami
-            deps.beforeSend((type, payload) => {
-              const base: Payload = {
-                website: websiteId,
-                hostname: deps.hostname,
-                title: 'Inbox Walk',
-                url: telemetryPath(payload.url ?? view),
-                referrer: '',
-                tag: config.release,
-              }
-              if (type === 'performance') {
-                if (performanceSent) return null
-                performanceSent = true
-                for (const key of ['ttfb', 'fcp', 'lcp', 'cls', 'inp', 'duration']) {
-                  const value = payload[key]
-                  if (typeof value === 'number' && Number.isFinite(value) && value >= 0) {
-                    base[key] = key === 'cls' ? Math.round(value * 1000) / 1000 : Math.round(value)
-                  }
-                }
-                return base
-              }
-              if (type !== 'event') return null
-              if (payload.name !== undefined) {
-                if (typeof payload.name !== 'string') return null
-                const data = eventProperties(
-                  payload.name,
-                  isRecord(payload.data) ? payload.data : {},
-                )
-                if (!data) return null
-                return { ...base, name: payload.name, data }
-              }
-              return base
-            })
-            await deps
-              .loadScript(`${url}/script.js`, {
-                'data-website-id': websiteId,
-                'data-host-url': url,
-                'data-domains': deps.hostname,
-                'data-auto-pageview': 'false',
-                'data-exclude-search': 'true',
-                'data-exclude-hash': 'true',
-                'data-before-send': 'inboxWalkBeforeSend',
-                'data-performance': 'true',
-                'data-fetch-credentials': 'omit',
-                'data-tag': config.release,
-              })
-              .catch(() => {})
-            enabled = Boolean(deps.tracker())
-            if (enabled && config.umami.replay)
-              await deps.startReplay(url, websiteId).catch(() => {})
-          }
-          await errors
-        } catch {
-          /* Missing/unavailable config leaves both integrations off. */
-        } finally {
-          ready = true
-          if (!fetchErrors) earlyErrors = []
-          const queued = pending
-          pending = []
-          if (enabled) for (const payload of queued) send(payload)
-        }
-      })()
+      started ??= initialize()
       return started
     },
     track(name: string, properties: Payload = {}) {
@@ -169,7 +216,8 @@ const telemetry = createTelemetry({
     })
   },
   startErrors: async (config) => {
-    await (await import('./errors.ts')).startErrors(config)
+    const { startErrors } = await import('./errors.ts')
+    startErrors(config)
   },
   startReplay: async (url, websiteId) => {
     const { guardRecorder } = await import('./telemetry-replay.ts')
@@ -179,8 +227,8 @@ const telemetry = createTelemetry({
       script.src = `${url}/recorder.js`
       script.async = true
       script.referrerPolicy = 'no-referrer'
-      script.setAttribute('data-website-id', websiteId)
-      script.setAttribute('data-host-url', url)
+      script.dataset.websiteId = websiteId
+      script.dataset.hostUrl = url
       script.onload = () => resolve()
       script.onerror = () => {
         script.remove()
