@@ -4,12 +4,13 @@ Last updated: 2026-09-19
 
 ## Release
 
-`v0.10.0` is the release described by this source tree. GitHub Actions publishes
+`v0.12.0` is the release described by this source tree. GitHub Actions publishes
 its immutable image, and Flux deploys the pinned tag through kub-homelab to
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 ## Shipped
 
+- [x] Standalone German and English Impressum and privacy policy pages readable without SSO.
 - [x] Continuous todo: JMAP push plus a fallback poll queue and sort unread mail without a manual run.
 - [x] Codex sorting sessions with read-only mailbox tools and app-only bucket tools.
 - [x] Bounded automatic retries, manual retry, and a visible pause while Codex is logged out.

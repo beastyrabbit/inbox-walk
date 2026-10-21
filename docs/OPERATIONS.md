@@ -2,7 +2,7 @@
 
 ## Production contract
 
-- Release described by this source tree: `v0.11.1`
+- Release described by this source tree: `v0.12.0`
 - URL: <https://inbox-walk.heerlab.com>
 - Access: Pangolin `BeastyOnly`
 - Public application: no. Analytics runs without a consent banner inside SSO.
