@@ -47,6 +47,23 @@ loop is process-local; two replicas would sort the same mail twice.
 The engine only reads from Fastmail. Marking read and adding the newsletter
 label happen exclusively in response to user actions in the browser.
 
+## Legal pages
+
+`GET` and `HEAD` on `/impressum`, `/datenschutz`, `/legal-notice` and `/privacy`
+serve standalone legal HTML before API/session and application telemetry handling.
+Pangolin needs an exact-path authentication bypass for those four paths only;
+no asset bypass is needed. These pages use system fonts, hash-approved inline CSS,
+no scripts or cookies, and a separate CSP that blocks resource and network requests.
+Requests with encoded percent signs, slashes or backslashes, literal backslashes,
+dot segments, repeated slashes or malformed percent-encoding are rejected before
+routing. The guard also models Badger/Pangolin's double decoding and path
+normalisation: any path that resolves to a legal path must match it byte-for-byte.
+They send both a robots `noindex` meta tag and `X-Robots-Tag: noindex`.
+The rest of the app keeps its existing CSP. Legal copy lives in
+`server/legal/content.ts`; privacy sections are numbered by their array order.
+The shared `LEGAL_DATE` contains both language versions of the publication date.
+The publication test rejects unresolved placeholders on all four rendered pages.
+
 ## Telemetry
 
 All configuration is read from the server environment at startup. No per-environment

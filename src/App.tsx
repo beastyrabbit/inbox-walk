@@ -1,6 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { api, blobUrl, ClientApiError, type CodexSettings } from './api.ts'
+import { LegalFooter } from './ErrorBoundary.tsx'
 import { emailDocument, type MailColorMode } from './email-document.ts'
 import {
   addressesToText,
@@ -720,13 +721,16 @@ function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return
       if (submitting || busy) return
+      const legalLinkFocused =
+        event.target instanceof Element && Boolean(event.target.closest('.legal-footer'))
       if (event.key === 'Escape') {
         if (settingsOpen) return
         if (helpOpen) setHelpOpen(false)
         else if (replyOpen) setReplyOpen(false)
-        else if (bucket) backToList()
+        else if (bucket && !legalLinkFocused) backToList()
         return
       }
+      if (legalLinkFocused) return
       if (settingsOpen || helpOpen || replyOpen || replyLoading) return
       if (isTypingTarget(event.target)) return
       if (event.key === '?') {
@@ -948,6 +952,7 @@ function App() {
         <div className="spinner" aria-hidden="true" />
         <h1>Inbox Walk</h1>
         <p>{status || 'Deine Todo-Liste wird geladen …'}</p>
+        <LegalFooter />
       </main>
     )
   }
@@ -960,6 +965,7 @@ function App() {
         <button type="button" className="button primary" onClick={() => window.location.reload()}>
           Erneut versuchen
         </button>
+        <LegalFooter />
       </main>
     )
   }
@@ -988,6 +994,7 @@ function App() {
           snapshot={snapshot}
           status={status}
         />
+        {!settingsOpen && !helpOpen && <LegalFooter />}
         {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
         {settingsDialog}
       </>
@@ -1095,6 +1102,7 @@ function App() {
         onPark={() => void parkSelected()}
         onComplete={() => void completeBucket()}
       />
+      {!settingsOpen && !helpOpen && <LegalFooter />}
 
       <p className="sr-only" aria-live="polite">
         {status}
@@ -1813,6 +1821,7 @@ function HelpDialog({ onClose }: Readonly<{ onClose: () => void }>) {
             <dd>Panel schließen</dd>
           </div>
         </dl>
+        <LegalFooter />
       </dialog>
     </div>
   )
@@ -2049,6 +2058,7 @@ function SettingsDialog({
             Schließen
           </button>
         </div>
+        <LegalFooter />
       </dialog>
     </div>
   )

@@ -3,6 +3,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, normalize, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
+import { serveLegalPage } from './legal/pages.ts'
+import { rejectUnsafeRequestPath } from './request-path.ts'
 import { createRuntime } from './runtime.ts'
 import { reportServerError, traceApi } from './telemetry.ts'
 import { serveClientConfig, telemetryConfig, telemetryCsp } from './telemetry-config.ts'
@@ -111,6 +113,8 @@ async function serveFrontend(req: IncomingMessage, res: ServerResponse) {
 }
 
 const server = createServer((req, res) => {
+  if (rejectUnsafeRequestPath(req, res)) return
+  if (serveLegalPage(req, res)) return
   setSecurityHeaders(res)
   if (serveClientConfig(req, res, clientConfig)) return
   if (req.url === '/healthz' || req.url === '/readyz') {
