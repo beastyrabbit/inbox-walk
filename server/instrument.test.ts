@@ -26,7 +26,7 @@ describe('server instrumentation preload', () => {
     await import('./instrument.ts')
     expect(sentry.init).toHaveBeenCalledWith(
       expect.objectContaining({
-        release: 'inbox-walk@0.11.0',
+        release: 'inbox-walk@0.11.1',
         sendDefaultPii: false,
         sendClientReports: false,
         defaultIntegrations: false,

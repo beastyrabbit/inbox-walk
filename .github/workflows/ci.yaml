@@ -111,7 +111,7 @@ jobs:
           release="inbox-walk@$(node -p 'JSON.parse(require("node:fs").readFileSync("sourcemaps/package.json", "utf8")).version')"
           pnpm exec sentry-cli --url http://192.168.60.68:8000 sourcemaps upload \
             --org beasty-rabbit --project inbox-walk --release "$release" \
-            --strict --wait sourcemaps/dist sourcemaps/dist-server
+            --strict sourcemaps/dist sourcemaps/dist-server
 
   container:
     if: ${{ !cancelled() && needs.quality.result == 'success' && (needs.sourcemaps.result == 'success' || needs.sourcemaps.result == 'skipped') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
