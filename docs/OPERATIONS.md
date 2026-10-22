@@ -251,11 +251,14 @@ the same database; none of them require action before upgrading to 0.10.
 
 ## Deployment path
 
-1. GitHub Actions runs on `arc-inbox-walk`, validates the project, boots a demo container, and publishes `ghcr.io/beastyrabbit/inbox-walk` for `v*` tags. The tag must match the package version.
-2. Flux image automation in `beastyrabbit/kub-homelab` observes the published tags and updates the workload's immutable image reference. Do not add a deploy hand-off job to this repository; the current workflow has no `notify-homelab` job.
-3. The Infisical Operator syncs the Fastmail token to namespace `tools`; Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources from kub-homelab. Roll back with the corresponding GitOps change there.
-4. The tools Pangolin blueprint exposes `https://inbox-walk.heerlab.com` to the `BeastyOnly` role.
-5. Homepage lists the service under Additional Services.
+1. PRs, main pushes and manual branch runs validate the project and boot the production Dockerfile's non-root demo container on `arc-inbox-walk`. They do not publish images. Fork PRs remain excluded.
+2. A `v*` tag, including a manual run targeting a tag, must match the package version. It skips the quality job and waits up to 35 minutes for the newest `ci.yaml` push-to-main run on the exact peeled tag commit to finish successfully. Missing or pending runs are polled; a failed run, API error or timeout blocks publication. PR runs, manual runs and ancestor commits cannot satisfy the gate.
+3. After the gate passes, Actions exports and uploads source maps, scans for secrets, builds the production runtime and boots the non-root demo container. Only then does it publish `ghcr.io/beastyrabbit/inbox-walk` with the release's semver tags. No `main` or `latest` images are published.
+4. Flux image automation in `beastyrabbit/kub-homelab` observes the published tags and updates the workload's immutable image reference. Do not add a deploy hand-off job to this repository; the current workflow has no `notify-homelab` job.
+5. The Infisical Operator syncs the Fastmail token to namespace `tools`; Flux applies the workload, Longhorn PVC, Tika Service, and Infisical resources from kub-homelab. Roll back with the corresponding GitOps change there.
+6. The tag run's `post-deploy` job checks internal Service reachability for up to a minute, then polls `http://inbox-walk.tools.svc.cluster.local:3000/api/client-config` until `release` exactly matches `inbox-walk@<package version>`. It then GETs `/` and `/healthz`, requiring application HTML and JSON health status `ok`. Redirects and malformed responses fail. The overall 25-minute deadline covers Flux's two 2-minute polling intervals, reconciliation and the HelmRelease's 15-minute timeout. Individual requests have a 10-second deadline. A newer semver release reports `superseded` in the job log and exits successfully without claiming that the older release was smoke-tested. Failure does not undo a published image or roll back Flux.
+7. The tools Pangolin blueprint exposes `https://inbox-walk.heerlab.com` to the `BeastyOnly` role. The smoke uses the internal Service because this public URL requires SSO.
+8. Homepage lists the service under Additional Services.
 
 ## Verification
 
