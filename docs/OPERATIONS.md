@@ -181,7 +181,7 @@ client `.map` before copying `dist`, and keeps server maps outside `dist`.
 The HTTP server also rejects `.map` paths for local production builds.
 
 The `sourcemaps` job exports and uploads artifacts on every `v*` tag-ref run,
-including manual runs, after `quality` succeeds. Only this job has
+including manual runs, after the `main-ci` gate succeeds. Only this job has
 `id-token:write`. The `container` job builds for
 PRs and main when `sourcemaps` is skipped; tag publication requires a successful
 upload. Both jobs use the same remote BuildKit endpoint and cached build stage.
