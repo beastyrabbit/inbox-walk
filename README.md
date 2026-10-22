@@ -149,13 +149,14 @@ lefthook run pre-commit
 ```
 
 Lefthook runs Biome, TypeScript, unit/API tests, and a redacted staged Gitleaks
-scan before commits. The GitHub Actions workflow repeats quality and browser tests,
-builds the production container through the shared BuildKit service, and
-publishes it to `ghcr.io/beastyrabbit/inbox-walk` on the repository's ARC runners.
+scan before commits. GitHub Actions runs quality and browser tests on PRs and
+main, then builds and smoke-tests the production container. Release tags reuse
+successful main CI for the exact commit, upload source maps, smoke-test and
+publish the image, then verify Flux's rollout. Branch runs publish no images.
 
 ## Production
 
-This source tree describes release `v0.12.1`. Production releases are deployed at
+This source tree describes release `v0.12.2`. Production releases are deployed at
 <https://inbox-walk.heerlab.com> behind Pangolin `BeastyOnly` authentication.
 
 The image listens on port `3000` and requires `FASTMAIL_JMAP_TOKEN` in live mode.
