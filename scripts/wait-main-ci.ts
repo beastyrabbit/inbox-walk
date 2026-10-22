@@ -68,8 +68,8 @@ export async function waitMainCi({
     const newest = data.workflow_runs
       .filter((run) => run.event === 'push' && run.head_branch === 'main' && run.head_sha === sha)
       .sort((a, b) => b.id - a.id)[0]
+    if (Date.now() >= deadline) break
     if (newest?.status === 'completed') {
-      if (Date.now() >= deadline) break
       if (newest.conclusion !== 'success')
         throw new Error(`Newest main CI run ${newest.id} concluded ${newest.conclusion}.`)
       console.log(`Main CI run ${newest.id} succeeded for ${sha}.`)

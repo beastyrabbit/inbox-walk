@@ -104,6 +104,15 @@ describe('exact-commit main CI gate', () => {
     await expect(waitMainCi({ ...options, fetcher })).rejects.toThrow(`HTTP ${status}`)
   })
 
+  it('rejects a successful response received at the deadline', async () => {
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () => {
+      vi.setSystemTime(Date.now() + options.timeoutMs)
+      return response([success])
+    })
+    await expect(waitMainCi({ ...options, fetcher })).rejects.toThrow('Timed out')
+    expect(fetcher).toHaveBeenCalledTimes(1)
+  })
+
   it('fails closed on network or malformed API responses', async () => {
     const fetcher = vi.fn<typeof fetch>().mockRejectedValueOnce(new Error('network unavailable'))
     await expect(waitMainCi({ ...options, fetcher })).rejects.toThrow('network unavailable')
