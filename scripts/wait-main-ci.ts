@@ -19,6 +19,19 @@ type Run = {
   conclusion: string | null
 }
 
+function validRun(run: Run) {
+  return Boolean(
+    run &&
+      Number.isSafeInteger(run.id) &&
+      run.id > 0 &&
+      typeof run.event === 'string' &&
+      typeof run.head_branch === 'string' &&
+      typeof run.head_sha === 'string' &&
+      typeof run.status === 'string' &&
+      (run.conclusion === null || typeof run.conclusion === 'string'),
+  )
+}
+
 export async function waitMainCi({
   repository,
   sha,
@@ -49,20 +62,7 @@ export async function waitMainCi({
     })
     if (response.status !== 200) throw new Error(`Main CI API returned HTTP ${response.status}.`)
     const data = (await response.json()) as { workflow_runs?: Run[] }
-    if (
-      !Array.isArray(data?.workflow_runs) ||
-      data.workflow_runs.some(
-        (run) =>
-          !run ||
-          !Number.isSafeInteger(run.id) ||
-          run.id <= 0 ||
-          typeof run.event !== 'string' ||
-          typeof run.head_branch !== 'string' ||
-          typeof run.head_sha !== 'string' ||
-          typeof run.status !== 'string' ||
-          !(run.conclusion === null || typeof run.conclusion === 'string'),
-      )
-    )
+    if (!Array.isArray(data?.workflow_runs) || data.workflow_runs.some((run) => !validRun(run)))
       throw new Error('Malformed main CI API response.')
     // Recheck API filters locally. Never fall back to an ancestor, PR or manual run.
     const newest = data.workflow_runs

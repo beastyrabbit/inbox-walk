@@ -2,12 +2,29 @@ import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 const service = 'http://inbox-walk.tools.svc.cluster.local:3000'
-const semver =
-  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][\da-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][\da-zA-Z-]*))*))?(?:\+[\da-zA-Z-]+(?:\.[\da-zA-Z-]+)*)?$/
+const numericIdentifier = /^(0|[1-9]\d*)$/
+
+function validIdentifiers(value: string | undefined, prerelease = false) {
+  if (value === undefined) return true
+  return value
+    .split('.')
+    .every(
+      (part) =>
+        /^[\da-zA-Z-]+$/.test(part) &&
+        (!prerelease || !/^\d+$/.test(part) || numericIdentifier.test(part)),
+    )
+}
 
 function versionParts(release: string) {
-  const match = release.startsWith('inbox-walk@') ? semver.exec(release.slice(11)) : null
-  if (!match) throw new Error('Malformed deployment release.')
+  const match = /^inbox-walk@(\d+)\.(\d+)\.(\d+)(?:-([\da-zA-Z.-]+))?(?:\+([\da-zA-Z.-]+))?$/.exec(
+    release,
+  )
+  if (
+    !match?.slice(1, 4).every((part) => numericIdentifier.test(part)) ||
+    !validIdentifiers(match[4], true) ||
+    !validIdentifiers(match[5])
+  )
+    throw new Error('Malformed deployment release.')
   return { numbers: match.slice(1, 4).map(BigInt), prerelease: match[4]?.split('.') }
 }
 
@@ -33,6 +50,29 @@ function isNewer(actual: string, expected: string) {
 }
 
 class Retryable extends Error {}
+
+async function checkRelease(
+  expected: string,
+  get: (path: string, contentType: string) => Promise<Response>,
+) {
+  const config = await (await get('/api/client-config', 'application/json')).json()
+  if (!config || typeof config.release !== 'string')
+    throw new Error('Malformed client config response.')
+  if (isNewer(config.release, expected)) {
+    console.log(`Release ${expected} superseded by ${config.release}; skipping rollout smoke.`)
+    return 'superseded' as const
+  }
+  if (config.release !== expected) {
+    console.log(`Waiting for ${expected}; Service currently reports ${config.release}.`)
+    return undefined
+  }
+  const html = await (await get('/', 'text/html')).text()
+  if (!/^<!doctype html>/i.test(html.trimStart()) || !/<div\s+id="root"/.test(html))
+    throw new Error('Malformed application HTML.')
+  const health = await (await get('/healthz', 'application/json')).json()
+  if (health?.status !== 'ok') throw new Error('Malformed health response.')
+  return 'deployed' as const
+}
 
 export async function waitDeployment({
   expected,
@@ -77,24 +117,12 @@ export async function waitDeployment({
 
   while (Date.now() < deadline) {
     try {
-      const config = await (await get('/api/client-config', 'application/json')).json()
-      if (!config || typeof config.release !== 'string')
-        throw new Error('Malformed client config response.')
-      if (isNewer(config.release, expected)) {
-        console.log(`Release ${expected} superseded by ${config.release}; skipping rollout smoke.`)
-        return 'superseded'
+      const result = await checkRelease(expected, get)
+      if (Date.now() >= deadline) break
+      if (result) {
+        console.log(`Deployment check for ${expected}: ${result}.`)
+        return result
       }
-      if (config.release === expected) {
-        const html = await (await get('/', 'text/html')).text()
-        if (!/^<!doctype html>/i.test(html.trimStart()) || !/<div\s+id="root"/.test(html))
-          throw new Error('Malformed application HTML.')
-        const health = await (await get('/healthz', 'application/json')).json()
-        if (health?.status !== 'ok') throw new Error('Malformed health response.')
-        if (Date.now() >= deadline) break
-        console.log(`Deployed ${expected}: client config, / and /healthz passed.`)
-        return 'deployed'
-      }
-      console.log(`Waiting for ${expected}; Service currently reports ${config.release}.`)
     } catch (error) {
       if (!(error instanceof Retryable)) throw error
       console.log(error.message)

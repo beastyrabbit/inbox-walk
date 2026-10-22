@@ -74,6 +74,7 @@ describe('exact-commit main CI gate', () => {
     const pending = waitMainCi({ ...options, fetcher })
     await vi.runAllTimersAsync()
     await pending
+    expect(fetcher).toHaveBeenCalledTimes(2)
   })
 
   it.each(['failure', 'cancelled', 'skipped', 'timed_out', null])(

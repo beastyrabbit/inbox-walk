@@ -61,6 +61,21 @@ describe('Flux rollout smoke', () => {
     }
   })
 
+  it.each(['1.0.0-rc.2', '1.0.0-beta.1+build.001', '1.0.0+001'])(
+    'accepts valid prerelease and build identifiers: %s',
+    async (version) => {
+      const release = `inbox-walk@${version}`
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(config(release))
+        .mockResolvedValueOnce(html())
+        .mockResolvedValueOnce(health())
+      await expect(waitDeployment({ ...options, expected: release, fetcher })).resolves.toBe(
+        'deployed',
+      )
+    },
+  )
+
   it.each(['inbox-walk@0.12.0', 'inbox-walk@0.12.1-rc.1', 'inbox-walk@0.12.1+other'])(
     'times out when exact release never appears: %s',
     async (release) => {
@@ -108,6 +123,11 @@ describe('Flux rollout smoke', () => {
     Response.json({}),
     config('other-app@0.12.1'),
     config('inbox-walk@garbage'),
+    config('inbox-walk@00.12.1'),
+    config('inbox-walk@0.12.1-rc.01'),
+    config('inbox-walk@0.12.1-rc..1'),
+    config('inbox-walk@0.12.1+build..1'),
+    config('inbox-walk@0.12.1_bad'),
     new Response('{broken', { headers: { 'content-type': 'application/json' } }),
     new Response('SSO login', { headers: { 'content-type': 'text/html' } }),
     new Response('', { status: 401 }),
