@@ -17,7 +17,7 @@ for (const maskLevel of ['strict', 'moderate']) {
     const configResponse = await page.request.get(`${baseURL}/api/client-config`)
     expect(configResponse.headers()['cache-control']).toBe('no-store')
     const config = (await configResponse.json()) as ClientConfig
-    expect(config.release).toBe('inbox-walk@0.12.2')
+    expect(config.release).toBe('inbox-walk@0.12.3')
     expect(config.umami?.url).toBe('https://umami.test')
     const errorsOrigin = new URL(config.glitchtip?.dsn ?? '').origin
     const current = (await (await page.request.get('/api/todo')).json()) as TriageSnapshot
@@ -147,7 +147,7 @@ for (const maskLevel of ['strict', 'moderate']) {
       .filter((request) => request.url.includes('/envelope/'))
       .map((request) => request.body)
       .join('\n')
-    expect(envelopes).toContain('"release":"inbox-walk@0.12.2"')
+    expect(envelopes).toContain('"release":"inbox-walk@0.12.3"')
     expect(envelopes).toContain('"environment":"e2e"')
     expect(envelopes).toContain('Application error (details withheld)')
     await page.keyboard.press('e')
@@ -206,7 +206,7 @@ test('unset runtime telemetry makes no requests and loads no SDK chunks', async 
   await page.goto(regularBase)
   await expect(page.locator('.todo-row').first()).toBeVisible()
   const config = await (await page.request.get(`${regularBase}/api/client-config`)).json()
-  expect(config).toEqual({ release: 'inbox-walk@0.12.2' })
+  expect(config).toEqual({ release: 'inbox-walk@0.12.3' })
   await page.keyboard.press('?')
   await expect(page.getByRole('dialog', { name: 'Tastatur' })).toBeVisible()
   expect(external).toEqual([])
