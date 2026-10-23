@@ -158,18 +158,20 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
 
   /** Returns false when sorting must pause instead of trying the next batch. */
   function recordSortFailure(ids: readonly string[], error: unknown) {
-    reportServerError(error)
     log('triage_sort_failed', { message: error instanceof Error ? error.message : 'unknown' })
     const reason = publicSortError(error)
     store.recordSort(new Date().toISOString(), reason)
     if (error instanceof CodexAuthenticationError || isCodexAuthenticationFailure(error)) {
+      reportServerError(error)
       waitingForCodex = true
       return false
     }
-    store.recordAttempt(
-      ids.filter((id) => store.message(id)?.status === 'queued'),
-      reason,
-    )
+    const queued = ids.filter((id) => store.message(id)?.status === 'queued')
+    store.recordAttempt(queued, reason)
+    // Transient Codex errors retry; report only once a message has used up its attempts.
+    if (queued.some((id) => (store.message(id)?.attempts ?? 0) >= TRIAGE_MAX_ATTEMPTS)) {
+      reportServerError(error)
+    }
     return true
   }
 
