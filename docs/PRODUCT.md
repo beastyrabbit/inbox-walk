@@ -53,6 +53,5 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 - Message content, search results, and bucket texts are treated as untrusted data, never as instructions. The model cannot write to Fastmail.
 - Optional self-hosted analytics and errors exclude mail, addresses, subjects, notes, drafts and Fastmail IDs. Replay masks all text and inputs and blocks mail/editor regions; outgoing payloads also pass allowlist filters. There is no consent banner inside the private SSO boundary. Unset runtime configuration disables telemetry.
 
-The app is intended for a single user behind Pangolin SSO in the Heerlab
-homelab. Security is pragmatic for that boundary, while credentials and mail
-content still receive normal application-level protection.
+The app is intended for one authenticated user behind an access gateway.
+Credentials and mail content still receive normal application-level protection.
