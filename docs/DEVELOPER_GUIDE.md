@@ -48,7 +48,8 @@ never call Fastmail, Codex, or another live provider.
 
 ## Production shape
 
-Build with `pnpm build`, then run `node dist-server/index.js`. Set
+Build with `pnpm build`, then run `pnpm start`. It preloads
+`dist-server/instrument.js` so optional error tracking starts before the app. Set
 `FASTMAIL_JMAP_TOKEN`, `TIKA_URL`, and a writable `DATA_DIR` through the
 deployment secret manager. Put the service behind authentication and TLS and
 expose `/healthz` and `/readyz` to platform probes.

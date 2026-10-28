@@ -55,3 +55,8 @@ Keep the live service behind authentication. The browser receives summaries
 first and loads bodies and attachments only when requested. Persisted state does
 not contain received bodies or attachment content. Never share a live service
 URL or session outside the authenticated service.
+
+The footer links to the legal notice and privacy policy, which open without
+signing in. When the operator configures them, self-hosted analytics, masked
+session replay, and error tracking run without mail content, addresses,
+subjects, notes, or drafts. See [Operations](OPERATIONS.md#telemetry).
