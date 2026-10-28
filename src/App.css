@@ -3,10 +3,11 @@
    --------------------------------------------------------------------------- */
 
 .app-shell {
+  --legal-footer-height: 36px;
   height: 100dvh;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
-  grid-template-rows: 56px minmax(0, 1fr) 68px;
+  grid-template-rows: 56px minmax(0, 1fr) 68px var(--legal-footer-height);
 }
 
 .topbar,
@@ -17,7 +18,8 @@
 
 .with-reply .topbar,
 .with-reply .reader,
-.with-reply .controls {
+.with-reply .controls,
+.with-reply > :where(.legal-footer) {
   margin-right: 460px;
 }
 
@@ -972,7 +974,7 @@
   position: fixed;
   z-index: 80;
   right: 18px;
-  bottom: 86px;
+  bottom: calc(86px + var(--legal-footer-height));
   max-width: 470px;
   display: flex;
   gap: 14px;
@@ -1441,7 +1443,8 @@
 @media (max-width: 1050px) {
   .with-reply .topbar,
   .with-reply .reader,
-  .with-reply .controls {
+  .with-reply .controls,
+  .with-reply > :where(.legal-footer) {
     margin-right: 0;
   }
   .reply-panel {
@@ -1460,7 +1463,7 @@
   }
 
   .app-shell {
-    grid-template-rows: 52px minmax(0, 1fr) 64px;
+    grid-template-rows: 52px minmax(0, 1fr) 64px var(--legal-footer-height);
   }
   .topbar {
     gap: 8px;
@@ -1566,7 +1569,7 @@
 
   .toast {
     right: 10px;
-    bottom: 74px;
+    bottom: calc(74px + var(--legal-footer-height));
     left: 10px;
   }
   .dialog-backdrop {
@@ -1632,7 +1635,7 @@
 
 .todo-page {
   width: min(960px, 100%);
-  min-height: 100vh;
+  min-height: calc(100dvh - 36px);
   margin: 0 auto;
   padding: 36px 28px 80px;
 }
@@ -1824,6 +1827,39 @@
   .todo-sources {
     max-width: none;
   }
+}
+
+/* Legal links */
+
+.legal-footer {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 20px;
+  min-height: 36px;
+  padding: 6px 16px;
+  font-size: 12px;
+}
+
+.legal-footer a {
+  color: var(--ink-soft);
+  text-underline-offset: 3px;
+}
+
+.legal-footer nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 20px;
+}
+
+.legal-footer a:hover {
+  color: var(--ink);
+}
+
+.state-page .legal-footer,
+.dialog .legal-footer {
+  margin-top: 20px;
 }
 
 /* Memory settings */

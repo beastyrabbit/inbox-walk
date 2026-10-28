@@ -23,6 +23,27 @@ draft. It has no send endpoint or send control; sending remains in Fastmail.
 - Keeps bucket state, notes, and draft editor state in a local SQLite database.
 - Exposes `/healthz` and `/readyz` for platform probes.
 
+## Telemetry and privacy
+
+The standalone legal pages are `/impressum` and `/datenschutz` in German, and
+`/legal-notice` and `/privacy` in English. They require no app session and load
+no app scripts, assets or telemetry. Both languages describe the data processing
+and retention rules as of October 21, 2026.
+
+The app is meant for a single user behind an authentication proxy and has no
+consent banner. Optional runtime configuration enables self-hosted Umami
+workflow analytics, performance metrics, masked replay and heatmaps, plus
+GlitchTip error tracking in the browser and server. With telemetry variables
+unset, neither integration starts.
+
+Telemetry excludes mail content, subjects, addresses, previews, bucket titles,
+notes, reply text and Fastmail IDs. Views use fixed virtual paths. All replay
+text and inputs are masked, mail and editor regions are blocked, and outgoing
+recordings pass an additional URL and DOM filter. Error messages and arbitrary
+metadata are discarded. Telemetry writes no browser storage or cookies.
+See [Operations](docs/OPERATIONS.md#telemetry) for configuration, the event
+catalogue, source maps, and the current recorder-config access requirement.
+
 ## Local development
 
 Install dependencies and copy the example environment file:

@@ -12,6 +12,7 @@ import type {
   TriageMemory,
   TriageSnapshot,
 } from './shared.ts'
+import { track } from './telemetry.ts'
 
 export type CodexSettings = CodexAuthStatus
 
@@ -116,16 +117,29 @@ async function payload<T>(response: Response): Promise<T> {
   return body as T
 }
 
+function statusClass(status: number) {
+  if (status >= 500) return '5xx'
+  if (status >= 400) return '4xx'
+  return 'other'
+}
+
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   let response: Response
   try {
     response = await fetch(url, init)
   } catch {
+    track('api_failure', { route: url, status_class: 'network' })
     throw new ClientApiError(
       'Der Server ist nicht erreichbar. Bitte überprüfe deine Verbindung und versuche es erneut.',
       'NETWORK_ERROR',
       true,
     )
+  }
+  if (!response.ok && response.status !== 207) {
+    track('api_failure', {
+      route: url,
+      status_class: statusClass(response.status),
+    })
   }
   return payload<T>(response)
 }

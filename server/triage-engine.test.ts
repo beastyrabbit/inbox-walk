@@ -1,8 +1,9 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ReviewEmail } from '../src/shared.ts'
 import { CodexAuthenticationError } from './codex.ts'
 import { demoEmails } from './demo.ts'
 import { createDemoMailbox } from './mailbox.ts'
+import * as telemetry from './telemetry.ts'
 import { createTriageEngine } from './triage-engine.ts'
 import { heuristicSorter, type TriageSorter } from './triage-sorter.ts'
 import { createTriageStore } from './triage-store.ts'
@@ -12,6 +13,10 @@ function nonSpam(emails: readonly ReviewEmail[]) {
 }
 
 describe('triage engine', () => {
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
   it('queues every unread demo message and sorts it with the local heuristic', async () => {
     const store = createTriageStore(':memory:')
     const mailbox = createDemoMailbox()
@@ -95,14 +100,18 @@ describe('triage engine', () => {
   })
 
   it('retries a failing sorter three times per message and then waits for the user', async () => {
+    const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
     const store = createTriageStore(':memory:')
     const mailbox = createDemoMailbox([demoEmails[0] as ReviewEmail])
+    const failure = new Error('fetch failed: ECONNRESET')
     const sorter = vi.fn<TriageSorter>(async () => {
-      throw new Error('fetch failed: ECONNRESET')
+      throw failure
     })
     const engine = createTriageEngine({ engine: 'codex', mailbox, sorter, store })
     await engine.refresh()
     expect(sorter).toHaveBeenCalledTimes(3)
+    expect(report).toHaveBeenCalledOnce()
+    expect(report).toHaveBeenCalledWith(failure)
     expect(engine.status()).toMatchObject({
       failedCount: 1,
       lastSortError: 'Codex war nicht erreichbar.',
@@ -115,11 +124,28 @@ describe('triage engine', () => {
     await engine.sort()
     expect(sorter).toHaveBeenCalledTimes(4)
     expect(store.todo()[0]?.unsorted).toBe(false)
+    expect(report).toHaveBeenCalledOnce()
+    await engine.stop()
+    store.close()
+  })
+
+  it('does not report a transient sort failure that a retry recovers from', async () => {
+    const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
+    const store = createTriageStore(':memory:')
+    const mailbox = createDemoMailbox([demoEmails[0] as ReviewEmail])
+    const sorter = vi.fn<TriageSorter>(heuristicSorter)
+    sorter.mockRejectedValueOnce(new Error('Codex error: An error occurred while processing.'))
+    const engine = createTriageEngine({ engine: 'codex', mailbox, sorter, store })
+    await engine.refresh()
+    expect(sorter).toHaveBeenCalledTimes(2)
+    expect(store.message('demo-train')?.status).toBe('sorted')
+    expect(report).not.toHaveBeenCalled()
     await engine.stop()
     store.close()
   })
 
   it('pauses on an authentication failure without counting an attempt', async () => {
+    const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
     const store = createTriageStore(':memory:')
     const mailbox = createDemoMailbox([demoEmails[0] as ReviewEmail])
     let configured = false
@@ -144,6 +170,7 @@ describe('triage engine', () => {
       waitingForCodex: true,
     })
     expect(store.message('demo-train')?.attempts).toBe(0)
+    expect(report).toHaveBeenCalledOnce()
     await engine.stop()
     store.close()
   })

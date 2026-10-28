@@ -51,6 +51,7 @@ or send button. A finished draft must be reviewed and sent from Fastmail.
 - Blob downloads are allowlisted from server-owned message metadata and returned with `Cache-Control: no-store`.
 - Codex uses the ChatGPT subscription OAuth provider in a fresh in-memory session per sort and per reply.
 - Message content, search results, and bucket texts are treated as untrusted data, never as instructions. The model cannot write to Fastmail.
+- Optional self-hosted analytics and errors exclude mail, addresses, subjects, notes, drafts and Fastmail IDs. Replay masks all text and inputs and blocks mail/editor regions; outgoing payloads also pass allowlist filters. There is no consent banner inside the private SSO boundary. Unset runtime configuration disables telemetry.
 
 The app is intended for one authenticated user behind an access gateway.
 Credentials and mail content still receive normal application-level protection.

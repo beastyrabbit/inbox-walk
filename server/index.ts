@@ -3,7 +3,13 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { extname, join, normalize, resolve } from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import { fileURLToPath } from 'node:url'
+import { serveLegalPage } from './legal/pages.ts'
+import { rejectUnsafeRequestPath } from './request-path.ts'
 import { createRuntime } from './runtime.ts'
+import { reportServerError, traceApi } from './telemetry.ts'
+import { serveClientConfig, telemetryConfig, telemetryCsp } from './telemetry-config.ts'
+
+const clientConfig = telemetryConfig()
 
 const port = Number.parseInt(process.env.PORT || '3000', 10)
 const host = process.env.HOST || '0.0.0.0'
@@ -48,21 +54,7 @@ function setSecurityHeaders(res: ServerResponse) {
   res.setHeader('Referrer-Policy', 'no-referrer')
   res.setHeader('X-Frame-Options', 'SAMEORIGIN')
   res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
-  res.setHeader(
-    'Content-Security-Policy',
-    [
-      "default-src 'self'",
-      "base-uri 'none'",
-      "connect-src 'self'",
-      "font-src 'self'",
-      "form-action 'self'",
-      "frame-src 'self' blob:",
-      "img-src 'self' data: blob: https:",
-      "object-src 'none'",
-      "script-src 'self'",
-      "style-src 'self' 'unsafe-inline'",
-    ].join('; '),
-  )
+  res.setHeader('Content-Security-Policy', telemetryCsp(clientConfig))
 }
 
 async function serveFile(req: IncomingMessage, res: ServerResponse, path: string) {
@@ -102,6 +94,10 @@ async function serveFrontend(req: IncomingMessage, res: ServerResponse) {
     return res.end('Bad request')
   }
   const normalized = normalize(decodedPath).replace(/^[/\\]+/, '')
+  if (extname(normalized) === '.map') {
+    res.statusCode = 404
+    return res.end('Not found')
+  }
   const candidate = resolve(staticDirectory, normalized)
   if (!candidate.startsWith(`${staticDirectory}/`) && candidate !== staticDirectory) {
     res.statusCode = 400
@@ -117,6 +113,10 @@ async function serveFrontend(req: IncomingMessage, res: ServerResponse) {
 }
 
 const server = createServer((req, res) => {
+  if (rejectUnsafeRequestPath(req, res)) return
+  if (serveLegalPage(req, res)) return
+  setSecurityHeaders(res)
+  if (serveClientConfig(req, res, clientConfig)) return
   if (req.url === '/healthz' || req.url === '/readyz') {
     setSecurityHeaders(res)
     res.statusCode = 200
@@ -124,17 +124,21 @@ const server = createServer((req, res) => {
     res.setHeader('Cache-Control', 'no-store')
     return res.end(JSON.stringify({ status: 'ok' }))
   }
-  void api(req, res, () => {
-    void serveFrontend(req, res).catch((error) => {
-      process.stderr.write(
-        `${JSON.stringify({ event: 'frontend_error', message: error instanceof Error ? error.message : 'unknown' })}\n`,
-      )
-      if (!res.headersSent) {
-        res.statusCode = 500
-        res.end('Internal server error')
-      } else if (!res.destroyed) res.destroy()
-    })
-  }).catch((error) => {
+  void traceApi(req.url ?? '/', () =>
+    api(req, res, () => {
+      void serveFrontend(req, res).catch((error) => {
+        reportServerError(error)
+        process.stderr.write(
+          `${JSON.stringify({ event: 'frontend_error', message: error instanceof Error ? error.message : 'unknown' })}\n`,
+        )
+        if (!res.headersSent) {
+          res.statusCode = 500
+          res.end('Internal server error')
+        } else if (!res.destroyed) res.destroy()
+      })
+    }),
+  ).catch((error) => {
+    reportServerError(error)
     process.stderr.write(
       `${JSON.stringify({ event: 'api_middleware_error', message: error instanceof Error ? error.message : 'unknown' })}\n`,
     )

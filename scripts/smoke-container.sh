@@ -9,10 +9,11 @@ for attempt in $(seq 1 30); do
 done
 docker exec "$container" node --input-type=module -e '
 import assert from "node:assert/strict";
-import { access, constants } from "node:fs/promises";
+import { access, constants, readdir } from "node:fs/promises";
 assert.equal(process.versions.node.split(".")[0], "24");
 assert.notEqual(process.getuid(), 0);
 await access("/data", constants.W_OK);
+assert.ok(!(await readdir("/app/dist", { recursive: true })).some(path => path.endsWith(".map")), "Public source maps must be absent");
 const base = "http://127.0.0.1:3000";
 for (const path of ["/healthz", "/readyz", "/"]) assert.equal((await fetch(base + path)).status, 200);
 for (let attempt = 0; attempt < 50; attempt += 1) {

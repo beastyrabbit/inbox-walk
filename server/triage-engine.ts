@@ -2,6 +2,7 @@ import { TRIAGE_MAX_ATTEMPTS, type TriageStatus } from '../src/shared.ts'
 import { CodexAuthenticationError, isCodexAuthenticationFailure } from './codex.ts'
 import { withoutIoDeadline } from './io.ts'
 import type { Mailbox } from './mailbox.ts'
+import { reportServerError } from './telemetry.ts'
 import type { TriageSorter } from './triage-sorter.ts'
 import type { TriageStore } from './triage-store.ts'
 
@@ -118,6 +119,7 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       if (added > 0 || gone.length > 0) log('triage_poll', { added, gone: gone.length })
     } catch (error) {
       if (signal.aborted) return
+      reportServerError(error)
       log('triage_poll_failed', { message: error instanceof Error ? error.message : 'unknown' })
       store.recordPoll(new Date().toISOString(), publicPollError(error))
     } finally {
@@ -160,13 +162,16 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
     const reason = publicSortError(error)
     store.recordSort(new Date().toISOString(), reason)
     if (error instanceof CodexAuthenticationError || isCodexAuthenticationFailure(error)) {
+      reportServerError(error)
       waitingForCodex = true
       return false
     }
-    store.recordAttempt(
-      ids.filter((id) => store.message(id)?.status === 'queued'),
-      reason,
-    )
+    const queued = ids.filter((id) => store.message(id)?.status === 'queued')
+    store.recordAttempt(queued, reason)
+    // Transient Codex errors retry; report only once a message has used up its attempts.
+    if (queued.some((id) => (store.message(id)?.attempts ?? 0) >= TRIAGE_MAX_ATTEMPTS)) {
+      reportServerError(error)
+    }
     return true
   }
 

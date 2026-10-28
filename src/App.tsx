@@ -1,6 +1,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { api, blobUrl, ClientApiError, type CodexSettings } from './api.ts'
+import { LegalFooter } from './ErrorBoundary.tsx'
 import { emailDocument, type MailColorMode } from './email-document.ts'
 import {
   addressesToText,
@@ -28,6 +29,7 @@ import {
   type TriageSnapshot,
   type TriageStatus,
 } from './shared.ts'
+import { durationBucket, failureCategory, interactionType, pageView, track } from './telemetry.ts'
 
 export { emailDocument } from './email-document.ts'
 
@@ -117,6 +119,10 @@ function isTypingTarget(target: EventTarget | null) {
     target instanceof HTMLSelectElement ||
     (target instanceof HTMLElement && target.isContentEditable)
   )
+}
+
+function isLegalLinkTarget(target: EventTarget | null) {
+  return target instanceof Element && Boolean(target.closest('.legal-footer'))
 }
 
 function bucketIdFromPath() {
@@ -280,6 +286,10 @@ function App() {
   snapshotRef.current = snapshot
 
   const chooseMailColorMode = useCallback((mode: MailColorMode) => {
+    track('original_colours_toggled', {
+      enabled: mode === 'original',
+      interaction: interactionType(),
+    })
     setMailColorMode(mode)
     try {
       window.localStorage.setItem(MAIL_COLOR_STORAGE_KEY, mode)
@@ -313,6 +323,33 @@ function App() {
   const codexLoginId = codexLogin?.id
   const codexLoginStatus = codexLogin?.status
   const openCount = buckets.reduce((count, item) => count + item.messages.length, 0)
+  const appLoadedRef = useRef(false)
+  useEffect(() => {
+    if (!snapshot || appLoadedRef.current) return
+    appLoadedRef.current = true
+    track('app_loaded', { mode: snapshot.mode })
+  }, [snapshot])
+  useEffect(() => {
+    if (settingsOpen) pageView('/settings')
+    else if (helpOpen) pageView('/help')
+    else if (replyOpen) pageView('/reply')
+    else if (bucketId) pageView('/bucket')
+    else if (showParked) pageView('/parked')
+    else pageView('/')
+  }, [bucketId, helpOpen, replyOpen, settingsOpen, showParked])
+  const openedBucketRef = useRef<string | null>(null)
+  useEffect(() => {
+    if (bucketId && openedBucketRef.current !== bucketId)
+      track('bucket_opened', { interaction: interactionType() })
+    openedBucketRef.current = bucketId
+  }, [bucketId])
+  useEffect(() => {
+    if (helpOpen) track('keyboard_help_opened', { interaction: interactionType() })
+  }, [helpOpen])
+  useEffect(() => {
+    if (codexLoginStatus === 'completed') track('codex_connect_succeeded')
+    else if (codexLoginStatus === 'failed') track('codex_connect_failed')
+  }, [codexLoginStatus])
 
   /**
    * Snapshots are ordered by the request that started them. A background
@@ -530,6 +567,7 @@ function App() {
     ) => {
       const current = snapshotRef.current
       if (!current || emailIds.length === 0) return false
+      const interaction = interactionType()
       setBusy(true)
       setError(null)
       try {
@@ -552,6 +590,14 @@ function App() {
           return false
         }
         setStatus(successStatus)
+        const event = {
+          done: 'bucket_done',
+          park: 'message_parked',
+          unpark: 'message_unparked',
+          newsletter: 'newsletter_tagged',
+          retry: 'sort_retry_requested',
+        }[action]
+        track(event, { message_count: emailIds.length, interaction })
         return true
       } catch (cause) {
         setError(errorMessage(cause))
@@ -640,6 +686,7 @@ function App() {
 
   const openReply = useCallback(async () => {
     if (!summary) return
+    track('reply_panel_opened', { interaction: interactionType() })
     setReplyOpen(true)
     setHelpOpen(false)
     // The thread is fetched on every open so mail that arrived since is included.
@@ -675,16 +722,20 @@ function App() {
   }, [summary, threadContexts])
 
   useEffect(() => {
+    const closeActiveView = (target: EventTarget | null) => {
+      if (settingsOpen) return
+      if (helpOpen) setHelpOpen(false)
+      else if (replyOpen) setReplyOpen(false)
+      else if (bucket && !isLegalLinkTarget(target)) backToList()
+    }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return
       if (submitting || busy) return
       if (event.key === 'Escape') {
-        if (settingsOpen) return
-        if (helpOpen) setHelpOpen(false)
-        else if (replyOpen) setReplyOpen(false)
-        else if (bucket) backToList()
+        closeActiveView(event.target)
         return
       }
+      if (isLegalLinkTarget(event.target)) return
       if (settingsOpen || helpOpen || replyOpen || replyLoading) return
       if (isTypingTarget(event.target)) return
       if (event.key === '?') {
@@ -739,6 +790,8 @@ function App() {
   async function generateReply() {
     const current = snapshotRef.current
     if (!current || !summary || !editor) return
+    const started = performance.now()
+    const attachmentCount = thread?.attachmentManifest.length ?? 0
     const bodyEditRevision = replyBodyEditsRef.current.get(summary.id) ?? 0
     const epoch = viewEpochRef.current
     setReplyLoading(true)
@@ -754,6 +807,10 @@ function App() {
         },
         current.csrfToken,
       )
+      track('reply_draft_created', {
+        duration: durationBucket(performance.now() - started),
+        attachment_count: attachmentCount,
+      })
       if (viewEpochRef.current !== epoch) return
       if ((replyBodyEditsRef.current.get(summary.id) ?? 0) !== bodyEditRevision) {
         setStatus('Vorschlag verworfen, weil der Antworttext zwischenzeitlich geändert wurde.')
@@ -769,6 +826,11 @@ function App() {
       })
       setStatus('Antwortentwurf erstellt. Bitte prüfen und bearbeiten.')
     } catch (cause) {
+      track('reply_draft_failed', {
+        category: failureCategory(cause),
+        duration: durationBucket(performance.now() - started),
+        attachment_count: attachmentCount,
+      })
       if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
       if (viewEpochRef.current === epoch) setReplyLoading(false)
@@ -813,10 +875,12 @@ function App() {
         },
         current.csrfToken,
       )
+      track('fastmail_draft_saved')
       if (viewEpochRef.current !== epoch) return
       setDraftResults((state) => ({ ...state, [summary.id]: saved }))
       setStatus('Draft in Fastmail gespeichert; die Nachricht bleibt ungelesen.')
     } catch (cause) {
+      track('fastmail_draft_failed', { category: failureCategory(cause) })
       if (viewEpochRef.current === epoch) setError(errorMessage(cause))
     } finally {
       if (viewEpochRef.current === epoch) setSubmitting(false)
@@ -824,12 +888,14 @@ function App() {
   }
 
   async function startCodexLogin() {
+    track('codex_connect_started')
     setCodexLoginBusy(true)
     setSettingsError(null)
     try {
       const { id } = await api.startCodexLogin()
       setCodexLogin({ id, status: 'starting', message: 'Anmeldung wird vorbereitet …' })
     } catch (cause) {
+      track('codex_connect_failed')
       setSettingsError(errorMessage(cause))
     } finally {
       setCodexLoginBusy(false)
@@ -843,6 +909,7 @@ function App() {
     setSettingsError(null)
     try {
       const memory = await api.saveMemory(notes, current.csrfToken)
+      track('memory_note_saved')
       setSnapshot((state) => (state ? { ...state, memory } : state))
     } catch (cause) {
       setSettingsError(errorMessage(cause))
@@ -858,6 +925,7 @@ function App() {
     setSettingsError(null)
     try {
       const memory = await api.decideProposal(id, accept, current.csrfToken)
+      track(accept ? 'memory_proposal_accepted' : 'memory_proposal_rejected')
       setSnapshot((state) => (state ? { ...state, memory } : state))
     } catch (cause) {
       setSettingsError(errorMessage(cause))
@@ -889,6 +957,7 @@ function App() {
         <div className="spinner" aria-hidden="true" />
         <h1>Inbox Walk</h1>
         <p>{status || 'Deine Todo-Liste wird geladen …'}</p>
+        <LegalFooter />
       </main>
     )
   }
@@ -901,6 +970,7 @@ function App() {
         <button type="button" className="button primary" onClick={() => window.location.reload()}>
           Erneut versuchen
         </button>
+        <LegalFooter />
       </main>
     )
   }
@@ -929,6 +999,7 @@ function App() {
           snapshot={snapshot}
           status={status}
         />
+        {!settingsOpen && !helpOpen && <LegalFooter />}
         {helpOpen && <HelpDialog onClose={() => setHelpOpen(false)} />}
         {settingsDialog}
       </>
@@ -995,7 +1066,11 @@ function App() {
       </header>
 
       <main className="reader">
-        <article className="message-card" aria-labelledby="bundle-title">
+        <article
+          className="message-card rr-block"
+          data-telemetry-block
+          aria-labelledby="bundle-title"
+        >
           <BucketHeader
             bucket={bucket}
             summary={summary}
@@ -1032,6 +1107,7 @@ function App() {
         onPark={() => void parkSelected()}
         onComplete={() => void completeBucket()}
       />
+      {!settingsOpen && !helpOpen && <LegalFooter />}
 
       <p className="sr-only" aria-live="polite">
         {status}
@@ -1185,7 +1261,8 @@ function TodoPage({
                 <li key={bucket.bucketId} className={bucket.unsorted ? 'unsorted' : ''}>
                   <button
                     type="button"
-                    className="todo-row"
+                    className="todo-row rr-block"
+                    data-telemetry-block
                     onClick={() => onOpen(bucket.bucketId)}
                     aria-label={`${bucket.title} öffnen`}
                   >
@@ -1227,7 +1304,8 @@ function TodoPage({
                 <li key={message.summary.id}>
                   <button
                     type="button"
-                    className="todo-row"
+                    className="todo-row rr-block"
+                    data-telemetry-block
                     onClick={() => onOpen(`${PARKED_PREFIX}${message.summary.id}`)}
                     aria-label={`${message.summary.subject || '(Kein Betreff)'} öffnen`}
                   >
@@ -1596,7 +1674,8 @@ function MessageBody({
   if (email) {
     return (
       <iframe
-        className="message-body"
+        className="message-body rr-block"
+        data-telemetry-block
         title={`Inhalt von ${subject}`}
         sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
         srcDoc={emailDocument(email, true, imageToken, colorMode)}
@@ -1747,6 +1826,7 @@ function HelpDialog({ onClose }: Readonly<{ onClose: () => void }>) {
             <dd>Panel schließen</dd>
           </div>
         </dl>
+        <LegalFooter />
       </dialog>
     </div>
   )
@@ -1832,7 +1912,11 @@ function SettingsDialog({
             ×
           </button>
         </div>
-        <section className="settings-section" aria-labelledby="settings-codex-title">
+        <section
+          className="settings-section rr-block"
+          data-telemetry-block
+          aria-labelledby="settings-codex-title"
+        >
           <div className="settings-section-heading">
             <div>
               <h3 id="settings-codex-title">Codex</h3>
@@ -1883,7 +1967,13 @@ function SettingsDialog({
               <strong>{login.message}</strong>
               {login.userCode && <code>{login.userCode}</code>}
               {login.url && (
-                <a className="button primary" href={login.url} target="_blank" rel="noreferrer">
+                <a
+                  className="button primary"
+                  data-telemetry-outbound
+                  href={login.url}
+                  target="_blank"
+                  rel="noreferrer"
+                >
                   OpenAI-Anmeldung öffnen
                 </a>
               )}
@@ -1906,7 +1996,11 @@ function SettingsDialog({
             </button>
           )}
         </section>
-        <section className="settings-section" aria-labelledby="settings-memory-title">
+        <section
+          className="settings-section rr-block"
+          data-telemetry-block
+          aria-labelledby="settings-memory-title"
+        >
           <div className="settings-section-heading">
             <div>
               <h3 id="settings-memory-title">Gedächtnis</h3>
@@ -1969,6 +2063,7 @@ function SettingsDialog({
             Schließen
           </button>
         </div>
+        <LegalFooter />
       </dialog>
     </div>
   )
@@ -2024,7 +2119,13 @@ function ReplyPanel({
     body = <p className="panel-error">Antwortkontext ist nicht verfügbar.</p>
   }
   return (
-    <aside ref={panelRef} className="reply-panel" aria-label="Antwortentwurf" tabIndex={-1}>
+    <aside
+      ref={panelRef}
+      className="reply-panel rr-block"
+      data-telemetry-block
+      aria-label="Antwortentwurf"
+      tabIndex={-1}
+    >
       <div className="reply-header">
         <div>
           <h2>Antwortentwurf</h2>

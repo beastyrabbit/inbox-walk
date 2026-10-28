@@ -2,6 +2,7 @@ import { defineConfig, devices } from '@playwright/test'
 
 const port = process.env.MAIL_REVIEW_TEST_PORT ?? '4173'
 const baseURL = `http://127.0.0.1:${port}`
+const telemetryPort = process.env.MAIL_REVIEW_TELEMETRY_TEST_PORT ?? String(Number(port) + 1)
 
 export default defineConfig({
   testDir: './e2e',
@@ -19,20 +20,26 @@ export default defineConfig({
     video: process.env.REVIEW_EVIDENCE_DIR ? 'on' : 'off',
   },
   webServer: {
-    command: 'pnpm build && pnpm start',
+    command: 'pnpm build && pnpm exec tsx scripts/start-e2e.ts',
     env: {
       CODEX_HOME: 'test-results/codex-home',
       DATA_DIR: 'test-results/runtime-data',
       HOST: '127.0.0.1',
       MAIL_REVIEW_DEMO: '1',
       PORT: port,
+      MAIL_REVIEW_TELEMETRY_TEST_PORT: telemetryPort,
     },
     url: `${baseURL}/api/todo`,
     reuseExistingServer: false,
     timeout: 120_000,
   },
   projects: [
-    { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
-    { name: 'mobile-chromium', use: { ...devices['Pixel 7'] } },
+    { name: 'chromium', testIgnore: 'telemetry.spec.ts', use: { ...devices['Desktop Chrome'] } },
+    { name: 'mobile-chromium', testIgnore: 'telemetry.spec.ts', use: { ...devices['Pixel 7'] } },
+    {
+      name: 'telemetry',
+      testMatch: 'telemetry.spec.ts',
+      use: { ...devices['Desktop Chrome'], baseURL: `http://127.0.0.1:${telemetryPort}` },
+    },
   ],
 })

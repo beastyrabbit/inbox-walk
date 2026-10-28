@@ -1,4 +1,4 @@
-import { createServer, type Server } from 'node:http'
+import { createServer, request, type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest'
 import type {
   ReviewEmail,
@@ -8,16 +8,22 @@ import type {
   TriageSnapshot,
 } from '../src/shared.ts'
 import { clearApiStateForTests, createApiMiddleware } from './api.ts'
+import { IoError } from './io.ts'
+import { JmapError } from './jmap.ts'
 import { createDemoMailbox } from './mailbox.ts'
+import { ReplyError } from './reply.ts'
+import { rejectUnsafeRequestPath } from './request-path.ts'
+import * as telemetry from './telemetry.ts'
 import { createTriageEngine } from './triage-engine.ts'
 import { heuristicSorter } from './triage-sorter.ts'
-import { createTriageStore } from './triage-store.ts'
+import { createTriageStore, TriageStoreError } from './triage-store.ts'
 
 let server: Server
 let baseUrl = ''
 const store = createTriageStore(':memory:')
 const mailbox = createDemoMailbox()
 const engine = createTriageEngine({ engine: 'heuristic', mailbox, sorter: heuristicSorter, store })
+const middleware = vi.fn(createApiMiddleware({ engine, mailbox, store }))
 
 async function json<T>(path: string, init?: RequestInit) {
   const response = await fetch(`${baseUrl}${path}`, init)
@@ -40,8 +46,8 @@ async function todo() {
 }
 
 beforeAll(async () => {
-  const middleware = createApiMiddleware({ engine, mailbox, store })
   server = createServer((request, response) => {
+    if (rejectUnsafeRequestPath(request, response)) return
     void middleware(request, response, () => {
       response.statusCode = 404
       response.end()
@@ -64,6 +70,95 @@ afterAll(async () => {
 })
 
 describe('todo API', () => {
+  it.each([
+    '/api/todo/..%2F..%2Fprivacy',
+    '/api/todo/x%2F..%2F..%2Fprivacy',
+    '/api/x/%2e%2e/privacy',
+    '/api/x/../privacy',
+    '//privacy',
+    '/privacy%2F',
+    '/a\\b',
+    '/%zz',
+    'http://localhost/privacy',
+  ])('rejects the raw target %s before invoking the API', async (path) => {
+    const calls = middleware.mock.calls.length
+    // fetch/URL would normalise literal dot segments before sending the request.
+    const result = await new Promise<{
+      status?: number
+      headers: Record<string, unknown>
+      body: string
+    }>((resolve, reject) => {
+      const req = request(baseUrl, { path }, (res) => {
+        let body = ''
+        res.setEncoding('utf8')
+        res.on('data', (chunk) => {
+          body += chunk
+        })
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }))
+        res.on('error', reject)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+    expect(result.status).toBe(400)
+    expect(result.body).toBe('Bad request')
+    expect(result.headers).toMatchObject({
+      'content-type': 'text/plain; charset=utf-8',
+      'cache-control': 'no-store',
+      'x-content-type-options': 'nosniff',
+      'referrer-policy': 'no-referrer',
+      'x-frame-options': 'DENY',
+      'permissions-policy': 'camera=(), microphone=(), geolocation=()',
+      'content-security-policy': "default-src 'none'; frame-ancestors 'none'",
+    })
+    expect(result.headers['set-cookie']).toBeUndefined()
+    expect(middleware.mock.calls).toHaveLength(calls)
+  })
+
+  it('does not report expected client and validation failures to GlitchTip', async () => {
+    const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
+    try {
+      const snapshot = await todo()
+      const forbidden = await json('/api/todo/messages/done', post({ emailIds: [] }))
+      expect(forbidden.response.status).toBe(403)
+      const invalid = await json('/api/todo/messages/done', post({}, snapshot.csrfToken))
+      expect(invalid.response.status).toBe(400)
+      const missing = await json('/api/todo/emails/ghost')
+      expect(missing.response.status).toBe(404)
+      expect(report).not.toHaveBeenCalled()
+    } finally {
+      report.mockRestore()
+    }
+  })
+
+  it.each([
+    [new ReplyError('Expected reply outcome', 'INVALID_REPLY'), 422],
+    [new JmapError('Authentication required', 'AUTH_REQUIRED', 401), 401],
+    [new JmapError('Missing email', 'NOT_FOUND', 404), 404],
+    [new TriageStoreError('Invalid bucket', 'INVALID_BUCKET'), 400],
+    [new TriageStoreError('Missing bucket', 'UNKNOWN_BUCKET'), 404],
+    [new ReplyError('Reply service failed', 'REPLY_FAILED', undefined, 502), 502],
+    [new JmapError('Upstream failed', 'UPSTREAM_ERROR', 503), 502],
+    [new IoError('Timed out', 'IO_TIMEOUT'), 504],
+    [new Error('Unexpected failure'), 500],
+    ['unknown failure', 500],
+  ])(
+    'reports an API failure only when its response maps to 5xx (%s → %i)',
+    async (error, status) => {
+      const report = vi.spyOn(telemetry, 'reportServerError').mockImplementation(() => {})
+      const detail = vi.spyOn(mailbox, 'detail').mockRejectedValueOnce(error)
+      try {
+        const failed = await json('/api/todo/emails/demo-shop')
+        expect(failed.response.status).toBe(status)
+        if (status >= 500) expect(report).toHaveBeenCalledExactlyOnceWith(error)
+        else expect(report).not.toHaveBeenCalled()
+      } finally {
+        detail.mockRestore()
+        report.mockRestore()
+      }
+    },
+  )
+
   it('serves the sorted todo with tokens, status and memory', async () => {
     const snapshot = await todo()
     expect(snapshot.mode).toBe('demo')

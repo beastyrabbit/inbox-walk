@@ -1,13 +1,15 @@
 # Release status
 
-Last updated: 2026-10-10
+Last updated: 2026-10-28
 
 ## Release
 
-`v0.10.0` is the release described by this source tree.
+`v0.12.3` is the release described by this source tree.
 
 ## Shipped
 
+- [x] Standalone German and English legal notice and privacy pages readable without sign-in.
+- [x] Optional self-hosted analytics, masked replay, and error tracking that exclude mail content.
 - [x] Continuous unread-mail todo with JMAP push and poll fallback.
 - [x] Codex sorting sessions with read-only mailbox tools and app-only bucket tools.
 - [x] Bounded automatic retries, manual retry, and visible login pause.
