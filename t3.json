@@ -4,14 +4,16 @@
   "scripts": [
     {
       "name": "Setup worktree",
-      "command": "corepack pnpm install --frozen-lockfile",
+      "command": "pnpm install --frozen-lockfile",
       "icon": "configure",
-      "runOnWorktreeCreate": true
+      "runOnWorktreeCreate": true,
+      "async": false
     },
     {
-      "name": "Start dev server",
-      "command": "pnpm dev",
-      "icon": "play"
+      "name": "Start dev server (demo data)",
+      "command": "MAIL_REVIEW_DEMO=1 pnpm dev",
+      "icon": "play",
+      "stopOnSettle": true
     },
     {
       "name": "Run checks",
@@ -22,6 +24,11 @@
       "name": "Build",
       "command": "pnpm build",
       "icon": "build"
+    },
+    {
+      "name": "Browser tests",
+      "command": "pnpm test:e2e",
+      "icon": "test"
     }
   ]
 }
