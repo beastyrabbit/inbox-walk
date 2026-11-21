@@ -1,6 +1,9 @@
+import { readFileSync } from 'node:fs'
 import { createServer, type Server } from 'node:http'
 import { afterEach, describe, expect, it } from 'vitest'
 import { release, serveClientConfig, telemetryConfig, telemetryCsp } from './telemetry-config.ts'
+
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 
 const configured = {
   UMAMI_URL: 'https://analytics.example',
@@ -17,7 +20,7 @@ describe('runtime telemetry config', () => {
     expect(
       telemetryConfig({ FASTMAIL_JMAP_TOKEN: 'private', GLITCHTIP_AUTH_TOKEN: 'private' }),
     ).toEqual({ release })
-    expect(release).toBe('inbox-walk@0.12.3')
+    expect(release).toBe(`inbox-walk@${version}`)
   })
   it('validates targets, DSNs, website IDs and defaults', () => {
     expect(telemetryConfig(configured)).toEqual({

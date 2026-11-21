@@ -1,4 +1,7 @@
+import { readFileSync } from 'node:fs'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 
 const sentry = vi.hoisted(() => ({
   init: vi.fn(),
@@ -26,7 +29,7 @@ describe('server instrumentation preload', () => {
     await import('./instrument.ts')
     expect(sentry.init).toHaveBeenCalledWith(
       expect.objectContaining({
-        release: 'inbox-walk@0.12.3',
+        release: `inbox-walk@${version}`,
         sendDefaultPii: false,
         sendClientReports: false,
         defaultIntegrations: false,
