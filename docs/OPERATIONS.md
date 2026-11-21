@@ -80,6 +80,10 @@ application imports using `node --import ./dist-server/instrument.js`; Vite
 development does not preload it. Both use `inbox-walk@<package version>`,
 `sendDefaultPii:false`, the same scrubber, and no Sentry Replay. Node captures
 process exceptions/rejections and explicit API, frontend, poll and sort errors.
+Transient poll failures reach GlitchTip on the third consecutive failed poll,
+once per outage. A complete successful poll resets the counter. Authentication,
+configuration and unexpected errors are reported immediately. Every failed poll
+still updates the app status and local logs; shutdown cancellation is ignored.
 HTTP/body/header/cookie, provider, console and local-variable integrations are
 disabled on Node. Browser console errors and unhandled failures are captured;
 the React boundary provides a German reload fallback. Unknown error messages,

@@ -3,6 +3,10 @@ import { expect, test } from '@playwright/test'
 import type { TriageSnapshot } from '../src/shared.ts'
 import type { ClientConfig } from '../src/telemetry-contract.ts'
 
+const { version: appVersion } = JSON.parse(
+  readFileSync(new URL('../package.json', import.meta.url), 'utf8'),
+) as { version: string }
+
 const fixture = (name: string) =>
   readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8')
 const regularBase = `http://127.0.0.1:${process.env.MAIL_REVIEW_TEST_PORT ?? '4173'}`
@@ -17,7 +21,7 @@ for (const maskLevel of ['strict', 'moderate']) {
     const configResponse = await page.request.get(`${baseURL}/api/client-config`)
     expect(configResponse.headers()['cache-control']).toBe('no-store')
     const config = (await configResponse.json()) as ClientConfig
-    expect(config.release).toBe('inbox-walk@0.12.3')
+    expect(config.release).toBe(`inbox-walk@${appVersion}`)
     expect(config.umami?.url).toBe('https://umami.test')
     const errorsOrigin = new URL(config.glitchtip?.dsn ?? '').origin
     const current = (await (await page.request.get('/api/todo')).json()) as TriageSnapshot
@@ -147,7 +151,7 @@ for (const maskLevel of ['strict', 'moderate']) {
       .filter((request) => request.url.includes('/envelope/'))
       .map((request) => request.body)
       .join('\n')
-    expect(envelopes).toContain('"release":"inbox-walk@0.12.3"')
+    expect(envelopes).toContain(`"release":"inbox-walk@${appVersion}"`)
     expect(envelopes).toContain('"environment":"e2e"')
     expect(envelopes).toContain('Application error (details withheld)')
     await page.keyboard.press('e')
@@ -206,7 +210,7 @@ test('unset runtime telemetry makes no requests and loads no SDK chunks', async 
   await page.goto(regularBase)
   await expect(page.locator('.todo-row').first()).toBeVisible()
   const config = await (await page.request.get(`${regularBase}/api/client-config`)).json()
-  expect(config).toEqual({ release: 'inbox-walk@0.12.3' })
+  expect(config).toEqual({ release: `inbox-walk@${appVersion}` })
   await page.keyboard.press('?')
   await expect(page.getByRole('dialog', { name: 'Tastatur' })).toBeVisible()
   expect(external).toEqual([])

@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process'
+import { readFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { fileURLToPath } from 'node:url'
 import { expect, it } from 'vitest'
+
+const { version } = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'))
 
 it.each(['captured exception', 'unhandled rejection'])(
   'the real Node preload reports a scrubbed %s to a local collector',
@@ -57,7 +60,7 @@ it.each(['captured exception', 'unhandled rejection'])(
       expect(result).toBe(scenario === 'unhandled rejection' ? 1 : 0)
       expect(bodies).toHaveLength(1)
       const body = bodies.join('')
-      expect(body).toContain('"release":"inbox-walk@0.12.3"')
+      expect(body).toContain(`"release":"inbox-walk@${version}"`)
       expect(body).toContain('"environment":"test"')
       expect(body).toContain('Application error (details withheld)')
       if (scenario === 'unhandled rejection') {

@@ -1,12 +1,14 @@
 import { TRIAGE_MAX_ATTEMPTS, type TriageStatus } from '../src/shared.ts'
 import { CodexAuthenticationError, isCodexAuthenticationFailure } from './codex.ts'
-import { withoutIoDeadline } from './io.ts'
+import { IoError, withoutIoDeadline } from './io.ts'
+import { JmapError } from './jmap.ts'
 import type { Mailbox } from './mailbox.ts'
 import { reportServerError } from './telemetry.ts'
 import type { TriageSorter } from './triage-sorter.ts'
 import type { TriageStore } from './triage-store.ts'
 
 const DEFAULT_POLL_INTERVAL_MS = 60_000
+const POLL_FAILURE_REPORT_THRESHOLD = 3
 const PUSH_DEBOUNCE_MS = 2_000
 const SORT_BATCH_SIZE = 8
 const SUMMARY_PAGE_SIZE = 200
@@ -51,10 +53,27 @@ function publicSortError(error: unknown) {
 
 export function publicPollError(error: unknown) {
   const message = error instanceof Error ? error.message : String(error)
-  if (/401|auth/i.test(message)) return 'Fastmail hat den Zugriff abgelehnt.'
+  if (/401|403|auth/i.test(message)) return 'Fastmail hat den Zugriff abgelehnt.'
   if (/timeout|timed out|abort/i.test(message)) return 'Fastmail hat nicht rechtzeitig geantwortet.'
   if (/network|fetch|connect|econn|dns/i.test(message)) return 'Fastmail war nicht erreichbar.'
   return 'Das Postfach konnte nicht abgefragt werden.'
+}
+
+function isTransientPollError(error: unknown) {
+  if (error instanceof JmapError) {
+    return (
+      error.status === 408 ||
+      error.status === 429 ||
+      (error.status !== undefined && error.status >= 500 && error.status < 600)
+    )
+  }
+  if (error instanceof IoError) return error.code === 'IO_TIMEOUT'
+  return (
+    error instanceof Error &&
+    (error.name === 'TimeoutError' ||
+      error.name === 'AbortError' ||
+      /fetch failed|network|timeout|timed out|econn|enotfound|eai_again|dns/i.test(error.message))
+  )
 }
 
 /**
@@ -71,6 +90,7 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
   let running: Promise<void> | null = null
   let sorting: Promise<void> | null = null
   let polling = false
+  let consecutivePollFailures = 0
   let waitingForCodex = false
   let pushConnected = false
   let pushTimer: ReturnType<typeof setTimeout> | undefined
@@ -116,10 +136,18 @@ export function createTriageEngine(options: TriageEngineOptions): TriageEngine {
       }
       if (gone.length > 0) store.markGone(gone)
       store.recordPoll(new Date().toISOString(), null)
+      consecutivePollFailures = 0
       if (added > 0 || gone.length > 0) log('triage_poll', { added, gone: gone.length })
     } catch (error) {
       if (signal.aborted) return
-      reportServerError(error)
+      consecutivePollFailures++
+      // One report per transient outage; auth, configuration and unexpected errors stay immediate.
+      if (
+        !isTransientPollError(error) ||
+        consecutivePollFailures === POLL_FAILURE_REPORT_THRESHOLD
+      ) {
+        reportServerError(error)
+      }
       log('triage_poll_failed', { message: error instanceof Error ? error.message : 'unknown' })
       store.recordPoll(new Date().toISOString(), publicPollError(error))
     } finally {
