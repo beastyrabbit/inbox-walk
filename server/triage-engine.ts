@@ -72,6 +72,9 @@ function isTransientPollError(error: unknown) {
     error instanceof Error &&
     (error.name === 'TimeoutError' ||
       error.name === 'AbortError' ||
+      (error.cause instanceof Error &&
+        'code' in error.cause &&
+        error.cause.code === 'UND_ERR_SOCKET') ||
       /fetch failed|network|timeout|timed out|econn|enotfound|eai_again|dns/i.test(error.message))
   )
 }

@@ -216,6 +216,9 @@ describe('triage engine', () => {
 
   it.each([
     new TypeError('fetch failed'),
+    new TypeError('terminated', {
+      cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }),
+    }),
     new Error('read ECONNRESET'),
     new DOMException('The operation was aborted due to timeout', 'TimeoutError'),
     new IoError(
