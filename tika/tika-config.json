@@ -1,0 +1,7 @@
+{
+  "server": {},
+  "parsers": [
+    { "default-parser": {} },
+    { "pdf-parser": { "pages": { "text": "EXTRACT_AND_OCR" } } }
+  ]
+}

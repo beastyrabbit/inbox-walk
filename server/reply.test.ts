@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { MailIdentity, MailResource, ThreadMessage } from '../src/shared.ts'
 import { IoError, withIoDeadline } from './io.ts'
@@ -20,6 +21,7 @@ const identity: MailIdentity = {
 
 afterEach(() => {
   vi.unstubAllGlobals()
+  vi.unstubAllEnvs()
   vi.useRealTimers()
 })
 
@@ -392,5 +394,37 @@ describe('reply construction', () => {
     expect(prompt).toContain('Vollständiger Inhalt von brief.pdf')
     expect(imageCount).toBe(1)
     expect(result.attachmentManifest).toHaveLength(2)
+  })
+
+  it('sends documents to Tika /tika and passes its text output to Codex', async () => {
+    vi.stubEnv('TIKA_URL', 'http://tika.test:9998/')
+    const fetchMock = vi.fn(async () => new Response('# Vertrag\n\nStempel Eingang 03.11.2026'))
+    vi.stubGlobal('fetch', fetchMock)
+    let prompt = ''
+    await generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
+      download: async () => new Response('pdf'),
+      runCodex: async (input) => {
+        prompt = input.prompt
+        return { bodyText: 'Ok.', supportedDetails: [], questions: [], warnings: [] }
+      },
+    })
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://tika.test:9998/tika',
+      expect.objectContaining({
+        method: 'PUT',
+        headers: { Accept: 'text/plain', 'Content-Type': 'application/pdf' },
+      }),
+    )
+    expect(prompt).toContain('Stempel Eingang 03.11.2026')
+  })
+
+  it('keeps the Tika server config on full OCR for every PDF page', async () => {
+    // Tika 4 defaults to AUTO, which drops text in images on PDF pages that also carry text.
+    const config = JSON.parse(
+      await readFile(new URL('../tika/tika-config.json', import.meta.url), 'utf8'),
+    )
+    expect(config.parsers).toContainEqual({
+      'pdf-parser': { pages: { text: 'EXTRACT_AND_OCR' } },
+    })
   })
 })

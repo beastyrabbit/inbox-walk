@@ -13,7 +13,9 @@ repository-scoped runner and builder needed to execute CI.
 - Required live secret: `FASTMAIL_JMAP_TOKEN`
 - Persistent state: `DATA_DIR` for the SQLite database and Codex OAuth record
 - Codex defaults: `CODEX_MODEL`, `CODEX_THINKING_LEVEL`, and `CODEX_SPEED`
-- Document extraction: `TIKA_URL`, an internal HTTP(S) Apache Tika service
+- Document extraction: `TIKA_URL`, an internal HTTP(S) Apache Tika 4 service
+  started with `-c` and the repository's `tika/tika-config.json` (full OCR of
+  every PDF page)
 - Poll fallback: `TRIAGE_POLL_INTERVAL_MS` (60 seconds by default)
 - Sort timeout: `TRIAGE_TIMEOUT_MS` (15 minutes by default, one hour maximum)
 - Reply timeout: `CODEX_INFERENCE_TIMEOUT_MS` (five minutes by default)
