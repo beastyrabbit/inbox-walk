@@ -202,14 +202,11 @@ async function extractWithTika(
   const timeoutSignal = ioSignal(Math.max(1, Math.min(120_000, timeoutMs)), signal)
   let text: string
   try {
+    // Tika 4 ignores per-request OCR headers; tika/tika-config.json sets EXTRACT_AND_OCR server-wide.
     response = await abortable(
       fetch(`${tikaUrl}/tika`, {
         method: 'PUT',
-        headers: {
-          Accept: 'text/plain',
-          'Content-Type': mime,
-          'X-Tika-PDFOcrStrategy': 'ocr_and_text',
-        },
+        headers: { Accept: 'text/plain', 'Content-Type': mime },
         body: new Uint8Array(bytes),
         signal: timeoutSignal,
       }),

@@ -14,7 +14,8 @@ MAIL_REVIEW_DEMO=1 pnpm dev
 ```
 
 Demo mode uses synthetic mail and does not contact Fastmail or Codex. For live
-mail, provide a dedicated `FASTMAIL_JMAP_TOKEN`, start Apache Tika, and run
+mail, provide a dedicated `FASTMAIL_JMAP_TOKEN`, start Apache Tika with
+`tika/tika-config.json` as the README shows, and run
 `pnpm dev` with `MAIL_REVIEW_DEMO=0` before connecting Codex from
 **Einstellungen**. New unread messages appear as unsorted entries. Codex groups
 them into buckets in the background; later mail is picked up by the push

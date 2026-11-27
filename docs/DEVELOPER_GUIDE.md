@@ -16,8 +16,8 @@ For a safe UI run, use demo mode:
 MAIL_REVIEW_DEMO=1 pnpm dev
 ```
 
-For live development, set a dedicated Fastmail token in `.env`, start Tika, and
-run `pnpm dev`. Keep credentials in local files or a secret manager. Do not
+For live development, set a dedicated Fastmail token in `.env`, start Tika 4
+with `tika/tika-config.json` (see the README), and run `pnpm dev`. Keep credentials in local files or a secret manager. Do not
 commit `.env`, `DATA_DIR`, OAuth files, or databases.
 
 ## Architecture
