@@ -1,10 +1,10 @@
 # Release status
 
-Last updated: 2026-11-21
+Last updated: 2026-11-27
 
 ## Release
 
-`v0.12.4` is the release described by this source tree.
+`v0.12.5` is the release described by this source tree.
 
 ## Shipped
 
