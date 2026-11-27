@@ -203,8 +203,9 @@ async function extractWithTika(
   let text: string
   try {
     // Tika 4 ignores per-request OCR headers; tika/tika-config.json sets EXTRACT_AND_OCR server-wide.
+    // Bare /tika returns Markdown, which merges single line breaks (CSV rows); /tika/text keeps them.
     response = await abortable(
-      fetch(`${tikaUrl}/tika`, {
+      fetch(`${tikaUrl}/tika/text`, {
         method: 'PUT',
         headers: { Accept: 'text/plain', 'Content-Type': mime },
         body: new Uint8Array(bytes),

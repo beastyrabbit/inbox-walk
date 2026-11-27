@@ -70,8 +70,10 @@ docker run -d --rm --name inbox-walk-tika -p 127.0.0.1:9998:9998 \
 pnpm dev
 ```
 
-Tika must start with `tika/tika-config.json`. It OCRs every PDF page in addition
+Tika must start with `tika/tika-config.json`. It OCRs each PDF page in addition
 to the embedded text, so text inside scans and stamps on text pages is not lost.
+Pages larger than Tika's 100-megapixel render limit, such as A0 plans, are not
+rendered and get no OCR.
 
 Connect Codex from **Einstellungen** when sorting or reply generation needs it.
 Keep `.env`, OAuth files, databases, and production credentials out of Git.

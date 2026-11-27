@@ -396,9 +396,9 @@ describe('reply construction', () => {
     expect(result.attachmentManifest).toHaveLength(2)
   })
 
-  it('sends documents to Tika /tika and passes its text output to Codex', async () => {
+  it('sends documents to Tika /tika/text and keeps line breaks in the Codex input', async () => {
     vi.stubEnv('TIKA_URL', 'http://tika.test:9998/')
-    const fetchMock = vi.fn(async () => new Response('# Vertrag\n\nStempel Eingang 03.11.2026'))
+    const fetchMock = vi.fn(async () => new Response('Posten,Preis\nBeratung,123.45'))
     vi.stubGlobal('fetch', fetchMock)
     let prompt = ''
     await generateReply(context, 'fixture', [{ ...message, attachments: [document] }], request, {
@@ -409,13 +409,13 @@ describe('reply construction', () => {
       },
     })
     expect(fetchMock).toHaveBeenCalledWith(
-      'http://tika.test:9998/tika',
+      'http://tika.test:9998/tika/text',
       expect.objectContaining({
         method: 'PUT',
         headers: { Accept: 'text/plain', 'Content-Type': 'application/pdf' },
       }),
     )
-    expect(prompt).toContain('Stempel Eingang 03.11.2026')
+    expect(prompt).toContain(JSON.stringify('Posten,Preis\nBeratung,123.45'))
   })
 
   it('keeps the Tika server config on full OCR for every PDF page', async () => {
@@ -423,7 +423,10 @@ describe('reply construction', () => {
     const config = JSON.parse(
       await readFile(new URL('../tika/tika-config.json', import.meta.url), 'utf8'),
     )
-    expect(config.server).toEqual(expect.any(Object)) // Tika 4.2 refuses to start without it
+    // Tika 4.2 refuses to start without a server object.
+    expect(config.server).toBeTypeOf('object')
+    expect(config.server).not.toBeNull()
+    expect(Array.isArray(config.server)).toBe(false)
     expect(config.parsers).toContainEqual({
       'pdf-parser': { pages: { text: 'EXTRACT_AND_OCR' } },
     })
