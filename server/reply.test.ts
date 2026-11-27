@@ -423,6 +423,7 @@ describe('reply construction', () => {
     const config = JSON.parse(
       await readFile(new URL('../tika/tika-config.json', import.meta.url), 'utf8'),
     )
+    expect(config.server).toEqual(expect.any(Object)) // Tika 4.2 refuses to start without it
     expect(config.parsers).toContainEqual({
       'pdf-parser': { pages: { text: 'EXTRACT_AND_OCR' } },
     })

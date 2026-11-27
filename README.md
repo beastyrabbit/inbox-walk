@@ -64,7 +64,7 @@ Fastmail or Codex. For live development, put a dedicated Fastmail token in
 `.env`, start Apache Tika, and run `pnpm dev`:
 
 ```bash
-docker run --rm --name inbox-walk-tika -p 127.0.0.1:9998:9998 \
+docker run -d --rm --name inbox-walk-tika -p 127.0.0.1:9998:9998 \
   -v "$PWD/tika/tika-config.json:/tika-config.json:ro" \
   apache/tika:4.2.0-full -c /tika-config.json
 pnpm dev
